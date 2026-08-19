@@ -1,6 +1,6 @@
 ---
 title: "feat: Ship text-complete Local Pipa"
-status: active
+status: completed
 date: 2026-08-19
 origin: https://linear.app/lunchpaillabs/document/implementation-plan-local-first-pipa-core-971f47d85312
 ---
