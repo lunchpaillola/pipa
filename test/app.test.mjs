@@ -3,23 +3,25 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { checkSlackToken, createConversationRunner, initializePipa, startPipa } from "../src/app.mjs";
+import { checkSlackAppToken, checkSlackToken, createConversationRunner, initializePipa, startPipa } from "../src/app.mjs";
 import { createSessionStore, pipaPaths } from "../src/state.mjs";
 
 test("init validates dependencies before replacing config", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-init-"));
   const paths = pipaPaths(home);
   const input = { botName: "Local Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: home };
-  await initializePipa(input, { paths, checkOpenCode: async () => "1.0.0", checkSlackToken: async () => ({ ok: true }) });
+  const valid = { paths, checkOpenCode: async () => "1.0.0", checkSlackAppToken: async () => ({ ok: true }), checkSlackToken: async () => ({ ok: true }) };
+  await initializePipa(input, valid);
   const before = await readFile(paths.config, "utf8");
   const manifestBefore = await readFile(paths.manifest, "utf8");
   const file = path.join(home, "not-a-directory");
   await writeFile(file, "x");
   const failures = [
-    () => initializePipa({ ...input, workingDirectory: file }, { paths, checkOpenCode: async () => "1.0.0", checkSlackToken: async () => ({ ok: true }) }),
-    () => initializePipa(input, { paths, checkOpenCode: async () => { throw new Error("OpenCode missing"); }, checkSlackToken: async () => ({ ok: true }) }),
-    () => initializePipa(input, { paths, checkOpenCode: async () => "2.0.0", checkSlackToken: async () => ({ ok: true }) }),
-    () => initializePipa({ ...input, slackBotToken: "xoxb-rejected" }, { paths, checkOpenCode: async () => "1.0.0", checkSlackToken: async () => { throw new Error("rejected"); } }),
+    () => initializePipa({ ...input, workingDirectory: file }, valid),
+    () => initializePipa(input, { ...valid, checkOpenCode: async () => { throw new Error("OpenCode missing"); } }),
+    () => initializePipa(input, { ...valid, checkOpenCode: async () => "2.0.0" }),
+    () => initializePipa(input, { ...valid, checkSlackAppToken: async () => { throw new Error("app rejected"); } }),
+    () => initializePipa({ ...input, slackBotToken: "xoxb-rejected" }, { ...valid, checkSlackToken: async () => { throw new Error("bot rejected"); } }),
   ];
   for (const fail of failures) {
     await assert.rejects(fail());
@@ -33,6 +35,10 @@ test("Slack auth errors never include the token", async () => {
   await assert.rejects(
     checkSlackToken("xoxb-super-secret", async () => ({ ok: false, json: async () => ({ ok: false, error: "invalid_auth" }) })),
     (error) => error.message === "Slack rejected the bot token." && !error.message.includes("super-secret"),
+  );
+  await assert.rejects(
+    checkSlackAppToken("xapp-super-secret", async () => ({ ok: false, json: async () => ({ ok: false, error: "invalid_auth" }) })),
+    (error) => error.message.includes("connections:write") && !error.message.includes("super-secret"),
   );
 });
 

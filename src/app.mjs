@@ -15,6 +15,7 @@ export async function initializePipa(input, options = {}) {
   };
   const openCodeVersion = await (options.checkOpenCode ?? runOpenCodeVersion)();
   if (!/^v?1(?:\.|$)/u.test(openCodeVersion)) throw new Error(`Pipa requires OpenCode v1; found ${openCodeVersion || "an unknown version"}.`);
+  await (options.checkSlackAppToken ?? checkSlackAppToken)(config.slackAppToken);
   await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
 
   await saveConfig(config, paths, manifest);
@@ -140,6 +141,22 @@ export async function checkSlackToken(token, fetchImpl = fetch) {
   });
   const result = await response.json();
   if (!response.ok || !result.ok) throw new Error("Slack rejected the bot token.");
+  return result;
+}
+
+export async function checkSlackAppToken(token, fetchImpl = fetch) {
+  const appToken = requireToken(token, "Slack app token", "xapp-");
+  const response = await fetchImpl("https://slack.com/api/apps.connections.open", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${appToken}`,
+      "content-type": "application/json",
+    },
+    body: "{}",
+    signal: AbortSignal.timeout(15_000),
+  });
+  const result = await response.json();
+  if (!response.ok || !result.ok) throw new Error("Slack rejected the app token. Generate an app-level token with the connections:write scope.");
   return result;
 }
 

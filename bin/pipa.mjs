@@ -50,18 +50,19 @@ async function init(io) {
       io.output.write(`\nIf Slack did not open, use this link:\n${manifestUrl}\n\n`);
       io.output.write("In Slack:\n1. Choose your workspace, review the configuration, and create the app.\n2. Under Basic Information, generate an app-level token with connections:write.\n3. Under OAuth & Permissions, install the app and copy its Bot User OAuth Token.\n\n");
     }
-    const askSecret = async (label) => {
-      io.output.write(label);
+    const askSecret = async (question, label) => {
+      io.output.write(question);
       muted = true;
       const value = await prompt.question("");
       muted = false;
-      io.output.write("\n");
+      io.output.write(`\n✓ ${label} received.\n`);
       return value;
     };
-    const slackAppToken = process.env.PIPA_SLACK_APP_TOKEN || await askSecret("Slack app token (xapp-): ");
-    const slackBotToken = process.env.PIPA_SLACK_BOT_TOKEN || await askSecret("Slack bot token (xoxb-): ");
+    const slackAppToken = process.env.PIPA_SLACK_APP_TOKEN || await askSecret("Slack app token (xapp-, input hidden): ", "App token");
+    const slackBotToken = process.env.PIPA_SLACK_BOT_TOKEN || await askSecret("Slack bot token (xoxb-, input hidden): ", "Bot token");
+    io.output.write("\nChecking OpenCode and Slack credentials...\n");
     const result = await initializePipa({ botName, workingDirectory, slackAppToken, slackBotToken });
-    io.output.write(`\nSaved config to ${result.paths.config}. Run \`pipa start\`.\n`);
+    io.output.write(`✓ Credentials validated.\n\nSaved config to ${result.paths.config}. Run \`pipa start\`.\n`);
   } finally {
     prompt.close();
   }
