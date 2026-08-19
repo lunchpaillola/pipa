@@ -12,8 +12,8 @@ try {
   await run("npm", ["install", "--ignore-scripts", "--prefix", path.join(directory, "install"), path.join(directory, filename)]);
 
   const bin = await realpath(path.join(directory, "install", "node_modules", ".bin", process.platform === "win32" ? "pipa.cmd" : "pipa"));
-  const command = process.platform === "win32" ? process.env.ComSpec ?? "cmd.exe" : process.execPath;
-  const args = process.platform === "win32" ? ["/d", "/s", "/c", `"${bin}" --version`] : [bin, "--version"];
+  const command = process.platform === "win32" ? bin : process.execPath;
+  const args = process.platform === "win32" ? ["--version"] : [bin, "--version"];
   const { stdout } = await run(command, args);
   if (stdout.trim() !== packageJson.version) throw new Error(`Packed CLI returned ${JSON.stringify(stdout.trim())}.`);
 
