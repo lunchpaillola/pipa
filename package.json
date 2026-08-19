@@ -1,0 +1,28 @@
+{
+  "name": "@usepipa/pipa",
+  "version": "0.1.0",
+  "description": "Run Pipa locally through Slack and OpenCode",
+  "type": "module",
+  "bin": {
+    "pipa": "bin/pipa.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "test:pack": "node scripts/pack-smoke.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@chat-adapter/slack": "4.38.1",
+    "@chat-adapter/state-memory": "4.38.1",
+    "chat": "4.38.1"
+  }
+}

@@ -1,0 +1,141 @@
+import { constants } from "node:fs";
+import { access, chmod, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+
+const MANIFEST = {
+  display_information: {
+    name: "Pippette",
+    description: "A sharp delivery coworker who helps you ship real work, stay focused, and cut through nonsense.",
+    background_color: "#1f2de6",
+    long_description: "Pippette is a private Lunch Pail Labs coworker running inside local OpenCode. She helps ship real work by reading the workspace, using connected tools when needed, and turning fuzzy asks into concrete outcomes.\r\n\r\nShe is direct, concise, and opinionated: less ceremony, more useful work. She can help with engineering, research, docs, planning, debugging, automation, and day-to-day project maintenance while respecting private context and keeping Lunch Pail Labs data inside the right boundaries.",
+  },
+  features: {
+    bot_user: {
+      display_name: "Pippette",
+      always_online: true,
+    },
+  },
+  oauth_config: {
+    scopes: {
+      user: ["files:read", "files:write"],
+      bot: [
+        "files:read",
+        "app_mentions:read",
+        "channels:history",
+        "chat:write",
+        "groups:history",
+        "groups:read",
+        "reactions:write",
+        "files:write",
+      ],
+    },
+    pkce_enabled: false,
+  },
+  settings: {
+    event_subscriptions: {
+      bot_events: ["app_mention", "message.channels", "message.groups"],
+    },
+    interactivity: { is_enabled: true },
+    org_deploy_enabled: false,
+    socket_mode_enabled: true,
+    token_rotation_enabled: false,
+    is_mcp_enabled: false,
+  },
+};
+
+export function pipaPaths(home = os.homedir()) {
+  const directory = path.join(home, ".pipa");
+  return {
+    directory,
+    config: path.join(directory, "config.json"),
+    manifest: path.join(directory, "slack-manifest.json"),
+    sessions: path.join(directory, "sessions.json"),
+  };
+}
+
+export function createManifest(botName) {
+  const name = validateBotName(botName);
+  const manifest = structuredClone(MANIFEST);
+  manifest.display_information.name = name;
+  manifest.display_information.long_description = manifest.display_information.long_description.replaceAll("Pippette", name);
+  manifest.features.bot_user.display_name = name;
+  return manifest;
+}
+
+export async function canonicalWorkingDirectory(directory) {
+  const resolved = await realpath(path.resolve(directory));
+  await access(resolved, constants.R_OK | constants.W_OK);
+  return resolved;
+}
+
+export async function loadConfig(file = pipaPaths().config) {
+  const config = await readJson(file, "Run `pipa init` first.");
+  for (const key of ["botName", "slackAppToken", "slackBotToken", "workingDirectory"]) {
+    if (typeof config[key] !== "string" || !config[key].trim()) {
+      throw new Error(`Invalid Pipa config: ${key} is missing.`);
+    }
+  }
+  return config;
+}
+
+export async function saveConfig(config, paths = pipaPaths(), manifest = createManifest(config.botName)) {
+  await writePrivateJson(paths.manifest, manifest);
+  await writePrivateJson(paths.config, config);
+}
+
+export async function loadSessions(file = pipaPaths().sessions) {
+  try {
+    const parsed = JSON.parse(await readFile(file, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+    for (const [key, value] of Object.entries(parsed)) {
+      if (typeof value !== "string" || !value) throw new Error(`invalid session for ${key}`);
+    }
+    return parsed;
+  } catch (error) {
+    if (error?.code === "ENOENT") return {};
+    throw new Error(`Could not read Pipa sessions: ${error.message}`);
+  }
+}
+
+export async function createSessionStore(file = pipaPaths().sessions, writeJson = writePrivateJson) {
+  const sessions = await loadSessions(file);
+  let writeTail = Promise.resolve();
+
+  return {
+    keys: () => Object.keys(sessions),
+    get: (conversationKey) => sessions[conversationKey] ?? null,
+    async set(conversationKey, sessionId) {
+      sessions[conversationKey] = sessionId;
+      const write = writeTail.then(() => writeJson(file, sessions));
+      writeTail = write.catch(() => undefined);
+      await write;
+    },
+  };
+}
+
+async function readJson(file, missingMessage) {
+  try {
+    return JSON.parse(await readFile(file, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") throw new Error(missingMessage);
+    throw new Error(`Could not read ${path.basename(file)}: ${error.message}`);
+  }
+}
+
+async function writePrivateJson(file, value) {
+  await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  if (process.platform !== "win32") await chmod(temporary, 0o600);
+  await rename(temporary, file);
+}
+
+function validateBotName(value) {
+  const name = String(value ?? "").trim();
+  if (!name || name.length > 35 || /[\r\n]/u.test(name)) {
+    throw new Error("Bot name must be 1 to 35 characters on one line.");
+  }
+  return name;
+}
