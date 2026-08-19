@@ -37,12 +37,11 @@ try {
     USERPROFILE: home,
     PIPA_HOME: home,
     PIPA_BOT_NAME: "Pack Bot",
-    PIPA_WORKING_DIRECTORY: workingDirectory,
     PIPA_SLACK_APP_TOKEN: "xapp-test",
     PIPA_SLACK_BOT_TOKEN: "xoxb-test",
     NODE_OPTIONS: `--import=${pathToFileURL(path.join(directory, "fetch-mock.mjs")).href}`,
     PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
-  }, "");
+  }, "", workingDirectory);
   if (init.stdout.includes("xapp-test") || init.stdout.includes("xoxb-test")) throw new Error("Packed init echoed Slack credentials.");
   if (init.stdout.includes("api.slack.com/apps?new_app=1")) throw new Error("Non-interactive init opened Slack setup.");
   const configText = await readFile(path.join(home, ".pipa", "config.json"), "utf8").catch((error) => {
@@ -52,14 +51,26 @@ try {
   const manifest = JSON.parse(await readFile(path.join(home, ".pipa", "slack-manifest.json"), "utf8"));
   if (config.botName !== "Pack Bot" || config.workingDirectory !== await realpath(workingDirectory)) throw new Error("Packed init wrote invalid config.");
   if (manifest.display_information.name !== "Pack Bot") throw new Error("Packed init wrote invalid manifest.");
+
+  const cancelledHome = path.join(directory, "cancelled-home");
+  await mkdir(cancelledHome);
+  const cancelled = await run(process.execPath, [installedCli, "init"], {
+    ...process.env,
+    PIPA_HOME: cancelledHome,
+    PIPA_BOT_NAME: "Pack Bot",
+  }, "n\n", workingDirectory);
+  if (!cancelled.stdout.includes("Setup cancelled")) throw new Error("Interactive init did not explain cancellation.");
+  if (await readFile(path.join(cancelledHome, ".pipa", "config.json"), "utf8").then(() => true, () => false)) {
+    throw new Error("Cancelled init wrote config.");
+  }
   process.stdout.write(`Packed CLI ${stdout.trim()} installed, initialized, and ran successfully.\n`);
 } finally {
   await rm(directory, { recursive: true, force: true });
 }
 
-function run(command, args, environment, input) {
+function run(command, args, environment, input, currentDirectory) {
   return new Promise((resolve, reject) => {
-    const child = crossSpawn(command, args, { env: environment ?? process.env, stdio: ["pipe", "pipe", "pipe"] });
+    const child = crossSpawn(command, args, { cwd: currentDirectory, env: environment ?? process.env, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => stdout += chunk);

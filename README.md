@@ -18,9 +18,9 @@ pipa init
 pipa start
 ```
 
-`pipa init` asks for a bot name and working directory, opens Slack with a pre-filled app manifest, and guides you through creating and installing the app. It validates OpenCode and the Slack bot token before storing configuration in `~/.pipa/config.json`. Slack credentials remain local.
+Run `pipa init` from the folder where Pipa should work. It confirms that folder, opens Slack with a pre-filled app manifest, and guides you through creating and installing the app. It validates OpenCode and the Slack bot token before storing configuration in `~/.pipa/config.json`. Slack credentials remain local.
 
-For non-interactive setup, provide `PIPA_BOT_NAME`, `PIPA_WORKING_DIRECTORY`, `PIPA_SLACK_APP_TOKEN`, and `PIPA_SLACK_BOT_TOKEN` when running `pipa init`.
+For non-interactive setup, provide `PIPA_BOT_NAME`, `PIPA_SLACK_APP_TOKEN`, and `PIPA_SLACK_BOT_TOKEN` when running `pipa init`.
 
 In Slack, invite the app to a trusted public or private channel and mention it. Pipa replies in that thread. Later replies in the same thread do not need another mention. The Slack-thread-to-OpenCode-session mapping in `~/.pipa/sessions.json` keeps that conversation connected after Pipa restarts.
 

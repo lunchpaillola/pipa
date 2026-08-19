@@ -34,10 +34,15 @@ async function init(io) {
     const botName = process.env.PIPA_BOT_NAME?.trim()
       || (await prompt.question("What should we call your bot? (leave empty to use Pipa; you can change this later): ")).trim()
       || "Pipa";
-    const workingDirectory = process.env.PIPA_WORKING_DIRECTORY?.trim()
-      || (await prompt.question("What directory should this work in? (leave empty to use the current directory): ")).trim()
-      || process.cwd();
     const hasSlackTokens = process.env.PIPA_SLACK_APP_TOKEN && process.env.PIPA_SLACK_BOT_TOKEN;
+    const workingDirectory = process.cwd();
+    if (!hasSlackTokens) {
+      io.output.write(`\nPipa will work in this folder:\n\n  ${workingDirectory}\n\nPeople in Slack channels where you add ${botName} can ask it to read and change files in this folder.\n\n`);
+      if (!await confirm(prompt, io.output)) {
+        io.output.write("\nSetup cancelled. Change into the folder where you want Pipa to work, then run `pipa init` again.\n");
+        return;
+      }
+    }
     if (!hasSlackTokens) {
       const manifestUrl = createManifestUrl(createManifest(botName));
       io.output.write("\nOpening Slack with your app configuration...\n");
@@ -59,6 +64,15 @@ async function init(io) {
     io.output.write(`\nSaved config to ${result.paths.config}. Run \`pipa start\`.\n`);
   } finally {
     prompt.close();
+  }
+}
+
+async function confirm(prompt, output) {
+  while (true) {
+    const answer = (await prompt.question("Continue? [Y/n]: ")).trim().toLowerCase();
+    if (!answer || answer === "y" || answer === "yes") return true;
+    if (answer === "n" || answer === "no") return false;
+    output.write("Please answer y or n.\n");
   }
 }
 
