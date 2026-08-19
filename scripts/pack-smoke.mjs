@@ -1,22 +1,20 @@
-import { execFile, spawn } from "node:child_process";
+import crossSpawn from "cross-spawn";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { promisify } from "node:util";
 
-const exec = promisify(execFile);
 const directory = await mkdtemp(path.join(os.tmpdir(), "pipa-pack-"));
 const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 const filename = `${packageJson.name.replace("@", "").replace("/", "-")}-${packageJson.version}.tgz`;
 try {
-  await exec("npm", ["pack", "--pack-destination", directory]);
-  await exec("npm", ["install", "--ignore-scripts", "--prefix", path.join(directory, "install"), path.join(directory, filename)]);
+  await run("npm", ["pack", "--pack-destination", directory]);
+  await run("npm", ["install", "--ignore-scripts", "--prefix", path.join(directory, "install"), path.join(directory, filename)]);
 
   const bin = await realpath(path.join(directory, "install", "node_modules", ".bin", process.platform === "win32" ? "pipa.cmd" : "pipa"));
   const command = process.platform === "win32" ? process.env.ComSpec ?? "cmd.exe" : process.execPath;
   const args = process.platform === "win32" ? ["/d", "/s", "/c", `"${bin}" --version`] : [bin, "--version"];
-  const { stdout } = await exec(command, args);
+  const { stdout } = await run(command, args);
   if (stdout.trim() !== packageJson.version) throw new Error(`Packed CLI returned ${JSON.stringify(stdout.trim())}.`);
 
   const home = path.join(directory, "home");
@@ -60,13 +58,13 @@ try {
 
 function run(command, args, environment, input) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { env: environment, stdio: ["pipe", "pipe", "pipe"] });
+    const child = crossSpawn(command, args, { env: environment ?? process.env, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => stdout += chunk);
     child.stderr.on("data", (chunk) => stderr += chunk);
     child.once("error", reject);
     child.once("close", (code) => code === 0 ? resolve({ stdout, stderr }) : reject(new Error(stderr || `CLI exited ${code}`)));
-    child.stdin.end(input);
+    child.stdin.end(input ?? "");
   });
 }
