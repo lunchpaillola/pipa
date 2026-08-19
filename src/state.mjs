@@ -7,9 +7,9 @@ import { randomUUID } from "node:crypto";
 const MANIFEST = {
   display_information: {
     name: "Pippette",
-    description: "A sharp delivery coworker who helps you ship real work, stay focused, and cut through nonsense.",
+    description: "Pippette is your autonomous agent in Slack, built by Lunch Pail Labs.",
     background_color: "#1f2de6",
-    long_description: "Pippette is a private Lunch Pail Labs coworker running inside local OpenCode. She helps ship real work by reading the workspace, using connected tools when needed, and turning fuzzy asks into concrete outcomes.\r\n\r\nShe is direct, concise, and opinionated: less ceremony, more useful work. She can help with engineering, research, docs, planning, debugging, automation, and day-to-day project maintenance while respecting private context and keeping Lunch Pail Labs data inside the right boundaries.",
+    long_description: "Pippette is your autonomous agent in Slack, built by Lunch Pail Labs. It connects Slack to OpenCode running on your computer so you can ask it to work in a chosen folder and continue conversations in threads. Pippette runs locally and keeps your Slack credentials on your machine.",
   },
   features: {
     bot_user: {
@@ -79,6 +79,7 @@ export function createManifest(botName) {
   const name = validateBotName(botName);
   const manifest = structuredClone(MANIFEST);
   manifest.display_information.name = name;
+  manifest.display_information.description = manifest.display_information.description.replaceAll("Pippette", name);
   manifest.display_information.long_description = manifest.display_information.long_description.replaceAll("Pippette", name);
   manifest.features.bot_user.display_name = name;
   return manifest;

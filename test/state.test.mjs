@@ -9,6 +9,7 @@ test("manifest preserves approved capabilities and substitutes the bot name", ()
   const manifest = createManifest('Workshop "Bot"');
   assert.equal(manifest.display_information.name, 'Workshop "Bot"');
   assert.equal(manifest.features.bot_user.display_name, 'Workshop "Bot"');
+  assert.match(manifest.display_information.description, /^Workshop "Bot" /u);
   assert.match(manifest.display_information.long_description, /^Workshop "Bot" /u);
   assert.deepEqual(manifest.oauth_config.scopes.user, ["files:read", "files:write"]);
   assert.ok(manifest.oauth_config.scopes.bot.includes("users:read"));
