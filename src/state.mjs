@@ -7,9 +7,9 @@ import { randomUUID } from "node:crypto";
 const MANIFEST = {
   display_information: {
     name: "Pippette",
-    description: "Pippette is your Slack agent, powered by OpenCode and built by Lunch Pail Labs.",
+    description: "Pippette connects Slack to OpenCode running on your computer.",
     background_color: "#1f2de6",
-    long_description: "Pippette connects Slack to OpenCode running on your computer. Mention Pippette in a channel to ask it to work in your chosen folder, then continue the conversation in the same thread. Pippette runs locally and keeps your Slack credentials on your machine. Built by Lunch Pail Labs.",
+    long_description: "Pippette connects Slack to the OpenCode installed on your computer. Send text requests from Slack and receive replies in threads for the local folder you choose. OpenCode runs locally, and your Slack credentials stay on your machine. Learn more at usepipa.com.",
   },
   features: {
     bot_user: {
