@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { access, chmod, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
+import { access, chmod, link, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -45,14 +45,33 @@ const MANIFEST = {
   },
 };
 
-export function pipaPaths(home = os.homedir()) {
+export function pipaPaths(home = process.env.PIPA_HOME || os.homedir()) {
   const directory = path.join(home, ".pipa");
   return {
     directory,
     config: path.join(directory, "config.json"),
     manifest: path.join(directory, "slack-manifest.json"),
+    lock: path.join(directory, "pipa.lock"),
     sessions: path.join(directory, "sessions.json"),
   };
+}
+
+export async function acquireInstanceLock(file = pipaPaths().lock) {
+  await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, String(process.pid), { mode: 0o600 });
+  try {
+    await claimLock(temporary, file);
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    const pid = Number.parseInt(await readFile(file, "utf8").catch(() => ""), 10);
+    if (pid && isRunning(pid)) throw new Error(`Pipa is already running (PID ${pid}).`);
+    await rm(file, { force: true });
+    await claimLock(temporary, file);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+  return () => rm(file, { force: true });
 }
 
 export function createManifest(botName) {
@@ -66,6 +85,7 @@ export function createManifest(botName) {
 
 export async function canonicalWorkingDirectory(directory) {
   const resolved = await realpath(path.resolve(directory));
+  if (!(await stat(resolved)).isDirectory()) throw new Error("Working directory must be a directory.");
   await access(resolved, constants.R_OK | constants.W_OK);
   return resolved;
 }
@@ -127,9 +147,13 @@ async function readJson(file, missingMessage) {
 async function writePrivateJson(file, value) {
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  if (process.platform !== "win32") await chmod(temporary, 0o600);
-  await rename(temporary, file);
+  try {
+    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    if (process.platform !== "win32") await chmod(temporary, 0o600);
+    await rename(temporary, file);
+  } finally {
+    await rm(temporary, { force: true });
+  }
 }
 
 function validateBotName(value) {
@@ -138,4 +162,17 @@ function validateBotName(value) {
     throw new Error("Bot name must be 1 to 35 characters on one line.");
   }
   return name;
+}
+
+function isRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function claimLock(source, destination) {
+  return link(source, destination);
 }

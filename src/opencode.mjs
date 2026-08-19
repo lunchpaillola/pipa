@@ -1,4 +1,4 @@
-import { spawn as nodeSpawn } from "node:child_process";
+import crossSpawn from "cross-spawn";
 
 const SECRET_ENV_KEYS = new Set([
   "PIPA_SLACK_APP_TOKEN",
@@ -8,11 +8,11 @@ const SECRET_ENV_KEYS = new Set([
 ]);
 
 export function opencodeCommand(platform = process.platform) {
-  return platform === "win32" ? "opencode.cmd" : "opencode";
+  return "opencode";
 }
 
 export function cleanChildEnvironment(environment = process.env) {
-  return Object.fromEntries(Object.entries(environment).filter(([key]) => !SECRET_ENV_KEYS.has(key)));
+  return Object.fromEntries(Object.entries(environment).filter(([key]) => !SECRET_ENV_KEYS.has(key.toUpperCase())));
 }
 
 export function buildRunArguments({ prompt, sessionId, workingDirectory }) {
@@ -23,59 +23,74 @@ export function buildRunArguments({ prompt, sessionId, workingDirectory }) {
 }
 
 export function createOpenCodeExecutor(options = {}) {
-  const spawn = options.spawn ?? nodeSpawn;
+  const spawn = options.spawn ?? crossSpawn;
   const platform = options.platform ?? process.platform;
   const environment = options.environment ?? process.env;
+  const timeoutMs = options.timeoutMs ?? 2.5 * 60 * 60 * 1000;
   const children = new Set();
 
-  async function runTurn({ prompt, sessionId, workingDirectory }) {
+  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {} }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     const child = spawn(opencodeCommand(platform), buildRunArguments({ prompt, sessionId, workingDirectory }), {
       cwd: workingDirectory,
-      env: cleanChildEnvironment(environment),
+      env: { ...cleanChildEnvironment(environment), ...contextEnvironment },
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
     });
     children.add(child);
     const exit = waitForExit(child);
+    void exit.finally(() => children.delete(child)).catch(() => undefined);
+    let timer;
 
     try {
-      const [stdout, stderr, code] = await Promise.all([
-        collect(child.stdout),
-        collect(child.stderr),
-        exit,
-      ]);
+      const operation = Promise.all([collect(child.stdout), collect(child.stderr), exit]);
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          terminateChild(child, platform);
+          reject(new Error(`OpenCode timed out after ${timeoutMs}ms.`));
+        }, timeoutMs);
+      });
+      const [stdout, stderr, code] = await Promise.race([operation, timeout]);
       const output = parseOpenCodeOutput(stdout);
+      if (output.error) throw new Error(output.error);
       if (code !== 0) throw new Error(output.error || stderr.trim() || `OpenCode exited with code ${code}.`);
       if (!output.text) throw new Error("OpenCode completed without assistant text.");
       return { text: output.text, sessionId: output.sessionId ?? sessionId ?? null };
     } catch (error) {
-      child.kill();
-      await exit.catch(() => undefined);
+      terminateChild(child, platform);
       throw error;
     } finally {
-      children.delete(child);
+      clearTimeout(timer);
     }
   }
 
   return {
     runTurn,
     stopAll() {
-      for (const child of children) child.kill();
+      for (const child of children) terminateChild(child, platform);
     },
   };
 }
 
 export async function runOpenCodeVersion(options = {}) {
-  const spawn = options.spawn ?? nodeSpawn;
+  const spawn = options.spawn ?? crossSpawn;
   const platform = options.platform ?? process.platform;
+  const timeoutMs = options.timeoutMs ?? 30_000;
   const child = spawn(opencodeCommand(platform), ["--version"], {
     env: cleanChildEnvironment(options.environment ?? process.env),
     shell: false,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  let timer;
   try {
-    const [stdout, stderr, code] = await Promise.all([collect(child.stdout), collect(child.stderr), waitForExit(child)]);
+    const operation = Promise.all([collect(child.stdout), collect(child.stderr), waitForExit(child)]);
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        terminateChild(child, platform);
+        reject(new Error(`OpenCode version check timed out after ${timeoutMs}ms.`));
+      }, timeoutMs);
+    });
+    const [stdout, stderr, code] = await Promise.race([operation, timeout]);
     if (code !== 0) throw new Error(stderr.trim() || "OpenCode version check failed.");
     return stdout.trim();
   } catch (error) {
@@ -83,6 +98,8 @@ export async function runOpenCodeVersion(options = {}) {
       throw new Error("OpenCode is unavailable. Install it and make sure `opencode --version` succeeds.");
     }
     throw error;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -125,4 +142,14 @@ function waitForExit(child) {
     child.once("error", reject);
     child.once("close", (code) => resolve(code ?? 1));
   });
+}
+
+function terminateChild(child, platform) {
+  if (platform === "win32" && child.pid) {
+    crossSpawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
+    return;
+  }
+  child.kill();
+  const force = setTimeout(() => child.kill("SIGKILL"), 5_000);
+  force.unref?.();
 }

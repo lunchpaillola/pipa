@@ -13,7 +13,8 @@ export async function initializePipa(input, options = {}) {
     slackBotToken: requireToken(input.slackBotToken, "Slack bot token", "xoxb-"),
     workingDirectory: await canonicalWorkingDirectory(input.workingDirectory),
   };
-  await (options.checkOpenCode ?? runOpenCodeVersion)();
+  const openCodeVersion = await (options.checkOpenCode ?? runOpenCodeVersion)();
+  if (!/^v?1(?:\.|$)/u.test(openCodeVersion)) throw new Error(`Pipa requires OpenCode v1; found ${openCodeVersion || "an unknown version"}.`);
   await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
 
   await saveConfig(config, paths, manifest);
@@ -23,46 +24,59 @@ export async function initializePipa(input, options = {}) {
 export async function startPipa(options = {}) {
   const paths = options.paths ?? pipaPaths();
   const config = options.config ?? await loadConfig(paths.config);
+  await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
   const sessionStore = options.sessionStore ?? await createSessionStore(paths.sessions);
   const executor = options.executor ?? createOpenCodeExecutor();
   const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn });
-  const slack = options.slack ?? createSlackAdapter({
-    appToken: config.slackAppToken,
-    botToken: config.slackBotToken,
-    mode: "socket",
-    userName: config.botName,
-  });
+  const state = options.state ?? createMemoryState();
   const chat = options.chat ?? new Chat({
-    adapters: { slack },
+    adapters: {
+      slack: createSlackAdapter({
+        appToken: config.slackAppToken,
+        botToken: config.slackBotToken,
+        mode: "socket",
+        userName: config.botName,
+        webClientOptions: { timeout: 30_000, retryConfig: { retries: 0 } },
+      }),
+    },
     concurrency: "concurrent",
-    state: createMemoryState(),
+    state,
     userName: config.botName,
   });
   let accepting = true;
 
   const handle = async (thread, message, subscribe) => {
     if (!accepting || shouldIgnore(thread, message)) return;
-    const prompt = stripMention(message.text);
+    const prompt = subscribe || message.isMention ? stripMention(message.text) : message.text.trim();
     if (!prompt) return;
     if (subscribe) await thread.subscribe();
     if (!accepting) return;
 
     try {
-      const result = await runner.enqueue(thread.id, {
+      await runner.enqueue(thread.id, {
         prompt,
         workingDirectory: config.workingDirectory,
+        contextEnvironment: slackContext(thread, message),
+        deliver: (text) => postInChunks(thread, text),
+        deliverFailure: (error) => thread.post(`Pipa failed: ${safeError(error)}`),
       });
-      await thread.post(result.text);
     } catch (error) {
-      await thread.post(`Pipa failed: ${safeError(error)}`);
+      process.stderr.write("Pipa could not complete or deliver a Slack turn.\n");
     }
   };
 
   chat.onNewMention((thread, message) => handle(thread, message, true));
   chat.onSubscribedMessage((thread, message) => handle(thread, message, false));
-  await chat.initialize();
-  for (const conversationKey of sessionStore.keys()) {
-    await chat.thread(conversationKey).subscribe();
+  try {
+    await state.connect();
+    for (const conversationKey of sessionStore.keys()) {
+      await chat.thread(conversationKey).subscribe();
+    }
+    await withTimeout(chat.initialize(), options.startupTimeoutMs ?? 30_000, "Slack Socket Mode startup timed out.");
+  } catch (error) {
+    executor.stopAll();
+    await withTimeout(chat.shutdown(), options.shutdownTimeoutMs ?? 15_000, "Slack shutdown timed out.").catch(() => undefined);
+    throw error;
   }
 
   return {
@@ -70,8 +84,10 @@ export async function startPipa(options = {}) {
       accepting = false;
       runner.close();
       executor.stopAll();
-      await runner.drain();
-      await chat.shutdown();
+      await withTimeout((async () => {
+        await runner.drain();
+        await chat.shutdown();
+      })(), options.shutdownTimeoutMs ?? 15_000, "Pipa shutdown timed out.");
     },
   };
 }
@@ -85,10 +101,19 @@ export function createConversationRunner({ sessionStore, runTurn }) {
     const previous = tails.get(conversationKey) ?? Promise.resolve();
     const current = previous.catch(() => undefined).then(async () => {
       if (closed) throw new Error("Pipa is shutting down.");
-      const result = await runTurn({ ...input, sessionId: sessionStore.get(conversationKey) });
-      if (result.sessionId && result.sessionId !== sessionStore.get(conversationKey)) {
-        await sessionStore.set(conversationKey, result.sessionId);
+      const { deliver, deliverFailure, ...turn } = input;
+      let result;
+      try {
+        result = await runTurn({ ...turn, sessionId: sessionStore.get(conversationKey) });
+        if (result.sessionId) await sessionStore.set(conversationKey, result.sessionId);
+      } catch (error) {
+        if (deliverFailure) {
+          await deliverFailure(error);
+          return { error };
+        }
+        throw error;
       }
+      if (deliver) await deliver(result.text);
       return result;
     });
     const tail = current.then(() => undefined, () => undefined);
@@ -111,6 +136,7 @@ export async function checkSlackToken(token, fetchImpl = fetch) {
   const response = await fetchImpl("https://slack.com/api/auth.test", {
     method: "POST",
     headers: { authorization: `Bearer ${botToken}` },
+    signal: AbortSignal.timeout(15_000),
   });
   const result = await response.json();
   if (!response.ok || !result.ok) throw new Error("Slack rejected the bot token.");
@@ -119,6 +145,7 @@ export async function checkSlackToken(token, fetchImpl = fetch) {
 
 function shouldIgnore(thread, message) {
   return message.author?.isMe
+    || message.author?.isBot
     || thread.channel?.isDM
     || thread.channel?.channelVisibility === "external"
     || Boolean(message.raw?.subtype)
@@ -126,7 +153,7 @@ function shouldIgnore(thread, message) {
 }
 
 function stripMention(text = "") {
-  return text.replace(/^\s*<@[^>]+>\s*/u, "").trim();
+  return text.replace(/(?:<@|@)[UW][A-Z0-9]+>?/u, "").trim();
 }
 
 function requireToken(value, label, prefix) {
@@ -138,4 +165,32 @@ function requireToken(value, label, prefix) {
 function safeError(error) {
   const message = error instanceof Error ? error.message : String(error);
   return message.replace(/xox[baprs]-[^\s]+|xapp-[^\s]+/gu, "[redacted]");
+}
+
+function slackContext(thread, message) {
+  const [, channelId = "", threadTs = ""] = thread.id.split(":");
+  return {
+    PIPA_MESSAGE_CHANNEL: "slack",
+    PIPA_CURRENT_SLACK_CHANNEL_ID: channelId,
+    PIPA_CURRENT_SLACK_THREAD_TS: threadTs,
+    PIPA_REQUESTER_SLACK_USER_ID: message.author?.userId ?? message.author?.id ?? "",
+  };
+}
+
+async function postInChunks(thread, text) {
+  for (let index = 0; index < text.length; index += 3500) {
+    await thread.post(text.slice(index, index + 3500));
+  }
+}
+
+async function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => timer = setTimeout(() => reject(new Error(message)), timeoutMs)),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }

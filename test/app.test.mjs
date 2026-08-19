@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { checkSlackToken, createConversationRunner, initializePipa, startPipa } from "../src/app.mjs";
-import { pipaPaths } from "../src/state.mjs";
+import { createSessionStore, pipaPaths } from "../src/state.mjs";
 
 test("init validates dependencies before replacing config", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-init-"));
@@ -12,11 +12,20 @@ test("init validates dependencies before replacing config", async () => {
   const input = { botName: "Local Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: home };
   await initializePipa(input, { paths, checkOpenCode: async () => "1.0.0", checkSlackToken: async () => ({ ok: true }) });
   const before = await readFile(paths.config, "utf8");
-  await assert.rejects(
-    initializePipa({ ...input, slackBotToken: "xoxb-rejected" }, { paths, checkOpenCode: async () => "1.0.0", checkSlackToken: async () => { throw new Error("rejected"); } }),
-    /rejected/u,
-  );
-  assert.equal(await readFile(paths.config, "utf8"), before);
+  const manifestBefore = await readFile(paths.manifest, "utf8");
+  const file = path.join(home, "not-a-directory");
+  await writeFile(file, "x");
+  const failures = [
+    () => initializePipa({ ...input, workingDirectory: file }, { paths, checkOpenCode: async () => "1.0.0", checkSlackToken: async () => ({ ok: true }) }),
+    () => initializePipa(input, { paths, checkOpenCode: async () => { throw new Error("OpenCode missing"); }, checkSlackToken: async () => ({ ok: true }) }),
+    () => initializePipa(input, { paths, checkOpenCode: async () => "2.0.0", checkSlackToken: async () => ({ ok: true }) }),
+    () => initializePipa({ ...input, slackBotToken: "xoxb-rejected" }, { paths, checkOpenCode: async () => "1.0.0", checkSlackToken: async () => { throw new Error("rejected"); } }),
+  ];
+  for (const fail of failures) {
+    await assert.rejects(fail());
+    assert.equal(await readFile(paths.config, "utf8"), before);
+    assert.equal(await readFile(paths.manifest, "utf8"), manifestBefore);
+  }
   assert.doesNotMatch(before.replace("xapp-test", "").replace("xoxb-test", ""), /xoxb|xapp/u);
 });
 
@@ -96,6 +105,31 @@ test("closing the runner prevents queued turns from starting", async () => {
   assert.deepEqual(prompts, ["active"]);
 });
 
+test("conversation tail preserves Slack delivery order", async () => {
+  const events = [];
+  let releaseDelivery;
+  const runner = createConversationRunner({
+    sessionStore: { get: () => null, set: async () => undefined },
+    runTurn: async ({ prompt }) => {
+      events.push(`run:${prompt}`);
+      return { text: prompt, sessionId: `ses_${prompt}` };
+    },
+  });
+  const first = runner.enqueue("A", {
+    prompt: "one",
+    deliver: async () => {
+      events.push("deliver:one");
+      await new Promise((resolve) => releaseDelivery = resolve);
+    },
+  });
+  const second = runner.enqueue("A", { prompt: "two", deliver: async () => events.push("deliver:two") });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ["run:one", "deliver:one"]);
+  releaseDelivery();
+  await Promise.all([first, second]);
+  assert.deepEqual(events, ["run:one", "deliver:one", "run:two", "deliver:two"]);
+});
+
 test("Slack composition subscribes mentions, restores sessions, and ignores unsupported traffic", async () => {
   const handlers = {};
   const restored = [];
@@ -107,30 +141,123 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
     thread(id) { return { subscribe: async () => restored.push(id) }; },
     async shutdown() { restored.push("shutdown"); },
   };
+  const calls = [];
   const executor = {
-    runTurn: async ({ prompt, sessionId }) => ({ text: `${prompt}:${sessionId ?? "new"}`, sessionId: sessionId ?? "ses_1" }),
+    runTurn: async ({ prompt, sessionId, contextEnvironment }) => {
+      calls.push({ prompt, sessionId, contextEnvironment });
+      if (prompt === "secret failure") throw new Error("bad xoxb-secret and xapp-secret");
+      return { text: prompt === "long" ? "x".repeat(7001) : `${prompt}:${sessionId ?? "new"}`, sessionId: sessionId ?? "ses_1" };
+    },
     stopAll() { restored.push("stopped"); },
   };
-  const sessions = new Map([["slack:C1:1.0", "ses_old"]]);
-  const sessionStore = {
-    keys: () => [...sessions.keys()],
-    get: (key) => sessions.get(key) ?? null,
-    async set(key, value) { sessions.set(key, value); },
-  };
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-restart-"));
+  const sessionFile = pipaPaths(home).sessions;
+  const firstStore = await createSessionStore(sessionFile);
+  await firstStore.set("slack:C1:1.0", "ses_old");
+  const sessionStore = await createSessionStore(sessionFile);
   const app = await startPipa({
     chat,
     executor,
     sessionStore,
+    checkSlackToken: async () => ({ ok: true }),
     config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
   });
-  assert.deepEqual(restored, ["initialized", "slack:C1:1.0"]);
+  assert.deepEqual(restored, ["slack:C1:1.0", "initialized"]);
+
+  const human = { id: "U3", userId: "U3", isMe: false, isBot: false };
+  const restoredPosts = [];
+  const restoredThread = { id: "slack:C1:1.0", channel: { isDM: false, channelVisibility: "private" }, post: async (text) => restoredPosts.push(text) };
+  await handlers.subscribed(restoredThread, { text: "continue", author: human, raw: {} });
+  assert.deepEqual(restoredPosts, ["continue:ses_old"]);
+  assert.equal(calls[0].sessionId, "ses_old");
 
   const thread = { id: "slack:C2:2.0", channel: { isDM: false, channelVisibility: "private" }, subscribe: async () => restored.push("subscribed"), post: async (text) => posts.push(text) };
-  await handlers.mention(thread, { text: "<@U1> ask <@U2> for help", author: { isMe: false }, raw: {} });
-  await handlers.subscribed(thread, { text: "follow up", author: { isMe: false }, raw: {} });
-  await handlers.subscribed({ ...thread, channel: { isDM: true } }, { text: "ignored", author: { isMe: false }, raw: {} });
-  assert.deepEqual(posts, ["ask <@U2> for help:new", "follow up:ses_1"]);
+  await handlers.mention(thread, { text: "@U1 ask <@U2> for help", author: human, raw: {} });
+  await handlers.subscribed(thread, { text: "<@U2> follow up", author: human, raw: {} });
+  const beforeIgnored = calls.length;
+  for (const [threadOverride, messageOverride] of [
+    [{ channel: { isDM: true } }, {}],
+    [{ channel: { isDM: false, channelVisibility: "external" } }, {}],
+    [{}, { author: { ...human, isMe: true } }],
+    [{}, { author: { ...human, isBot: true } }],
+    [{}, { raw: { subtype: "message_changed" } }],
+    [{}, { text: "  " }],
+  ]) {
+    await handlers.subscribed({ ...thread, ...threadOverride }, { text: "ignored", author: human, raw: {}, ...messageOverride });
+  }
+  assert.equal(calls.length, beforeIgnored);
+  await handlers.subscribed(thread, { text: "long", author: human, raw: {} });
+  await handlers.subscribed(thread, { text: "secret failure", author: human, raw: {} });
+  assert.deepEqual(posts.slice(0, 2), ["ask <@U2> for help:new", "<@U2> follow up:ses_1"]);
+  assert.deepEqual(posts.slice(2, 5).map((part) => part.length), [3500, 3500, 1]);
+  assert.equal(posts.at(-1), "Pipa failed: bad [redacted] and [redacted]");
+  assert.deepEqual(calls.find(({ prompt }) => prompt.startsWith("ask ")).contextEnvironment, {
+    PIPA_MESSAGE_CHANNEL: "slack",
+    PIPA_CURRENT_SLACK_CHANNEL_ID: "C2",
+    PIPA_CURRENT_SLACK_THREAD_TS: "2.0",
+    PIPA_REQUESTER_SLACK_USER_ID: "U3",
+  });
   assert.equal(restored.filter((item) => item === "subscribed").length, 1);
   await app.shutdown();
   assert.deepEqual(restored.slice(-2), ["stopped", "shutdown"]);
+});
+
+test("startup cleans up Chat when restored subscription setup fails", async () => {
+  const events = [];
+  const chat = {
+    onNewMention() {},
+    onSubscribedMessage() {},
+    thread() { return { subscribe: async () => { throw new Error("restore failed"); } }; },
+    async initialize() { events.push("initialized"); },
+    async shutdown() { events.push("shutdown"); },
+  };
+  const executor = { runTurn: async () => undefined, stopAll: () => events.push("stopped") };
+  await assert.rejects(startPipa({
+    chat,
+    executor,
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => ["slack:C1:1"], get: () => "ses_1", set: async () => undefined },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+  }), /restore failed/u);
+  assert.deepEqual(events, ["stopped", "shutdown"]);
+});
+
+test("startup timeout shuts Chat down", async () => {
+  const events = [];
+  const chat = {
+    onNewMention() {},
+    onSubscribedMessage() {},
+    async initialize() { await new Promise(() => undefined); },
+    async shutdown() { events.push("shutdown"); },
+  };
+  await assert.rejects(startPipa({
+    chat,
+    state: { connect: async () => undefined },
+    startupTimeoutMs: 5,
+    checkSlackToken: async () => ({ ok: true }),
+    executor: { runTurn: async () => undefined, stopAll: () => events.push("stopped") },
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+  }), /startup timed out/u);
+  assert.deepEqual(events, ["stopped", "shutdown"]);
+});
+
+test("shutdown returns after its deadline when Chat does not disconnect", async () => {
+  const chat = {
+    onNewMention() {},
+    onSubscribedMessage() {},
+    async initialize() {},
+    async shutdown() { await new Promise(() => undefined); },
+  };
+  const app = await startPipa({
+    chat,
+    state: { connect: async () => undefined },
+    startupTimeoutMs: 50,
+    shutdownTimeoutMs: 5,
+    checkSlackToken: async () => ({ ok: true }),
+    executor: { runTurn: async () => undefined, stopAll() {} },
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+  });
+  await assert.rejects(app.shutdown(), /shutdown timed out/u);
 });

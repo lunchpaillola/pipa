@@ -20,9 +20,13 @@
     "node": ">=22"
   },
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@chat-adapter/slack": "4.38.1",
     "@chat-adapter/state-memory": "4.38.1",
-    "chat": "4.38.1"
+    "chat": "4.38.1",
+    "cross-spawn": "7.0.6"
   }
 }

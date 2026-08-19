@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createManifest, createSessionStore, loadSessions, pipaPaths, saveConfig } from "../src/state.mjs";
+import { acquireInstanceLock, createManifest, createSessionStore, loadSessions, pipaPaths, saveConfig } from "../src/state.mjs";
 
 test("manifest preserves approved capabilities and substitutes the bot name", () => {
   const manifest = createManifest('Workshop "Bot"');
@@ -48,4 +48,18 @@ test("a failed session write does not poison later writes", async () => {
   await assert.rejects(store.set("slack:C1:1", "ses_1"), /disk unavailable/u);
   await store.set("slack:C2:2", "ses_2");
   assert.equal(writes, 2);
+});
+
+test("instance lock rejects a second process and can be reacquired", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-lock-"));
+  const file = pipaPaths(home).lock;
+  const release = await acquireInstanceLock(file);
+  await assert.rejects(acquireInstanceLock(file), /already running/u);
+  await release();
+  const releaseAgain = await acquireInstanceLock(file);
+  await releaseAgain();
+
+  const simultaneous = await Promise.allSettled([acquireInstanceLock(file), acquireInstanceLock(file)]);
+  assert.deepEqual(simultaneous.map(({ status }) => status).sort(), ["fulfilled", "rejected"]);
+  await simultaneous.find(({ status }) => status === "fulfilled").value();
 });
