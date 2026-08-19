@@ -5,14 +5,13 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import { buildRunArguments, cleanChildEnvironment, createOpenCodeExecutor, opencodeCommand, parseOpenCodeOutput, runOpenCodeVersion } from "../src/opencode.mjs";
+import { buildRunArguments, cleanChildEnvironment, createOpenCodeExecutor, parseOpenCodeOutput, runOpenCodeVersion } from "../src/opencode.mjs";
 
 test("builds shell-free continuation arguments with a literal prompt", () => {
   const prompt = "summarize $(touch nope) && echo bad";
   assert.deepEqual(buildRunArguments({ prompt, sessionId: "ses_1", workingDirectory: "/work" }), [
     "run", "--format", "json", "--dir", "/work", "--session", "ses_1", "--", prompt,
   ]);
-  assert.equal(opencodeCommand("win32"), "opencode");
 });
 
 test("removes Slack credentials from the child environment regardless of casing", () => {

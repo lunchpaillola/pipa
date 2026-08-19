@@ -7,10 +7,6 @@ const SECRET_ENV_KEYS = new Set([
   "SLACK_BOT_TOKEN",
 ]);
 
-export function opencodeCommand(platform = process.platform) {
-  return "opencode";
-}
-
 export function cleanChildEnvironment(environment = process.env) {
   return Object.fromEntries(Object.entries(environment).filter(([key]) => !SECRET_ENV_KEYS.has(key.toUpperCase())));
 }
@@ -31,7 +27,7 @@ export function createOpenCodeExecutor(options = {}) {
 
   async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {} }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
-    const child = spawn(opencodeCommand(platform), buildRunArguments({ prompt, sessionId, workingDirectory }), {
+    const child = spawn("opencode", buildRunArguments({ prompt, sessionId, workingDirectory }), {
       cwd: workingDirectory,
       env: { ...cleanChildEnvironment(environment), ...contextEnvironment },
       shell: false,
@@ -76,7 +72,7 @@ export async function runOpenCodeVersion(options = {}) {
   const spawn = options.spawn ?? crossSpawn;
   const platform = options.platform ?? process.platform;
   const timeoutMs = options.timeoutMs ?? 30_000;
-  const child = spawn(opencodeCommand(platform), ["--version"], {
+  const child = spawn("opencode", ["--version"], {
     env: cleanChildEnvironment(options.environment ?? process.env),
     shell: false,
     stdio: ["ignore", "pipe", "pipe"],
