@@ -7,9 +7,9 @@ import { randomUUID } from "node:crypto";
 const MANIFEST = {
   display_information: {
     name: "Pippette",
-    description: "Pippette is your autonomous agent in Slack, built by Lunch Pail Labs.",
+    description: "Pippette is your Slack agent, powered by OpenCode and built by Lunch Pail Labs.",
     background_color: "#1f2de6",
-    long_description: "Pippette is your autonomous agent in Slack, built by Lunch Pail Labs. It connects Slack to OpenCode running on your computer so you can ask it to work in a chosen folder and continue conversations in threads. Pippette runs locally and keeps your Slack credentials on your machine.",
+    long_description: "Pippette connects Slack to OpenCode running on your computer. Mention Pippette in a channel to ask it to work in your chosen folder, then continue the conversation in the same thread. Pippette runs locally and keeps your Slack credentials on your machine. Built by Lunch Pail Labs.",
   },
   features: {
     bot_user: {
