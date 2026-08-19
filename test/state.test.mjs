@@ -11,6 +11,7 @@ test("manifest preserves approved capabilities and substitutes the bot name", ()
   assert.equal(manifest.features.bot_user.display_name, 'Workshop "Bot"');
   assert.match(manifest.display_information.long_description, /^Workshop "Bot" /u);
   assert.deepEqual(manifest.oauth_config.scopes.user, ["files:read", "files:write"]);
+  assert.ok(manifest.oauth_config.scopes.bot.includes("users:read"));
   assert.deepEqual(manifest.settings.event_subscriptions.bot_events, ["app_mention", "message.channels", "message.groups"]);
   assert.equal(manifest.settings.interactivity.is_enabled, true);
   assert.equal(manifest.settings.socket_mode_enabled, true);

@@ -28,6 +28,7 @@ const MANIFEST = {
         "groups:history",
         "groups:read",
         "reactions:write",
+        "users:read",
         "files:write",
       ],
     },
