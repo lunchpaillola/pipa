@@ -53,15 +53,18 @@ export async function startPipa(options = {}) {
     if (subscribe) await thread.subscribe();
     if (!accepting) return;
 
+    await react(thread, message, "eyes");
     try {
-      await runner.enqueue(thread.id, {
+      const result = await runner.enqueue(thread.id, {
         prompt,
         workingDirectory: config.workingDirectory,
         contextEnvironment: slackContext(thread, message),
         deliver: (text) => postInChunks(thread, text),
         deliverFailure: (error) => thread.post(`Pipa failed: ${safeError(error)}`),
       });
+      await finishReaction(thread, message, result.error ? "warning" : "white_check_mark");
     } catch (error) {
+      await finishReaction(thread, message, "warning");
       process.stderr.write("Pipa could not complete or deliver a Slack turn.\n");
     }
   };
@@ -198,6 +201,17 @@ async function postInChunks(thread, text) {
   for (let index = 0; index < text.length; index += 3500) {
     await thread.post(text.slice(index, index + 3500));
   }
+}
+
+async function react(thread, message, emoji) {
+  if (!message.id) return;
+  await thread.adapter.addReaction(thread.id, message.id, emoji).catch(() => undefined);
+}
+
+async function finishReaction(thread, message, emoji) {
+  if (!message.id) return;
+  await thread.adapter.removeReaction(thread.id, message.id, "eyes").catch(() => undefined);
+  await react(thread, message, emoji);
 }
 
 async function withTimeout(promise, timeoutMs, message) {

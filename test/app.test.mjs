@@ -140,6 +140,7 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   const handlers = {};
   const restored = [];
   const posts = [];
+  const reactions = [];
   const chat = {
     onNewMention(handler) { handlers.mention = handler; },
     onSubscribedMessage(handler) { handlers.subscribed = handler; },
@@ -177,9 +178,13 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   assert.deepEqual(restoredPosts, ["continue:ses_old"]);
   assert.equal(calls[0].sessionId, "ses_old");
 
-  const thread = { id: "slack:C2:2.0", channel: { isDM: false, channelVisibility: "private" }, subscribe: async () => restored.push("subscribed"), post: async (text) => posts.push(text) };
-  await handlers.mention(thread, { text: "@U1 ask <@U2> for help", author: human, raw: {} });
-  await handlers.subscribed(thread, { text: "<@U2> follow up", author: human, raw: {} });
+  const adapter = {
+    addReaction: async (_, messageId, emoji) => reactions.push(`add:${messageId}:${emoji}`),
+    removeReaction: async (_, messageId, emoji) => reactions.push(`remove:${messageId}:${emoji}`),
+  };
+  const thread = { id: "slack:C2:2.0", adapter, channel: { isDM: false, channelVisibility: "private" }, subscribe: async () => restored.push("subscribed"), post: async (text) => posts.push(text) };
+  await handlers.mention(thread, { id: "1", text: "@U1 ask <@U2> for help", author: human, raw: {} });
+  await handlers.subscribed(thread, { id: "2", text: "<@U2> follow up", author: human, raw: {} });
   const beforeIgnored = calls.length;
   for (const [threadOverride, messageOverride] of [
     [{ channel: { isDM: true } }, {}],
@@ -192,8 +197,8 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
     await handlers.subscribed({ ...thread, ...threadOverride }, { text: "ignored", author: human, raw: {}, ...messageOverride });
   }
   assert.equal(calls.length, beforeIgnored);
-  await handlers.subscribed(thread, { text: "long", author: human, raw: {} });
-  await handlers.subscribed(thread, { text: "secret failure", author: human, raw: {} });
+  await handlers.subscribed(thread, { id: "3", text: "long", author: human, raw: {} });
+  await handlers.subscribed(thread, { id: "4", text: "secret failure", author: human, raw: {} });
   assert.deepEqual(posts.slice(0, 2), ["ask <@U2> for help:new", "<@U2> follow up:ses_1"]);
   assert.deepEqual(posts.slice(2, 5).map((part) => part.length), [3500, 3500, 1]);
   assert.equal(posts.at(-1), "Pipa failed: bad [redacted] and [redacted]");
@@ -204,6 +209,12 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
     PIPA_REQUESTER_SLACK_USER_ID: "U3",
   });
   assert.equal(restored.filter((item) => item === "subscribed").length, 1);
+  assert.deepEqual(reactions, [
+    "add:1:eyes", "remove:1:eyes", "add:1:white_check_mark",
+    "add:2:eyes", "remove:2:eyes", "add:2:white_check_mark",
+    "add:3:eyes", "remove:3:eyes", "add:3:white_check_mark",
+    "add:4:eyes", "remove:4:eyes", "add:4:warning",
+  ]);
   await app.shutdown();
   assert.deepEqual(restored.slice(-2), ["stopped", "shutdown"]);
 });
