@@ -83,6 +83,10 @@ export function createManifest(botName) {
   return manifest;
 }
 
+export function createManifestUrl(manifest) {
+  return `https://api.slack.com/apps?new_app=1&manifest_json=${encodeURIComponent(JSON.stringify(manifest))}`;
+}
+
 export async function canonicalWorkingDirectory(directory) {
   const resolved = await realpath(path.resolve(directory));
   if (!(await stat(resolved)).isDirectory()) throw new Error("Working directory must be a directory.");

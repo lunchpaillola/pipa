@@ -18,7 +18,7 @@ pipa init
 pipa start
 ```
 
-`pipa init` asks for a bot name and working directory, prints the Slack app manifest, validates OpenCode and the Slack bot token, then stores configuration in `~/.pipa/config.json`. Slack credentials remain local.
+`pipa init` asks for a bot name and working directory, opens Slack with a pre-filled app manifest, and guides you through creating and installing the app. It validates OpenCode and the Slack bot token before storing configuration in `~/.pipa/config.json`. Slack credentials remain local.
 
 For non-interactive setup, provide `PIPA_BOT_NAME`, `PIPA_WORKING_DIRECTORY`, `PIPA_SLACK_APP_TOKEN`, and `PIPA_SLACK_BOT_TOKEN` when running `pipa init`.
 

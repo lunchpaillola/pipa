@@ -44,6 +44,7 @@ try {
     PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
   }, "");
   if (init.stdout.includes("xapp-test") || init.stdout.includes("xoxb-test")) throw new Error("Packed init echoed Slack credentials.");
+  if (init.stdout.includes("api.slack.com/apps?new_app=1")) throw new Error("Non-interactive init opened Slack setup.");
   const configText = await readFile(path.join(home, ".pipa", "config.json"), "utf8").catch((error) => {
     throw new Error(`Packed init did not write config: ${error.message}\nstdout:\n${init.stdout}\nstderr:\n${init.stderr}`);
   });

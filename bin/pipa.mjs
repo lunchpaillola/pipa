@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 
+import crossSpawn from "cross-spawn";
 import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { stdin, stdout } from "node:process";
-import { acquireInstanceLock, createManifest } from "../src/state.mjs";
+import { acquireInstanceLock, createManifest, createManifestUrl } from "../src/state.mjs";
 import { initializePipa, startPipa } from "../src/app.mjs";
 
 const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
@@ -31,13 +32,19 @@ async function init(io) {
   const prompt = createInterface({ input: io.input, output: promptOutput, terminal: Boolean(io.input.isTTY) });
   try {
     const botName = process.env.PIPA_BOT_NAME?.trim()
-      || (await prompt.question("Bot name (Pipa): ")).trim()
+      || (await prompt.question("What should we call your bot? (leave empty to use Pipa; you can change this later): ")).trim()
       || "Pipa";
     const workingDirectory = process.env.PIPA_WORKING_DIRECTORY?.trim()
-      || (await prompt.question(`Working directory (${process.cwd()}): `)).trim()
+      || (await prompt.question("What directory should this work in? (leave empty to use the current directory): ")).trim()
       || process.cwd();
-    io.output.write("\nCreate a Slack app from this manifest and install it to your workspace:\n\n");
-    io.output.write(`${JSON.stringify(createManifest(botName), null, 2)}\n\n`);
+    const hasSlackTokens = process.env.PIPA_SLACK_APP_TOKEN && process.env.PIPA_SLACK_BOT_TOKEN;
+    if (!hasSlackTokens) {
+      const manifestUrl = createManifestUrl(createManifest(botName));
+      io.output.write("\nOpening Slack with your app configuration...\n");
+      if (io.input.isTTY) await openUrl(manifestUrl).catch(() => undefined);
+      io.output.write(`\nIf Slack did not open, use this link:\n${manifestUrl}\n\n`);
+      io.output.write("In Slack:\n1. Choose your workspace, review the configuration, and create the app.\n2. Under Basic Information, generate an app-level token with connections:write.\n3. Under OAuth & Permissions, install the app and copy its Bot User OAuth Token.\n\n");
+    }
     const askSecret = async (label) => {
       io.output.write(label);
       muted = true;
@@ -53,6 +60,24 @@ async function init(io) {
   } finally {
     prompt.close();
   }
+}
+
+function openUrl(url) {
+  let command = "xdg-open";
+  let args = [url];
+  if (process.platform === "darwin") command = "open";
+  if (process.platform === "win32") {
+    command = "rundll32";
+    args = ["url.dll,FileProtocolHandler", url];
+  }
+  return new Promise((resolve, reject) => {
+    const child = crossSpawn(command, args, { detached: true, stdio: "ignore" });
+    child.once("spawn", () => {
+      child.unref();
+      resolve();
+    });
+    child.once("error", reject);
+  });
 }
 
 async function start(io) {

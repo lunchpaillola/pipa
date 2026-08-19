@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { acquireInstanceLock, createManifest, createSessionStore, loadSessions, pipaPaths, saveConfig } from "../src/state.mjs";
+import { acquireInstanceLock, createManifest, createManifestUrl, createSessionStore, loadSessions, pipaPaths, saveConfig } from "../src/state.mjs";
 
 test("manifest preserves approved capabilities and substitutes the bot name", () => {
   const manifest = createManifest('Workshop "Bot"');
@@ -14,6 +14,10 @@ test("manifest preserves approved capabilities and substitutes the bot name", ()
   assert.deepEqual(manifest.settings.event_subscriptions.bot_events, ["app_mention", "message.channels", "message.groups"]);
   assert.equal(manifest.settings.interactivity.is_enabled, true);
   assert.equal(manifest.settings.socket_mode_enabled, true);
+  const url = new URL(createManifestUrl(manifest));
+  assert.equal(url.origin + url.pathname, "https://api.slack.com/apps");
+  assert.equal(url.searchParams.get("new_app"), "1");
+  assert.deepEqual(JSON.parse(url.searchParams.get("manifest_json")), manifest);
 });
 
 test("config and sessions are stored separately with private permissions", async () => {
