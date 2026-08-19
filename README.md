@@ -1,5 +1,8 @@
 # Pipa
 
+[![CI](https://github.com/lunchpaillola/pipa/actions/workflows/ci.yml/badge.svg)](https://github.com/lunchpaillola/pipa/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Pipa connects Slack to the OpenCode already installed on your computer. It runs locally: no hosted relay, database, public endpoint, or sandbox is involved.
 
 ## Requirements
@@ -33,3 +36,21 @@ pipa --version  Print the installed version
 ```
 
 Pipa v0.1 is text-only. File handling, DMs, interactive questions, schedulers, and hosted fallback are not included.
+
+## Development
+
+```sh
+npm ci
+npm test
+npm run test:pack
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Report vulnerabilities privately through the process in [SECURITY.md](SECURITY.md).
+
+## Releases
+
+Pipa follows [Semantic Versioning](https://semver.org/). Release notes are published on [GitHub Releases](https://github.com/lunchpaillola/pipa/releases).
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).

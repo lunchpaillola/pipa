@@ -2,6 +2,7 @@
   "name": "@usepipa/pipa",
   "version": "0.1.0",
   "description": "Run Pipa locally through Slack and OpenCode",
+  "keywords": ["slack", "opencode", "ai-agent", "cli"],
   "type": "module",
   "bin": {
     "pipa": "bin/pipa.mjs"
@@ -10,7 +11,8 @@
     "bin",
     "src",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE"
   ],
   "scripts": {
     "test": "node --test",
@@ -19,7 +21,16 @@
   "engines": {
     "node": ">=22"
   },
-  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lunchpaillola/pipa.git"
+  },
+  "homepage": "https://github.com/lunchpaillola/pipa#readme",
+  "bugs": {
+    "url": "https://github.com/lunchpaillola/pipa/issues"
+  },
+  "author": "Lunch Pail Labs",
+  "license": "Apache-2.0",
   "publishConfig": {
     "access": "public"
   },
