@@ -5,6 +5,8 @@
 
 Pipa connects Slack to the OpenCode already installed on your computer. It runs locally: no hosted relay, database, public endpoint, or sandbox is involved.
 
+**Pipa is in early preview. Features may break unintentionally, and CLI commands, configuration, and Slack behavior may continue to change.**
+
 ## Requirements
 
 - Node.js 22 or newer
