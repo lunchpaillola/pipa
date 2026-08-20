@@ -39,6 +39,13 @@ pipa start
 
 Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. Pipa replies in a thread, and follow-up messages in that thread do not need another mention.
 
+To use an existing OpenCode server instead of starting standalone OpenCode runs, set its URL before starting Pipa:
+
+```sh
+export PIPA_OPENCODE_ATTACH_URL=http://localhost:5555
+pipa start
+```
+
 ## Commands
 
 ```text
