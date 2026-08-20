@@ -11,8 +11,9 @@ export function cleanChildEnvironment(environment = process.env) {
   return Object.fromEntries(Object.entries(environment).filter(([key]) => !SECRET_ENV_KEYS.has(key.toUpperCase())));
 }
 
-export function buildRunArguments({ prompt, sessionId, workingDirectory }) {
+export function buildRunArguments({ prompt, sessionId, workingDirectory, attachUrl }) {
   const args = ["run", "--format", "json", "--dir", workingDirectory];
+  if (attachUrl) args.push("--attach", attachUrl);
   if (sessionId) args.push("--session", sessionId);
   args.push("--", prompt);
   return args;
@@ -22,12 +23,13 @@ export function createOpenCodeExecutor(options = {}) {
   const spawn = options.spawn ?? crossSpawn;
   const platform = options.platform ?? process.platform;
   const environment = options.environment ?? process.env;
+  const attachUrl = options.attachUrl ?? environment.PIPA_OPENCODE_ATTACH_URL?.trim();
   const timeoutMs = options.timeoutMs ?? 2.5 * 60 * 60 * 1000;
   const children = new Set();
 
   async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {} }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
-    const child = spawn("opencode", buildRunArguments({ prompt, sessionId, workingDirectory }), {
+    const child = spawn("opencode", buildRunArguments({ prompt, sessionId, workingDirectory, attachUrl }), {
       cwd: workingDirectory,
       env: { ...cleanChildEnvironment(environment), ...contextEnvironment },
       shell: false,

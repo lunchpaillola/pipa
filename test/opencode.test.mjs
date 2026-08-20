@@ -42,9 +42,10 @@ test("executor passes a clean environment and returns attributable output", asyn
     });
     return child;
   };
-  const executor = createOpenCodeExecutor({ spawn, platform: "linux", environment: { PATH: "/bin", SLACK_BOT_TOKEN: "secret" } });
+  const executor = createOpenCodeExecutor({ spawn, platform: "linux", environment: { PATH: "/bin", SLACK_BOT_TOKEN: "secret", PIPA_OPENCODE_ATTACH_URL: " http://localhost:5555 " } });
   const result = await executor.runTurn({ prompt: "hello", sessionId: null, workingDirectory: "/work" });
   assert.deepEqual(result, { text: "done", sessionId: "ses_new" });
+  assert.deepEqual(invocation.args, ["run", "--format", "json", "--dir", "/work", "--attach", "http://localhost:5555", "--", "hello"]);
   assert.equal(invocation.options.shell, false);
   assert.equal(invocation.options.env.SLACK_BOT_TOKEN, undefined);
 });
