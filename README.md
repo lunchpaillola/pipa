@@ -15,17 +15,27 @@ Invite the Slack app only to channels whose members may use OpenCode in the conf
 
 ## Install
 
+1. Install Pipa:
+
 ```sh
 npm install --global @usepipa/pipa
+```
+
+2. From the folder where you want Pipa to work, run:
+
+```sh
 pipa init
+```
+
+`pipa init` guides you through creating and installing the Slack app and saving its local configuration.
+
+3. Start Pipa:
+
+```sh
 pipa start
 ```
 
-Run `pipa init` from the folder where Pipa should work. It confirms that folder, opens Slack with a pre-filled app manifest, and guides you through creating and installing the app. It validates OpenCode and the Slack bot token before storing configuration in `~/.pipa/config.json`. Slack credentials remain local.
-
-For non-interactive setup, provide `PIPA_BOT_NAME`, `PIPA_SLACK_APP_TOKEN`, and `PIPA_SLACK_BOT_TOKEN` when running `pipa init`.
-
-In Slack, invite the app to a trusted public or private channel and mention it. Pipa replies in that thread. Later replies in the same thread do not need another mention. The Slack-thread-to-OpenCode-session mapping in `~/.pipa/sessions.json` keeps that conversation connected after Pipa restarts.
+Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. Pipa replies in a thread, and follow-up messages in that thread do not need another mention.
 
 ## Commands
 
