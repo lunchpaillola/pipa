@@ -2,10 +2,6 @@
 
 Pipa is a Node.js command-line application that connects Slack to a local OpenCode installation. A Slack message enters through Socket Mode, becomes an `opencode run` command, and returns to the same Slack thread. Configuration and OpenCode session IDs are stored locally in `~/.pipa`.
 
-## Why the JavaScript files use `.mjs`
-
-`.mjs` tells Node.js that a file uses ECMAScript modules (ES modules), so it can use `import`, `export`, top-level `await`, and `import.meta.url`. The package also declares `"type": "module"`, which would make `.js` files ES modules too. Keeping `.mjs` makes the module format explicit when a file is run directly or viewed outside the package.
-
 ## Request flow
 
 1. `bin/pipa.mjs` handles `pipa init` or `pipa start`.
