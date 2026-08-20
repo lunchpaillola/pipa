@@ -13,5 +13,3 @@ npm run test:pack
 ```
 
 Keep changes small, include a regression test for behavior changes, and never commit Slack tokens or files from `~/.pipa`.
-
-Report security issues privately as described in [SECURITY.md](SECURITY.md).

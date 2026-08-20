@@ -11,8 +11,7 @@
     "bin",
     "src",
     "README.md",
-    "LICENSE",
-    "NOTICE"
+    "LICENSE"
   ],
   "scripts": {
     "test": "node --test",

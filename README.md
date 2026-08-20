@@ -45,7 +45,9 @@ npm test
 npm run test:pack
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Report vulnerabilities privately through the process in [SECURITY.md](SECURITY.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+
+See the [repository overview](docs/repository-overview.md) for a file-by-file explanation of how Pipa works.
 
 ## Releases
 
