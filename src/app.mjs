@@ -199,7 +199,7 @@ function slackContext(thread, message) {
 
 async function postInChunks(thread, text) {
   for (let index = 0; index < text.length; index += 3500) {
-    await thread.post(text.slice(index, index + 3500));
+    await thread.post({ markdown: text.slice(index, index + 3500) });
   }
 }
 

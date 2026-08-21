@@ -153,7 +153,12 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
     runTurn: async ({ prompt, sessionId, contextEnvironment }) => {
       calls.push({ prompt, sessionId, contextEnvironment });
       if (prompt === "secret failure") throw new Error("bad xoxb-secret and xapp-secret");
-      return { text: prompt === "long" ? "x".repeat(7001) : `${prompt}:${sessionId ?? "new"}`, sessionId: sessionId ?? "ses_1" };
+      const text = prompt === "long"
+        ? "x".repeat(7001)
+        : prompt === "markdown"
+          ? "Try **[Inventing on Principle](<https://example.com>)**."
+          : `${prompt}:${sessionId ?? "new"}`;
+      return { text, sessionId: sessionId ?? "ses_1" };
     },
     stopAll() { restored.push("stopped"); },
   };
@@ -175,7 +180,7 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   const restoredPosts = [];
   const restoredThread = { id: "slack:C1:1.0", channel: { isDM: false, channelVisibility: "private" }, post: async (text) => restoredPosts.push(text) };
   await handlers.subscribed(restoredThread, { text: "continue", author: human, raw: {} });
-  assert.deepEqual(restoredPosts, ["continue:ses_old"]);
+  assert.deepEqual(restoredPosts, [{ markdown: "continue:ses_old" }]);
   assert.equal(calls[0].sessionId, "ses_old");
 
   const adapter = {
@@ -199,9 +204,14 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   assert.equal(calls.length, beforeIgnored);
   await handlers.subscribed(thread, { id: "3", text: "long", author: human, raw: {} });
   await handlers.subscribed(thread, { id: "4", text: "secret failure", author: human, raw: {} });
-  assert.deepEqual(posts.slice(0, 2), ["ask <@U2> for help:new", "<@U2> follow up:ses_1"]);
-  assert.deepEqual(posts.slice(2, 5).map((part) => part.length), [3500, 3500, 1]);
-  assert.equal(posts.at(-1), "Pipa failed: bad [redacted] and [redacted]");
+  await handlers.subscribed(thread, { id: "5", text: "markdown", author: human, raw: {} });
+  assert.deepEqual(posts.slice(0, 2), [
+    { markdown: "ask <@U2> for help:new" },
+    { markdown: "<@U2> follow up:ses_1" },
+  ]);
+  assert.deepEqual(posts.slice(2, 5).map((part) => part.markdown.length), [3500, 3500, 1]);
+  assert.equal(posts.at(-2), "Pipa failed: bad [redacted] and [redacted]");
+  assert.deepEqual(posts.at(-1), { markdown: "Try **[Inventing on Principle](<https://example.com>)**." });
   assert.deepEqual(calls.find(({ prompt }) => prompt.startsWith("ask ")).contextEnvironment, {
     PIPA_MESSAGE_CHANNEL: "slack",
     PIPA_CURRENT_SLACK_CHANNEL_ID: "C2",
@@ -214,6 +224,7 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
     "add:2:eyes", "remove:2:eyes", "add:2:white_check_mark",
     "add:3:eyes", "remove:3:eyes", "add:3:white_check_mark",
     "add:4:eyes", "remove:4:eyes", "add:4:warning",
+    "add:5:eyes", "remove:5:eyes", "add:5:white_check_mark",
   ]);
   await app.shutdown();
   assert.deepEqual(restored.slice(-2), ["stopped", "shutdown"]);
