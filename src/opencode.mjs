@@ -1,4 +1,7 @@
 import crossSpawn from "cross-spawn";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 const SECRET_ENV_KEYS = new Set([
   "PIPA_SLACK_APP_TOKEN",
@@ -7,14 +10,17 @@ const SECRET_ENV_KEYS = new Set([
   "SLACK_BOT_TOKEN",
 ]);
 
+export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+
 export function cleanChildEnvironment(environment = process.env) {
   return Object.fromEntries(Object.entries(environment).filter(([key]) => !SECRET_ENV_KEYS.has(key.toUpperCase())));
 }
 
-export function buildRunArguments({ prompt, sessionId, workingDirectory, attachUrl }) {
+export function buildRunArguments({ prompt, sessionId, workingDirectory, attachUrl, files = [] }) {
   const args = ["run", "--format", "json", "--dir", workingDirectory];
   if (attachUrl) args.push("--attach", attachUrl);
   if (sessionId) args.push("--session", sessionId);
+  for (const file of files) args.push("--file", file);
   args.push("--", prompt);
   return args;
 }
@@ -26,48 +32,120 @@ export function createOpenCodeExecutor(options = {}) {
   const attachUrl = options.attachUrl ?? environment.PIPA_OPENCODE_ATTACH_URL?.trim();
   const timeoutMs = options.timeoutMs ?? 2.5 * 60 * 60 * 1000;
   const children = new Set();
+  const cancelDownloads = new Set();
+  let stopped = false;
 
-  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {} }) {
+  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [] }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
-    const child = spawn("opencode", buildRunArguments({ prompt, sessionId, workingDirectory, attachUrl }), {
-      cwd: workingDirectory,
-      env: { ...cleanChildEnvironment(environment), ...contextEnvironment },
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    children.add(child);
-    const exit = waitForExit(child);
-    void exit.finally(() => children.delete(child)).catch(() => undefined);
-    let timer;
+    if (stopped) throw new Error("Pipa is shutting down.");
+    const temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
+    let turnError;
 
     try {
-      const operation = Promise.all([collect(child.stdout), collect(child.stderr), exit]);
-      const timeout = new Promise((_, reject) => {
-        timer = setTimeout(() => {
-          terminateChild(child, platform);
-          reject(new Error(`OpenCode timed out after ${timeoutMs}ms.`));
-        }, timeoutMs);
+      if (stopped) throw new Error("Pipa is shutting down.");
+      const files = [];
+      for (const [index, attachment] of attachments.entries()) {
+        if (stopped) throw new Error("Pipa is shutting down.");
+        let data;
+        try {
+          data = await fetchAttachment(attachment, timeoutMs, cancelDownloads);
+        } catch (error) {
+          if (error.message === "Pipa is shutting down.") throw error;
+          throw new Error("Could not read one of the attached files. Please try uploading it again.");
+        }
+        if (data.byteLength > MAX_ATTACHMENT_BYTES) throw new Error("Attached files must be 100 MB or smaller.");
+        try {
+          const sanitizedName = path.basename(attachment.name || "attachment")
+            .replace(/[<>:"/\\|?*\u0000-\u001f]/gu, "_")
+            .replace(/[. ]+$/u, "");
+          const name = Array.from(sanitizedName).reduce(
+            (result, character) => Buffer.byteLength(result + character) <= 200 ? result + character : result,
+            "",
+          ) || "attachment";
+          const file = path.join(temporaryDirectory, `${index + 1}-${name}`);
+          await writeFile(file, data);
+          files.push(file);
+        } catch {
+          throw new Error("Could not read one of the attached files. Please try uploading it again.");
+        }
+      }
+
+      if (stopped) throw new Error("Pipa is shutting down.");
+      const child = spawn("opencode", buildRunArguments({ prompt, sessionId, workingDirectory, attachUrl, files }), {
+        cwd: workingDirectory,
+        env: { ...cleanChildEnvironment(environment), ...contextEnvironment },
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
       });
-      const [stdout, stderr, code] = await Promise.race([operation, timeout]);
-      const output = parseOpenCodeOutput(stdout);
-      if (output.error) throw new Error(output.error);
-      if (code !== 0) throw new Error(output.error || stderr.trim() || `OpenCode exited with code ${code}.`);
-      if (!output.text) throw new Error("OpenCode completed without assistant text.");
-      return { text: output.text, sessionId: output.sessionId ?? sessionId ?? null };
+      children.add(child);
+      const exit = waitForExit(child);
+      void exit.finally(() => children.delete(child)).catch(() => undefined);
+      let timer;
+
+      try {
+        const operation = Promise.all([collect(child.stdout), collect(child.stderr), exit]);
+        const timeout = new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            terminateChild(child, platform);
+            reject(new Error(`OpenCode timed out after ${timeoutMs}ms.`));
+          }, timeoutMs);
+        });
+        const [stdout, stderr, code] = await Promise.race([operation, timeout]);
+        const output = parseOpenCodeOutput(stdout);
+        if (output.error) throw new Error(output.error);
+        if (code !== 0) throw new Error(output.error || stderr.trim() || `OpenCode exited with code ${code}.`);
+        if (!output.text) throw new Error("OpenCode completed without assistant text.");
+        return { text: output.text, sessionId: output.sessionId ?? sessionId ?? null };
+      } catch (error) {
+        terminateChild(child, platform);
+        await exit.catch(() => undefined);
+        throw error;
+      } finally {
+        clearTimeout(timer);
+      }
     } catch (error) {
-      terminateChild(child, platform);
+      turnError = error;
       throw error;
     } finally {
-      clearTimeout(timer);
+      if (temporaryDirectory) {
+        try {
+          await rm(temporaryDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        } catch (error) {
+          if (!turnError) throw error;
+          process.stderr.write("Pipa could not remove temporary attachment files.\n");
+        }
+      }
     }
   }
 
   return {
     runTurn,
     stopAll() {
+      stopped = true;
+      for (const cancel of cancelDownloads) cancel();
       for (const child of children) terminateChild(child, platform);
     },
   };
+}
+
+function fetchAttachment(attachment, timeoutMs, cancelDownloads) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer;
+    const finish = (callback) => (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cancelDownloads.delete(cancel);
+      callback(value);
+    };
+    const succeed = finish(resolve);
+    const fail = finish(reject);
+    const cancel = () => fail(new Error("Pipa is shutting down."));
+    timer = setTimeout(() => fail(new Error(`Attachment download timed out after ${timeoutMs}ms.`)), timeoutMs);
+    cancelDownloads.add(cancel);
+    Promise.resolve().then(() => attachment.fetchData()).then(succeed, fail);
+  });
 }
 
 export async function runOpenCodeVersion(options = {}) {

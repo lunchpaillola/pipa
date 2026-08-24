@@ -1,16 +1,30 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
 import { access, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import { buildRunArguments, cleanChildEnvironment, createOpenCodeExecutor, parseOpenCodeOutput, runOpenCodeVersion } from "../src/opencode.mjs";
+import { buildRunArguments, cleanChildEnvironment, createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, parseOpenCodeOutput, runOpenCodeVersion } from "../src/opencode.mjs";
 
 test("builds shell-free continuation arguments with a literal prompt", () => {
   const prompt = "summarize $(touch nope) && echo bad";
   assert.deepEqual(buildRunArguments({ prompt, sessionId: "ses_1", workingDirectory: "/work" }), [
     "run", "--format", "json", "--dir", "/work", "--session", "ses_1", "--", prompt,
+  ]);
+});
+
+test("builds repeated file arguments before the literal prompt", () => {
+  assert.deepEqual(buildRunArguments({
+    prompt: "compare",
+    sessionId: "ses_1",
+    workingDirectory: "/work",
+    attachUrl: "http://localhost:5555",
+    files: ["/tmp/1-a.txt", "/tmp/2-b.txt"],
+  }), [
+    "run", "--format", "json", "--dir", "/work", "--attach", "http://localhost:5555",
+    "--session", "ses_1", "--file", "/tmp/1-a.txt", "--file", "/tmp/2-b.txt", "--", "compare",
   ]);
 });
 
@@ -50,6 +64,60 @@ test("executor passes a clean environment and returns attributable output", asyn
   assert.equal(invocation.options.env.SLACK_BOT_TOKEN, undefined);
 });
 
+test("executor downloads attachments to distinct temporary files and removes them", async () => {
+  let temporaryDirectory;
+  const contents = [];
+  const spawn = (_, args) => {
+    const files = args.flatMap((value, index) => value === "--file" ? [args[index + 1]] : []);
+    temporaryDirectory = path.dirname(files[0]);
+    contents.push(...files.map((file) => readFileSync(file, "utf8")));
+    assert.equal(new Set(files).size, 2);
+    for (const file of files) {
+      assert.doesNotMatch(path.basename(file), /[<>:"/\\|?*\u0000-\u001f]|[. ]$/u);
+      assert.ok(Buffer.byteLength(path.basename(file)) <= 202);
+    }
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    queueMicrotask(() => {
+      child.stdout.end(`${JSON.stringify({ type: "text", text: "done" })}\n`);
+      child.stderr.end();
+      child.emit("close", 0);
+    });
+    return child;
+  };
+  const attachment = (text) => ({ name: `same<>:"\\|?*${"😀".repeat(100)}. `, fetchData: async () => Buffer.from(text) });
+  const executor = createOpenCodeExecutor({ spawn });
+
+  await executor.runTurn({ prompt: "compare", workingDirectory: "/work", attachments: [attachment("one"), attachment("two")] });
+
+  assert.deepEqual(contents, ["one", "two"]);
+  await assert.rejects(access(temporaryDirectory));
+});
+
+test("executor does not spawn OpenCode when an attachment cannot be downloaded", async () => {
+  let spawned = false;
+  const executor = createOpenCodeExecutor({ spawn: () => { spawned = true; } });
+  await assert.rejects(executor.runTurn({
+    prompt: "summarize",
+    workingDirectory: "/work",
+    attachments: [{ name: "broken.txt", fetchData: async () => { throw new Error("download failed"); } }],
+  }), /Could not read one of the attached files/u);
+  assert.equal(spawned, false);
+});
+
+test("executor rejects downloaded data over 100 MB before writing or spawning", async () => {
+  let spawned = false;
+  const executor = createOpenCodeExecutor({ spawn: () => { spawned = true; } });
+  await assert.rejects(executor.runTurn({
+    prompt: "summarize",
+    workingDirectory: "/work",
+    attachments: [{ name: "large.bin", fetchData: async () => ({ byteLength: MAX_ATTACHMENT_BYTES + 1 }) }],
+  }), /100 MB or smaller/u);
+  assert.equal(spawned, false);
+});
+
 test("executor kills the child when output collection fails", async () => {
   let killed = false;
   const spawn = () => {
@@ -70,7 +138,9 @@ test("executor kills the child when output collection fails", async () => {
 });
 
 test("executor reports OpenCode error events even with a zero exit code", async () => {
-  const spawn = () => {
+  let temporaryDirectory;
+  const spawn = (_, args) => {
+    temporaryDirectory = path.dirname(args[args.indexOf("--file") + 1]);
     const child = new EventEmitter();
     child.stdout = new PassThrough();
     child.stderr = new PassThrough();
@@ -82,12 +152,51 @@ test("executor reports OpenCode error events even with a zero exit code", async 
     });
     return child;
   };
-  await assert.rejects(createOpenCodeExecutor({ spawn }).runTurn({ prompt: "hello", workingDirectory: "/work" }), /provider failed/u);
+  await assert.rejects(createOpenCodeExecutor({ spawn }).runTurn({
+    prompt: "hello",
+    workingDirectory: "/work",
+    attachments: [{ name: "notes.txt", fetchData: async () => Buffer.from("notes") }],
+  }), /provider failed/u);
+  await assert.rejects(access(temporaryDirectory));
+});
+
+test("stopAll cancels attachment staging before OpenCode can spawn", async () => {
+  let spawned = false;
+  let downloadStarted;
+  const executor = createOpenCodeExecutor({ spawn: () => { spawned = true; }, timeoutMs: 60_000 });
+  const turn = executor.runTurn({
+    prompt: "summarize",
+    workingDirectory: "/work",
+    attachments: [{
+      name: "stalled.txt",
+      fetchData: async () => {
+        downloadStarted();
+        return new Promise(() => undefined);
+      },
+    }],
+  });
+  await new Promise((resolve) => downloadStarted = resolve);
+  executor.stopAll();
+  await assert.rejects(turn, /shutting down/u);
+  assert.equal(spawned, false);
+});
+
+test("executor times out stalled attachment downloads without spawning OpenCode", async () => {
+  let spawned = false;
+  const executor = createOpenCodeExecutor({ spawn: () => { spawned = true; }, timeoutMs: 5 });
+  await assert.rejects(executor.runTurn({
+    prompt: "summarize",
+    workingDirectory: "/work",
+    attachments: [{ name: "stalled.txt", fetchData: async () => new Promise(() => undefined) }],
+  }), /Could not read one of the attached files/u);
+  assert.equal(spawned, false);
 });
 
 test("executor times out and terminates a hung child", async () => {
   let killed = false;
-  const spawn = () => {
+  let temporaryDirectory;
+  const spawn = (_, args) => {
+    temporaryDirectory = path.dirname(args[args.indexOf("--file") + 1]);
     const child = new EventEmitter();
     child.stdout = new PassThrough();
     child.stderr = new PassThrough();
@@ -98,8 +207,13 @@ test("executor times out and terminates a hung child", async () => {
     };
     return child;
   };
-  await assert.rejects(createOpenCodeExecutor({ spawn, timeoutMs: 5 }).runTurn({ prompt: "hello", workingDirectory: "/work" }), /timed out/u);
+  await assert.rejects(createOpenCodeExecutor({ spawn, timeoutMs: 5 }).runTurn({
+    prompt: "hello",
+    workingDirectory: "/work",
+    attachments: [{ name: "notes.txt", fetchData: async () => Buffer.from("notes") }],
+  }), /timed out/u);
   assert.equal(killed, true);
+  await assert.rejects(access(temporaryDirectory));
 });
 
 test("stopAll terminates an active OpenCode child", async () => {

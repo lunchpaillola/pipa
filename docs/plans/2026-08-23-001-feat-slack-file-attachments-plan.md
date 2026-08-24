@@ -1,7 +1,7 @@
 ---
 title: "feat: Add Slack file attachments"
 type: feat
-status: active
+status: completed
 date: 2026-08-23
 issue: https://linear.app/lunchpaillabs/issue/STU-551/add-inbound-slack-files-to-local-pipa
 linear_document: https://linear.app/lunchpaillabs/document/implementation-plan-file-complete-local-pipa-1625796d7053

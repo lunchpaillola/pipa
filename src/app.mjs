@@ -2,7 +2,7 @@ import { Chat } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { canonicalWorkingDirectory, createManifest, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
-import { createOpenCodeExecutor, runOpenCodeVersion } from "./opencode.mjs";
+import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, runOpenCodeVersion } from "./opencode.mjs";
 
 export async function initializePipa(input, options = {}) {
   const paths = options.paths ?? pipaPaths();
@@ -50,13 +50,19 @@ export async function startPipa(options = {}) {
     if (!accepting || shouldIgnore(thread, message)) return;
     const prompt = subscribe || message.isMention ? stripMention(message.text) : message.text.trim();
     if (!prompt) return;
+    const attachments = message.attachments ?? [];
     if (subscribe) await thread.subscribe();
+    if (attachments.some(({ size }) => size !== undefined && (!Number.isSafeInteger(size) || size < 0 || size > MAX_ATTACHMENT_BYTES))) {
+      await thread.post("Pipa can read files up to 100 MB each.");
+      return;
+    }
     if (!accepting) return;
 
     await react(thread, message, "eyes");
     try {
       const result = await runner.enqueue(thread.id, {
         prompt,
+        attachments,
         workingDirectory: config.workingDirectory,
         contextEnvironment: slackContext(thread, message),
         deliver: (text) => postInChunks(thread, text),
@@ -168,7 +174,7 @@ function shouldIgnore(thread, message) {
     || message.author?.isBot
     || thread.channel?.isDM
     || thread.channel?.channelVisibility === "external"
-    || Boolean(message.raw?.subtype)
+    || Boolean(message.raw?.subtype && message.raw.subtype !== "file_share")
     || !message.text?.trim();
 }
 

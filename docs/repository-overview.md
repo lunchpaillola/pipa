@@ -7,8 +7,8 @@ Pipa is a Node.js command-line application that connects Slack to a local OpenCo
 1. `bin/pipa.mjs` handles `pipa init` or `pipa start`.
 2. During initialization, `src/app.mjs` validates OpenCode and Slack credentials, then `src/state.mjs` saves the configuration and generated Slack manifest under `~/.pipa`.
 3. During startup, `src/app.mjs` creates the Slack connection and restores previously subscribed Slack threads from `~/.pipa/sessions.json`.
-4. A mention or thread reply is queued per Slack thread. Different threads can run concurrently, but messages in one thread run in order.
-5. `src/opencode.mjs` starts `opencode run`, passes the Slack context, parses OpenCode's JSON event stream, and returns the final assistant text and session ID.
+4. A mention or thread reply, including any attachments, is queued per Slack thread. Different threads can run concurrently, but messages in one thread run in order.
+5. `src/opencode.mjs` downloads attachments through Chat SDK into a temporary directory, starts `opencode run` with their paths, passes the Slack context, parses OpenCode's JSON event stream, removes the temporary files, and returns the final assistant text and session ID.
 6. `src/app.mjs` saves the session ID, posts the response back to Slack in safe-sized chunks, and updates the message reaction.
 
 ## Files and folders
@@ -41,16 +41,16 @@ Repository maintenance and release checks that are not part of the installed run
 
 The application implementation.
 
-- `src/app.mjs`: Coordinates Slack, OpenCode, and persisted sessions. `initializePipa` validates input and credentials before saving configuration. `startPipa` creates the Slack adapter, restores thread subscriptions, filters unsupported messages, sends prompts to OpenCode, posts responses, shows progress reactions, and handles startup and shutdown timeouts. `createConversationRunner` serializes work within each thread while allowing separate threads to run concurrently.
-- `src/opencode.mjs`: Owns the OpenCode child-process boundary. It builds shell-free command arguments, removes Slack secrets from the child environment, starts `opencode`, enforces timeouts and output limits, parses newline-delimited JSON events, returns assistant text and session IDs, checks the installed OpenCode version, and terminates active children during shutdown. Windows process termination uses `taskkill` so descendant processes are also stopped.
+- `src/app.mjs`: Coordinates Slack, OpenCode, and persisted sessions. `initializePipa` validates input and credentials before saving configuration. `startPipa` creates the Slack adapter, restores thread subscriptions, filters unsupported messages, enforces the 100 MB per-file limit, sends prompts and attachment descriptors to OpenCode, posts responses, shows progress reactions, and handles startup and shutdown timeouts. `createConversationRunner` serializes work within each thread while allowing separate threads to run concurrently.
+- `src/opencode.mjs`: Owns the OpenCode child-process boundary. It downloads attachments through Chat SDK, writes them to one temporary directory per turn, builds shell-free command arguments with repeated `--file` paths, removes Slack secrets from the child environment, starts `opencode`, enforces timeouts and output limits, removes temporary files, parses newline-delimited JSON events, returns assistant text and session IDs, checks the installed OpenCode version, and terminates active children during shutdown. Windows process termination uses `taskkill` so descendant processes are also stopped.
 - `src/state.mjs`: Owns local state and the Slack app manifest. It builds paths under `~/.pipa`, validates the working directory and bot name, writes private JSON files atomically, loads configuration and sessions, serializes session writes, and uses a lock file to prevent two Pipa instances from controlling the same local state. It also generates the encoded Slack manifest URL used by `pipa init`.
 
 ### `test/`
 
 Tests run by Node's built-in test runner through `npm test`.
 
-- `test/app.test.mjs`: Tests application orchestration: safe initialization, Slack token error handling, per-thread queueing, session continuity, Slack filtering and delivery, reactions, secret redaction, chunked responses, and startup and shutdown cleanup.
-- `test/opencode.test.mjs`: Tests the OpenCode process boundary: literal shell-free arguments, secret removal, JSON event parsing, timeout and termination behavior, error propagation, active-process shutdown, and Windows command-shim safety.
+- `test/app.test.mjs`: Tests application orchestration: safe initialization, Slack token error handling, per-thread queueing, session continuity, attachment routing and limits, Slack filtering and delivery, reactions, secret redaction, chunked responses, and startup and shutdown cleanup.
+- `test/opencode.test.mjs`: Tests the OpenCode process boundary: literal shell-free arguments, attachment download and cleanup, secret removal, JSON event parsing, timeout and termination behavior, error propagation, active-process shutdown, and Windows command-shim safety.
 - `test/state.test.mjs`: Tests state management: Slack manifest generation, private file permissions, separate configuration and session storage, malformed state errors, recovery after failed writes, and single-instance locking.
 
 ### Root files
