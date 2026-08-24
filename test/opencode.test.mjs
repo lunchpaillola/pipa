@@ -160,23 +160,26 @@ test("executor reports OpenCode error events even with a zero exit code", async 
   await assert.rejects(access(temporaryDirectory));
 });
 
-test("stopAll cancels attachment staging before OpenCode can spawn", async () => {
+test("stopAll prevents OpenCode from spawning after attachment staging", async () => {
   let spawned = false;
-  let downloadStarted;
+  let finishDownload;
+  let markDownloadStarted;
+  const downloadStarted = new Promise((resolve) => markDownloadStarted = resolve);
   const executor = createOpenCodeExecutor({ spawn: () => { spawned = true; }, timeoutMs: 60_000 });
   const turn = executor.runTurn({
     prompt: "summarize",
     workingDirectory: "/work",
     attachments: [{
       name: "stalled.txt",
-      fetchData: async () => {
-        downloadStarted();
-        return new Promise(() => undefined);
-      },
+      fetchData: () => new Promise((resolve) => {
+        finishDownload = resolve;
+        markDownloadStarted();
+      }),
     }],
   });
-  await new Promise((resolve) => downloadStarted = resolve);
+  await downloadStarted;
   executor.stopAll();
+  finishDownload(Buffer.from("notes"));
   await assert.rejects(turn, /shutting down/u);
   assert.equal(spawned, false);
 });

@@ -54,8 +54,6 @@ pipa start      Connect Slack Socket Mode to local OpenCode
 pipa --version  Print the installed version
 ```
 
-DMs, interactive questions, schedulers, and hosted fallback are not included.
-
 ## Development
 
 ```sh

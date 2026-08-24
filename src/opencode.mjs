@@ -32,7 +32,6 @@ export function createOpenCodeExecutor(options = {}) {
   const attachUrl = options.attachUrl ?? environment.PIPA_OPENCODE_ATTACH_URL?.trim();
   const timeoutMs = options.timeoutMs ?? 2.5 * 60 * 60 * 1000;
   const children = new Set();
-  const cancelDownloads = new Set();
   let stopped = false;
 
   async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [] }) {
@@ -42,15 +41,12 @@ export function createOpenCodeExecutor(options = {}) {
     let turnError;
 
     try {
-      if (stopped) throw new Error("Pipa is shutting down.");
       const files = [];
       for (const [index, attachment] of attachments.entries()) {
-        if (stopped) throw new Error("Pipa is shutting down.");
         let data;
         try {
-          data = await fetchAttachment(attachment, timeoutMs, cancelDownloads);
-        } catch (error) {
-          if (error.message === "Pipa is shutting down.") throw error;
+          data = await fetchAttachment(attachment, timeoutMs);
+        } catch {
           throw new Error("Could not read one of the attached files. Please try uploading it again.");
         }
         if (data.byteLength > MAX_ATTACHMENT_BYTES) throw new Error("Attached files must be 100 MB or smaller.");
@@ -122,30 +118,19 @@ export function createOpenCodeExecutor(options = {}) {
     runTurn,
     stopAll() {
       stopped = true;
-      for (const cancel of cancelDownloads) cancel();
       for (const child of children) terminateChild(child, platform);
     },
   };
 }
 
-function fetchAttachment(attachment, timeoutMs, cancelDownloads) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let timer;
-    const finish = (callback) => (value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      cancelDownloads.delete(cancel);
-      callback(value);
-    };
-    const succeed = finish(resolve);
-    const fail = finish(reject);
-    const cancel = () => fail(new Error("Pipa is shutting down."));
-    timer = setTimeout(() => fail(new Error(`Attachment download timed out after ${timeoutMs}ms.`)), timeoutMs);
-    cancelDownloads.add(cancel);
-    Promise.resolve().then(() => attachment.fetchData()).then(succeed, fail);
-  });
+function fetchAttachment(attachment, timeoutMs) {
+  let timer;
+  return Promise.race([
+    attachment.fetchData(),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Attachment download timed out after ${timeoutMs}ms.`)), timeoutMs);
+    }),
+  ]).finally(() => clearTimeout(timer));
 }
 
 export async function runOpenCodeVersion(options = {}) {
