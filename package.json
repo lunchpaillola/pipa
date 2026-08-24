@@ -1,6 +1,6 @@
 {
   "name": "@usepipa/pipa",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Run Pipa locally through Slack and OpenCode",
   "keywords": ["slack", "opencode", "ai-agent", "cli"],
   "type": "module",
