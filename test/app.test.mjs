@@ -150,9 +150,10 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   };
   const calls = [];
   const executor = {
-    runTurn: async ({ prompt, sessionId, contextEnvironment }) => {
-      calls.push({ prompt, sessionId, contextEnvironment });
+    runTurn: async ({ prompt, sessionId, contextEnvironment, attachments }) => {
+      calls.push({ prompt, sessionId, contextEnvironment, attachments });
       if (prompt === "secret failure") throw new Error("bad xoxb-secret and xapp-secret");
+      if (prompt === "broken attachment") throw new Error("Could not read one of the attached files. Please try uploading it again.");
       const text = prompt === "long"
         ? "x".repeat(7001)
         : prompt === "markdown"
@@ -190,6 +191,9 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   const thread = { id: "slack:C2:2.0", adapter, channel: { isDM: false, channelVisibility: "private" }, subscribe: async () => restored.push("subscribed"), post: async (text) => posts.push(text) };
   await handlers.mention(thread, { id: "1", text: "@U1 ask <@U2> for help", author: human, raw: {} });
   await handlers.subscribed(thread, { id: "2", text: "<@U2> follow up", author: human, raw: {} });
+  const attachment = { name: "notes.txt", size: 100 * 1024 * 1024, fetchData: async () => Buffer.from("notes") };
+  await handlers.mention(thread, { id: "file-1", text: "@U1 summarize", attachments: [attachment], author: human, raw: {} });
+  await handlers.subscribed(thread, { id: "file-2", text: "compare this", attachments: [attachment], author: human, raw: { subtype: "file_share" } });
   const beforeIgnored = calls.length;
   for (const [threadOverride, messageOverride] of [
     [{ channel: { isDM: true } }, {}],
@@ -197,11 +201,16 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
     [{}, { author: { ...human, isMe: true } }],
     [{}, { author: { ...human, isBot: true } }],
     [{}, { raw: { subtype: "message_changed" } }],
-    [{}, { text: "  " }],
+    [{}, { text: "  ", attachments: [attachment] }],
   ]) {
     await handlers.subscribed({ ...thread, ...threadOverride }, { text: "ignored", author: human, raw: {}, ...messageOverride });
   }
   assert.equal(calls.length, beforeIgnored);
+  await handlers.mention(thread, { id: "too-large", text: "@U1 summarize", attachments: [{ ...attachment, size: 100 * 1024 * 1024 + 1 }], author: human, raw: {} });
+  assert.equal(calls.length, beforeIgnored);
+  await handlers.subscribed(thread, { id: "missing-size", text: "no declared size", attachments: [{ ...attachment, size: undefined }], author: human, raw: { subtype: "file_share" } });
+  assert.equal(calls.length, beforeIgnored + 1);
+  await handlers.subscribed(thread, { id: "broken", text: "broken attachment", attachments: [attachment], author: human, raw: { subtype: "file_share" } });
   await handlers.subscribed(thread, { id: "3", text: "long", author: human, raw: {} });
   await handlers.subscribed(thread, { id: "4", text: "secret failure", author: human, raw: {} });
   await handlers.subscribed(thread, { id: "5", text: "markdown", author: human, raw: {} });
@@ -209,7 +218,11 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
     { markdown: "ask <@U2> for help:new" },
     { markdown: "<@U2> follow up:ses_1" },
   ]);
-  assert.deepEqual(posts.slice(2, 5).map((part) => part.markdown.length), [3500, 3500, 1]);
+  assert.deepEqual(posts.slice(2, 4), [{ markdown: "summarize:ses_1" }, { markdown: "compare this:ses_1" }]);
+  assert.equal(posts[4], "Pipa can read files up to 100 MB each.");
+  assert.deepEqual(posts[5], { markdown: "no declared size:ses_1" });
+  assert.equal(posts[6], "Pipa failed: Could not read one of the attached files. Please try uploading it again.");
+  assert.deepEqual(posts.slice(7, 10).map((part) => part.markdown.length), [3500, 3500, 1]);
   assert.equal(posts.at(-2), "Pipa failed: bad [redacted] and [redacted]");
   assert.deepEqual(posts.at(-1), { markdown: "Try **[Inventing on Principle](<https://example.com>)**." });
   assert.deepEqual(calls.find(({ prompt }) => prompt.startsWith("ask ")).contextEnvironment, {
@@ -218,10 +231,17 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
     PIPA_CURRENT_SLACK_THREAD_TS: "2.0",
     PIPA_REQUESTER_SLACK_USER_ID: "U3",
   });
-  assert.equal(restored.filter((item) => item === "subscribed").length, 1);
+  assert.deepEqual(calls.find(({ prompt }) => prompt === "summarize").attachments, [attachment]);
+  assert.deepEqual(calls.find(({ prompt }) => prompt === "compare this").attachments, [attachment]);
+  assert.equal(calls.find(({ prompt }) => prompt === "no declared size").attachments[0].size, undefined);
+  assert.equal(restored.filter((item) => item === "subscribed").length, 3);
   assert.deepEqual(reactions, [
     "add:1:eyes", "remove:1:eyes", "add:1:white_check_mark",
     "add:2:eyes", "remove:2:eyes", "add:2:white_check_mark",
+    "add:file-1:eyes", "remove:file-1:eyes", "add:file-1:white_check_mark",
+    "add:file-2:eyes", "remove:file-2:eyes", "add:file-2:white_check_mark",
+    "add:missing-size:eyes", "remove:missing-size:eyes", "add:missing-size:white_check_mark",
+    "add:broken:eyes", "remove:broken:eyes", "add:broken:warning",
     "add:3:eyes", "remove:3:eyes", "add:3:white_check_mark",
     "add:4:eyes", "remove:4:eyes", "add:4:warning",
     "add:5:eyes", "remove:5:eyes", "add:5:white_check_mark",

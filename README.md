@@ -37,7 +37,7 @@ pipa init
 pipa start
 ```
 
-Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. Pipa replies in a thread, and follow-up messages in that thread do not need another mention.
+Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. Pipa replies in a thread, and follow-up messages in that thread do not need another mention. Messages can include up to Slack's 10-file limit, with a maximum size of 100 MB per file. Attachments require a text prompt and are copied to a temporary directory only for the duration of the turn.
 
 To use an existing OpenCode server instead of starting standalone OpenCode runs, set its URL before starting Pipa:
 
@@ -53,8 +53,6 @@ pipa init       Configure Slack and the local working directory
 pipa start      Connect Slack Socket Mode to local OpenCode
 pipa --version  Print the installed version
 ```
-
-Pipa v0.1 is text-only. File handling, DMs, interactive questions, schedulers, and hosted fallback are not included.
 
 ## Development
 
