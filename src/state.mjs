@@ -99,12 +99,22 @@ export async function canonicalWorkingDirectory(directory) {
 
 export async function loadConfig(file = pipaPaths().config) {
   const config = await readJson(file, "Run `pipa init` first.");
-  for (const key of ["botName", "slackAppToken", "slackBotToken", "workingDirectory"]) {
+  const slackMode = config.slackMode === undefined ? "socket" : config.slackMode;
+  if (slackMode !== "socket" && slackMode !== "managed") {
+    throw new Error("Invalid Pipa config: slackMode is unsupported.");
+  }
+  const requiredStrings = slackMode === "socket"
+    ? ["botName", "workingDirectory", "slackAppToken", "slackBotToken"]
+    : ["botName", "workingDirectory", "openCodeHostname"];
+  for (const key of requiredStrings) {
     if (typeof config[key] !== "string" || !config[key].trim()) {
       throw new Error(`Invalid Pipa config: ${key} is missing.`);
     }
   }
-  return config;
+  if (slackMode === "managed" && (!Number.isInteger(config.openCodePort) || config.openCodePort < 1 || config.openCodePort > 65535)) {
+    throw new Error("Invalid Pipa config: openCodePort must be an integer from 1 to 65535.");
+  }
+  return { ...config, slackMode };
 }
 
 export async function saveConfig(config, paths = pipaPaths(), manifest = createManifest(config.botName)) {

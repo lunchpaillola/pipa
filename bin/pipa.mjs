@@ -5,8 +5,9 @@ import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { stdin, stdout } from "node:process";
-import { acquireInstanceLock, createManifest, createManifestUrl } from "../src/state.mjs";
+import { acquireInstanceLock, createManifest, createManifestUrl, loadConfig } from "../src/state.mjs";
 import { initializePipa, startPipa } from "../src/app.mjs";
+import { startOpenCodeServer } from "../src/opencode.mjs";
 
 const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 
@@ -98,7 +99,24 @@ function openUrl(url) {
 async function start(io) {
   const releaseLock = await acquireInstanceLock();
   try {
-    const app = await startPipa();
+    const config = await loadConfig();
+    if (config.slackMode === "managed") {
+      const server = startOpenCodeServer(config);
+      io.output.write(`Pipa is serving OpenCode on ${config.openCodeHostname}:${config.openCodePort}.\n`);
+      const stopWithSigint = () => server.stop("SIGINT");
+      const stopWithSigterm = () => server.stop("SIGTERM");
+      process.once("SIGINT", stopWithSigint);
+      process.once("SIGTERM", stopWithSigterm);
+      try {
+        await server.wait();
+      } finally {
+        process.off("SIGINT", stopWithSigint);
+        process.off("SIGTERM", stopWithSigterm);
+      }
+      return;
+    }
+
+    const app = await startPipa({ config });
     io.output.write("Pipa is connected through Slack Socket Mode.\n");
     await new Promise((resolve, reject) => {
       let stopping = false;

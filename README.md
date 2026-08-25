@@ -3,11 +3,15 @@
 [![CI](https://github.com/lunchpaillola/pipa/actions/workflows/ci.yml/badge.svg)](https://github.com/lunchpaillola/pipa/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Pipa connects Slack to the OpenCode already installed on your computer. It runs locally: no hosted relay, database, public endpoint, or sandbox is involved.
+Pipa runs OpenCode in one of two profile modes: local Slack Socket Mode or a Managed OpenCode server. Local mode uses no hosted relay, database, public endpoint, or sandbox.
 
 **Pipa is in early preview. Features may break unintentionally, and CLI commands, configuration, and Slack behavior may continue to change.**
 
-## Requirements
+## Local Socket Mode
+
+Profiles created by `pipa init` use Socket Mode. Profiles written before mode support continue to load as Socket Mode.
+
+### Requirements
 
 - Node.js 22 or newer
 - [OpenCode](https://opencode.ai) installed and authenticated
@@ -15,7 +19,7 @@ Pipa connects Slack to the OpenCode already installed on your computer. It runs 
 
 Invite the Slack app only to channels whose members may use OpenCode in the configured working directory.
 
-## Install
+### Install
 
 1. Install Pipa:
 
@@ -46,11 +50,27 @@ export PIPA_OPENCODE_ATTACH_URL=http://localhost:5555
 pipa start
 ```
 
+## Managed Mode
+
+Managed mode starts exactly one persistent `opencode serve` child and does not connect to Slack or require Slack tokens. Create `~/.pipa/config.json` (or `$PIPA_HOME/.pipa/config.json`) with a private hostname and TCP port:
+
+```json
+{
+  "botName": "Pipa",
+  "workingDirectory": "/workspace",
+  "slackMode": "managed",
+  "openCodeHostname": "127.0.0.1",
+  "openCodePort": 4096
+}
+```
+
+Then run `pipa start`. The OpenCode child inherits the working process environment, so runtime credentials and service configuration should remain in environment variables rather than the profile. `SIGINT` and `SIGTERM` are forwarded to the child.
+
 ## Commands
 
 ```text
 pipa init       Configure Slack and the local working directory
-pipa start      Connect Slack Socket Mode to local OpenCode
+pipa start      Start the configured Socket or Managed runtime
 pipa --version  Print the installed version
 ```
 

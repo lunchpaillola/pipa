@@ -123,6 +123,34 @@ export function createOpenCodeExecutor(options = {}) {
   };
 }
 
+export function startOpenCodeServer(config, options = {}) {
+  const spawn = options.spawn ?? crossSpawn;
+  const platform = options.platform ?? process.platform;
+  const child = spawn("opencode", [
+    "serve",
+    "--hostname", config.openCodeHostname,
+    "--port", String(config.openCodePort),
+    "--log-level", "ERROR",
+  ], {
+    cwd: config.workingDirectory,
+    env: cleanChildEnvironment(options.environment ?? process.env),
+    shell: false,
+    stdio: "inherit",
+  });
+  let stopping = false;
+  const exit = waitForExit(child).then((code) => {
+    if (!stopping) throw new Error(`OpenCode server exited unexpectedly with code ${code}.`);
+  });
+
+  return {
+    wait: () => exit,
+    stop(signal) {
+      stopping = true;
+      terminateChild(child, platform, signal);
+    },
+  };
+}
+
 function fetchAttachment(attachment, timeoutMs) {
   let timer;
   return Promise.race([
@@ -205,12 +233,13 @@ function waitForExit(child) {
   });
 }
 
-function terminateChild(child, platform) {
+function terminateChild(child, platform, signal) {
   if (platform === "win32" && child.pid) {
     crossSpawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
     return;
   }
-  child.kill();
+  child.kill(signal);
   const force = setTimeout(() => child.kill("SIGKILL"), 5_000);
   force.unref?.();
+  child.once("close", () => clearTimeout(force));
 }
