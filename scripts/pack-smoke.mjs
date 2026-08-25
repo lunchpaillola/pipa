@@ -38,7 +38,7 @@ if (process.argv[2] === "--version") {
   if (process.cwd() !== process.env.EXPECTED_CWD) throw new Error("Unexpected Managed OpenCode working directory.");
   if (environmentKeys.some((key) => process.env[key] !== "pack-sentinel")) throw new Error("Managed OpenCode environment was not inherited.");
   fs.writeFileSync(process.env.ASSERT_FILE, "managed-ok");
-  setInterval(() => {}, 1_000);
+  process.exitCode = 23;
 }
 `);
   const fakeOpenCode = path.join(fakeBin, process.platform === "win32" ? "opencode.cmd" : "opencode");
@@ -93,43 +93,39 @@ if (process.argv[2] === "--version") {
     openCodeHostname: "127.0.0.1",
     openCodePort: 4096,
   }));
-  const managed = await run(process.execPath, [installedCli, "start"], {
-    ...process.env,
-    PIPA_HOME: managedHome,
-    PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
-    EXPECTED_CWD: managedWorkingDirectory,
-    ASSERT_FILE: assertionFile,
-    OPENCODE_DB: "pack-sentinel",
-    OPENCODE_CONFIG_CONTENT: "pack-sentinel",
-    PIPA_API_BASE_URL: "pack-sentinel",
-    PIPA_EXECUTION_SECRET: "pack-sentinel",
-    COMPOSIO_API_KEY: "pack-sentinel",
-    OPENAI_API_KEY: "pack-sentinel",
-  }, "", workingDirectory, async (child) => {
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      if (await readFile(assertionFile, "utf8").then(() => true, () => false)) {
-        child.kill("SIGTERM");
-        return;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-    throw new Error("Packed Managed start did not reach OpenCode.");
-  });
+  let managedError;
+  try {
+    await run(process.execPath, [installedCli, "start"], {
+      ...process.env,
+      PIPA_HOME: managedHome,
+      PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+      EXPECTED_CWD: managedWorkingDirectory,
+      ASSERT_FILE: assertionFile,
+      OPENCODE_DB: "pack-sentinel",
+      OPENCODE_CONFIG_CONTENT: "pack-sentinel",
+      PIPA_API_BASE_URL: "pack-sentinel",
+      PIPA_EXECUTION_SECRET: "pack-sentinel",
+      COMPOSIO_API_KEY: "pack-sentinel",
+      OPENAI_API_KEY: "pack-sentinel",
+    }, "", workingDirectory);
+  } catch (error) {
+    managedError = error;
+  }
   if (await readFile(assertionFile, "utf8") !== "managed-ok") throw new Error("Packed Managed start did not run OpenCode.");
-  if (`${managed.stdout}\n${managed.stderr}`.includes("pack-sentinel")) throw new Error("Packed Managed start exposed an environment secret.");
+  if (!managedError?.message.includes("OpenCode server exited unexpectedly with code 23")) throw new Error("Packed Managed start did not propagate the OpenCode exit.");
+  if (managedError.message.includes("pack-sentinel")) throw new Error("Packed Managed start exposed an environment secret.");
   process.stdout.write(`Packed CLI ${stdout.trim()} installed, initialized, cancelled, and ran Managed start successfully.\n`);
 } finally {
   await rm(directory, { recursive: true, force: true });
 }
 
-function run(command, args, environment, input, currentDirectory, afterSpawn) {
+function run(command, args, environment, input, currentDirectory) {
   return new Promise((resolve, reject) => {
     const child = crossSpawn(command, args, { cwd: currentDirectory, env: environment ?? process.env, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => stdout += chunk);
     child.stderr.on("data", (chunk) => stderr += chunk);
-    if (afterSpawn) child.once("spawn", () => Promise.resolve(afterSpawn(child)).catch(reject));
     child.once("error", reject);
     child.once("close", (code) => code === 0 ? resolve({ stdout, stderr }) : reject(new Error(stderr || `CLI exited ${code}`)));
     child.stdin.end(input ?? "");
