@@ -26,8 +26,25 @@ try {
     mkdir(workingDirectory),
     mkdir(fakeBin),
   ]);
+  const fakeScript = path.join(fakeBin, "fake-opencode.cjs");
+  await writeFile(fakeScript, `
+const fs = require("node:fs");
+if (process.argv[2] === "--version") {
+  console.log("1.0.0");
+} else {
+  const expectedArgs = ["serve", "--hostname", "127.0.0.1", "--port", "4096", "--log-level", "ERROR"];
+  const environmentKeys = ["OPENCODE_DB", "OPENCODE_CONFIG_CONTENT", "PIPA_API_BASE_URL", "PIPA_EXECUTION_SECRET", "COMPOSIO_API_KEY", "OPENAI_API_KEY"];
+  if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(expectedArgs)) throw new Error("Unexpected Managed OpenCode arguments.");
+  if (process.cwd() !== process.env.EXPECTED_CWD) throw new Error("Unexpected Managed OpenCode working directory.");
+  if (environmentKeys.some((key) => process.env[key] !== "pack-sentinel")) throw new Error("Managed OpenCode environment was not inherited.");
+  fs.writeFileSync(process.env.ASSERT_FILE, "managed-ok");
+  process.exitCode = 23;
+}
+`);
   const fakeOpenCode = path.join(fakeBin, process.platform === "win32" ? "opencode.cmd" : "opencode");
-  await writeFile(fakeOpenCode, process.platform === "win32" ? "@ECHO 1.0.0\r\n" : "#!/bin/sh\necho 1.0.0\n");
+  await writeFile(fakeOpenCode, process.platform === "win32"
+    ? `@ECHO off\r\n"${process.execPath}" "%~dp0fake-opencode.cjs" %*\r\n`
+    : `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/fake-opencode.cjs" "$@"\n`);
   if (process.platform !== "win32") await chmod(fakeOpenCode, 0o755);
 
   const installedCli = path.join(directory, "install", "node_modules", "@usepipa", "pipa", "bin", "pipa.mjs");
@@ -63,7 +80,41 @@ try {
   if (await readFile(path.join(cancelledHome, ".pipa", "config.json"), "utf8").then(() => true, () => false)) {
     throw new Error("Cancelled init wrote config.");
   }
-  process.stdout.write(`Packed CLI ${stdout.trim()} installed, initialized, and ran successfully.\n`);
+
+  const managedWorkingDirectory = await realpath(workingDirectory);
+  const managedHome = path.join(directory, "managed-home");
+  const managedConfigDirectory = path.join(managedHome, ".pipa");
+  const assertionFile = path.join(directory, "managed-assertion.txt");
+  await mkdir(managedConfigDirectory, { recursive: true });
+  await writeFile(path.join(managedConfigDirectory, "config.json"), JSON.stringify({
+    botName: "Managed Pack Bot",
+    workingDirectory: managedWorkingDirectory,
+    slackMode: "managed",
+    openCodeHostname: "127.0.0.1",
+    openCodePort: 4096,
+  }));
+  let managedError;
+  try {
+    await run(process.execPath, [installedCli, "start"], {
+      ...process.env,
+      PIPA_HOME: managedHome,
+      PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+      EXPECTED_CWD: managedWorkingDirectory,
+      ASSERT_FILE: assertionFile,
+      OPENCODE_DB: "pack-sentinel",
+      OPENCODE_CONFIG_CONTENT: "pack-sentinel",
+      PIPA_API_BASE_URL: "pack-sentinel",
+      PIPA_EXECUTION_SECRET: "pack-sentinel",
+      COMPOSIO_API_KEY: "pack-sentinel",
+      OPENAI_API_KEY: "pack-sentinel",
+    }, "", workingDirectory);
+  } catch (error) {
+    managedError = error;
+  }
+  if (await readFile(assertionFile, "utf8") !== "managed-ok") throw new Error("Packed Managed start did not run OpenCode.");
+  if (!managedError?.message.includes("OpenCode server exited unexpectedly with code 23")) throw new Error("Packed Managed start did not propagate the OpenCode exit.");
+  if (managedError.message.includes("pack-sentinel")) throw new Error("Packed Managed start exposed an environment secret.");
+  process.stdout.write(`Packed CLI ${stdout.trim()} installed, initialized, cancelled, and ran Managed start successfully.\n`);
 } finally {
   await rm(directory, { recursive: true, force: true });
 }

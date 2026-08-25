@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import { buildRunArguments, cleanChildEnvironment, createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, parseOpenCodeOutput, runOpenCodeVersion } from "../src/opencode.mjs";
+import { buildRunArguments, cleanChildEnvironment, createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, parseOpenCodeOutput, runOpenCodeVersion, startOpenCodeServer } from "../src/opencode.mjs";
 
 test("builds shell-free continuation arguments with a literal prompt", () => {
   const prompt = "summarize $(touch nope) && echo bad";
@@ -62,6 +62,70 @@ test("executor passes a clean environment and returns attributable output", asyn
   assert.deepEqual(invocation.args, ["run", "--format", "json", "--dir", "/work", "--attach", "http://localhost:5555", "--", "hello"]);
   assert.equal(invocation.options.shell, false);
   assert.equal(invocation.options.env.SLACK_BOT_TOKEN, undefined);
+});
+
+test("Managed server inherits its environment and forwards termination signals", async () => {
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    let invocation;
+    let killCount = 0;
+    const child = new EventEmitter();
+    child.kill = (received) => {
+      killCount += 1;
+      assert.equal(received, signal);
+      queueMicrotask(() => child.emit("close", 1));
+      return true;
+    };
+    const environment = {
+      OPENCODE_DB: "/work/opencode.db",
+      OPENCODE_CONFIG_CONTENT: "config",
+      PIPA_API_BASE_URL: "https://gateway.example",
+      PIPA_EXECUTION_SECRET: "gateway-secret",
+      PIPA_SLACK_BOT_TOKEN: "stale-slack-secret",
+      COMPOSIO_API_KEY: "composio-secret",
+      OPENAI_API_KEY: "provider-secret",
+    };
+    const server = startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "127.0.0.1", openCodePort: 4096 }, {
+      environment,
+      platform: "linux",
+      spawn(command, args, options) {
+        invocation = { command, args, options };
+        return child;
+      },
+    });
+    assert.equal(invocation.command, "opencode");
+    assert.deepEqual(invocation.args, ["serve", "--hostname", "127.0.0.1", "--port", "4096", "--log-level", "ERROR"]);
+    assert.equal(invocation.options.cwd, "/work");
+    assert.equal(invocation.options.env.PIPA_SLACK_BOT_TOKEN, undefined);
+    assert.equal(invocation.options.env.PIPA_EXECUTION_SECRET, "gateway-secret");
+    assert.equal(invocation.options.env.COMPOSIO_API_KEY, "composio-secret");
+    assert.equal(invocation.options.env.OPENAI_API_KEY, "provider-secret");
+    assert.equal(invocation.options.shell, false);
+    assert.equal(invocation.options.stdio, "inherit");
+    server.stop(signal);
+    server.stop(signal);
+    await server.wait();
+    assert.equal(killCount, 1);
+  }
+});
+
+test("Managed server propagates spawn errors and unexpected exits", async () => {
+  const spawnFailure = new EventEmitter();
+  spawnFailure.kill = () => true;
+  const failedServer = startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "localhost", openCodePort: 4096 }, { spawn: () => spawnFailure });
+  queueMicrotask(() => spawnFailure.emit("error", new Error("OpenCode unavailable")));
+  await assert.rejects(failedServer.wait(), /OpenCode unavailable/u);
+
+  const exited = new EventEmitter();
+  exited.kill = () => true;
+  const exitedServer = startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "localhost", openCodePort: 4096 }, { spawn: () => exited });
+  queueMicrotask(() => exited.emit("close", 23));
+  await assert.rejects(exitedServer.wait(), /exited unexpectedly with code 23/u);
+
+  const cleanExit = new EventEmitter();
+  cleanExit.kill = () => true;
+  const cleanExitServer = startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "localhost", openCodePort: 4096 }, { spawn: () => cleanExit });
+  queueMicrotask(() => cleanExit.emit("close", 0));
+  await assert.rejects(cleanExitServer.wait(), /exited unexpectedly with code 0/u);
 });
 
 test("executor downloads attachments to distinct temporary files and removes them", async () => {

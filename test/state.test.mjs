@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { acquireInstanceLock, createManifest, createManifestUrl, createSessionStore, loadSessions, pipaPaths, saveConfig } from "../src/state.mjs";
+import { acquireInstanceLock, createManifest, createManifestUrl, createSessionStore, loadConfig, loadSessions, pipaPaths, saveConfig } from "../src/state.mjs";
 
 test("manifest preserves approved capabilities and substitutes the bot name", () => {
   const manifest = createManifest('Workshop "Bot"');
@@ -34,6 +34,34 @@ test("config and sessions are stored separately with private permissions", async
   assert.equal(JSON.parse(await readFile(paths.sessions, "utf8"))["slack:C1:1.0"], "ses_1");
   assert.doesNotMatch(await readFile(paths.sessions, "utf8"), /xoxb|xapp/u);
   if (process.platform !== "win32") assert.equal((await stat(paths.config)).mode & 0o777, 0o600);
+});
+
+test("config validates Socket and Managed profiles", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-config-"));
+  const file = pipaPaths(home).config;
+  await mkdir(path.dirname(file), { recursive: true });
+  const writeConfig = (config) => writeFile(file, JSON.stringify(config));
+  const shared = { botName: "Pipa", workingDirectory: home };
+
+  await writeConfig({ ...shared, slackAppToken: "xapp-test", slackBotToken: "xoxb-test" });
+  assert.equal((await loadConfig(file)).slackMode, "socket");
+  for (const missing of ["slackAppToken", "slackBotToken"]) {
+    const config = { ...shared, slackMode: "socket", slackAppToken: "xapp-test", slackBotToken: "xoxb-test" };
+    delete config[missing];
+    await writeConfig(config);
+    await assert.rejects(loadConfig(file), new RegExp(`${missing} is missing`, "u"));
+  }
+
+  const managed = { ...shared, slackMode: "managed", openCodeHostname: "127.0.0.1", openCodePort: 4096 };
+  await writeConfig(managed);
+  assert.deepEqual(await loadConfig(file), managed);
+  for (const [openCodeHostname, openCodePort] of [["", 4096], ["127.0.0.1", 1.5], ["127.0.0.1", 0], ["127.0.0.1", 65536]]) {
+    await writeConfig({ ...managed, openCodeHostname, openCodePort });
+    await assert.rejects(loadConfig(file), /Invalid Pipa config/u);
+  }
+
+  await writeConfig({ ...shared, slackMode: "not-a-real-mode-secret" });
+  await assert.rejects(loadConfig(file), (error) => !error.message.includes("not-a-real-mode-secret"));
 });
 
 test("malformed session state fails instead of discarding continuity", async () => {
