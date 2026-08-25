@@ -145,6 +145,7 @@ export function startOpenCodeServer(config, options = {}) {
   return {
     wait: () => exit,
     stop(signal) {
+      if (stopping) return;
       stopping = true;
       terminateChild(child, platform, signal);
     },

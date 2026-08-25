@@ -102,11 +102,11 @@ async function start(io) {
     const config = await loadConfig();
     if (config.slackMode === "managed") {
       const server = startOpenCodeServer(config);
-      io.output.write(`Pipa is serving OpenCode on ${config.openCodeHostname}:${config.openCodePort}.\n`);
+      io.output.write(`Pipa is starting OpenCode on ${config.openCodeHostname}:${config.openCodePort}.\n`);
       const stopWithSigint = () => server.stop("SIGINT");
       const stopWithSigterm = () => server.stop("SIGTERM");
-      process.once("SIGINT", stopWithSigint);
-      process.once("SIGTERM", stopWithSigterm);
+      process.on("SIGINT", stopWithSigint);
+      process.on("SIGTERM", stopWithSigterm);
       try {
         await server.wait();
       } finally {

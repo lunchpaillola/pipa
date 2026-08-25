@@ -67,8 +67,10 @@ test("executor passes a clean environment and returns attributable output", asyn
 test("Managed server inherits its environment and forwards termination signals", async () => {
   for (const signal of ["SIGINT", "SIGTERM"]) {
     let invocation;
+    let killCount = 0;
     const child = new EventEmitter();
     child.kill = (received) => {
+      killCount += 1;
       assert.equal(received, signal);
       queueMicrotask(() => child.emit("close", 1));
       return true;
@@ -100,7 +102,9 @@ test("Managed server inherits its environment and forwards termination signals",
     assert.equal(invocation.options.shell, false);
     assert.equal(invocation.options.stdio, "inherit");
     server.stop(signal);
+    server.stop(signal);
     await server.wait();
+    assert.equal(killCount, 1);
   }
 });
 
