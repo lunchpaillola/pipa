@@ -17,6 +17,10 @@ try {
   const { stdout } = await run(command, args);
   if (stdout.trim() !== packageJson.version) throw new Error(`Packed CLI returned ${JSON.stringify(stdout.trim())}.`);
 
+  const installedRoot = path.join(directory, "install", "node_modules", "@usepipa", "pipa");
+  const packedRuntime = await import(pathToFileURL(path.join(installedRoot, "src", "opencode.mjs")).href);
+  if (typeof packedRuntime.createOpenCodeExecutor !== "function") throw new Error("Packed OpenCode executor is unavailable.");
+
   const home = path.join(directory, "home");
   const workingDirectory = path.join(directory, "work");
   const fakeBin = path.join(directory, "fake-bin");
@@ -47,7 +51,7 @@ if (process.argv[2] === "--version") {
     : `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/fake-opencode.cjs" "$@"\n`);
   if (process.platform !== "win32") await chmod(fakeOpenCode, 0o755);
 
-  const installedCli = path.join(directory, "install", "node_modules", "@usepipa", "pipa", "bin", "pipa.mjs");
+  const installedCli = path.join(installedRoot, "bin", "pipa.mjs");
   const init = await run(process.execPath, [installedCli, "init"], {
     ...process.env,
     HOME: home,
@@ -114,7 +118,7 @@ if (process.argv[2] === "--version") {
   if (await readFile(assertionFile, "utf8") !== "managed-ok") throw new Error("Packed Managed start did not run OpenCode.");
   if (!managedError?.message.includes("OpenCode server exited unexpectedly with code 23")) throw new Error("Packed Managed start did not propagate the OpenCode exit.");
   if (managedError.message.includes("pack-sentinel")) throw new Error("Packed Managed start exposed an environment secret.");
-  process.stdout.write(`Packed CLI ${stdout.trim()} installed, initialized, cancelled, and ran Managed start successfully.\n`);
+  process.stdout.write(`Packed CLI ${stdout.trim()} installed, loaded its runtime, initialized, cancelled, and ran Managed start successfully.\n`);
 } finally {
   await rm(directory, { recursive: true, force: true });
 }

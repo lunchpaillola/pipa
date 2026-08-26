@@ -5,3 +5,4 @@ node_modules/
 .opencode/.gitignore
 .opencode/goals/
 .opencode/skills/*/results/
+docs/plans/

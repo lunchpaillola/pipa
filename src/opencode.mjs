@@ -2,6 +2,7 @@ import crossSpawn from "cross-spawn";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const SECRET_ENV_KEYS = new Set([
   "PIPA_SLACK_APP_TOKEN",
@@ -9,6 +10,7 @@ const SECRET_ENV_KEYS = new Set([
   "SLACK_APP_TOKEN",
   "SLACK_BOT_TOKEN",
 ]);
+const LISTENING_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+/u;
 
 export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 
@@ -16,23 +18,99 @@ export function cleanChildEnvironment(environment = process.env) {
   return Object.fromEntries(Object.entries(environment).filter(([key]) => !SECRET_ENV_KEYS.has(key.toUpperCase())));
 }
 
-export function buildRunArguments({ prompt, sessionId, workingDirectory, attachUrl, files = [] }) {
-  const args = ["run", "--format", "json", "--dir", workingDirectory];
-  if (attachUrl) args.push("--attach", attachUrl);
-  if (sessionId) args.push("--session", sessionId);
-  for (const file of files) args.push("--file", file);
-  args.push("--", prompt);
-  return args;
+export async function startSocketOpenCodeServer(config, options = {}) {
+  const environment = options.environment ?? process.env;
+  const attachUrl = options.attachUrl ?? environment.PIPA_OPENCODE_ATTACH_URL?.trim();
+  const fetchImpl = options.fetch ?? fetch;
+  const startupTimeoutMs = options.startupTimeoutMs ?? 30_000;
+  const headers = authenticationHeaders(environment);
+
+  if (attachUrl) {
+    const baseUrl = normalizeBaseUrl(attachUrl);
+    await waitForHealth(baseUrl, fetchImpl, headers, startupTimeoutMs);
+    return externalServer(baseUrl);
+  }
+
+  const spawn = options.spawn ?? crossSpawn;
+  const platform = options.platform ?? process.platform;
+  const child = spawn("opencode", [
+    "serve",
+    "--hostname", "127.0.0.1",
+    "--port", "0",
+    "--log-level", "ERROR",
+  ], {
+    cwd: config.workingDirectory,
+    env: cleanChildEnvironment(environment),
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const exit = waitForExit(child);
+
+  try {
+    const baseUrl = await Promise.race([
+      readListeningUrl(child, startupTimeoutMs),
+      exit.then((code) => { throw new Error(`OpenCode server exited before startup with code ${code}.`); }),
+    ]);
+    child.stdout?.resume();
+    child.stderr?.resume();
+    await Promise.race([
+      waitForHealth(baseUrl, fetchImpl, headers, startupTimeoutMs),
+      exit.then((code) => { throw new Error(`OpenCode server exited before startup with code ${code}.`); }),
+    ]);
+    return ownedServer(baseUrl, child, exit, platform);
+  } catch (error) {
+    terminateChild(child, platform);
+    await Promise.race([exit.catch(() => undefined), delay(5_000)]);
+    throw error;
+  }
 }
 
 export function createOpenCodeExecutor(options = {}) {
-  const spawn = options.spawn ?? crossSpawn;
-  const platform = options.platform ?? process.platform;
+  const baseUrl = normalizeBaseUrl(options.baseUrl);
+  const fetchImpl = options.fetch ?? fetch;
   const environment = options.environment ?? process.env;
-  const attachUrl = options.attachUrl ?? environment.PIPA_OPENCODE_ATTACH_URL?.trim();
+  const headers = authenticationHeaders(environment);
   const timeoutMs = options.timeoutMs ?? 2.5 * 60 * 60 * 1000;
-  const children = new Set();
+  const requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
+  const pollIntervalMs = options.pollIntervalMs ?? 1_000;
+  const useDataUrls = !isLoopbackUrl(baseUrl);
+  const active = new Set();
   let stopped = false;
+
+  async function request(pathname, init, workingDirectory, controller, acceptedStatuses = [200]) {
+    const url = serverUrl(baseUrl, pathname, workingDirectory);
+    let response;
+    try {
+      response = await fetchImpl(url, {
+        ...init,
+        headers: {
+          ...headers,
+          ...(init.body ? { "content-type": "application/json" } : {}),
+          ...init.headers,
+        },
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(requestTimeoutMs)]),
+      });
+    } catch (error) {
+      if (controller.signal.aborted) throw controller.signal.reason;
+      if (isNetworkError(error)) options.onFatal?.(new Error("OpenCode server became unavailable."));
+      throw error;
+    }
+    let text;
+    try {
+      text = await response.text();
+    } catch (error) {
+      if (controller.signal.aborted) throw controller.signal.reason;
+      if (isNetworkError(error)) options.onFatal?.(new Error("OpenCode server became unavailable."));
+      throw error;
+    }
+    if (!acceptedStatuses.includes(response.status)) throw new OpenCodeRequestError(response.status);
+    if (!text) return undefined;
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error("OpenCode returned an invalid response.");
+    }
+  }
 
   async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [] }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
@@ -41,66 +119,63 @@ export function createOpenCodeExecutor(options = {}) {
     let turnError;
 
     try {
-      const files = [];
-      for (const [index, attachment] of attachments.entries()) {
-        let data;
-        try {
-          data = await fetchAttachment(attachment, timeoutMs);
-        } catch {
-          throw new Error("Could not read one of the attached files. Please try uploading it again.");
-        }
-        if (data.byteLength > MAX_ATTACHMENT_BYTES) throw new Error("Attached files must be 100 MB or smaller.");
-        try {
-          const sanitizedName = path.basename(attachment.name || "attachment")
-            .replace(/[<>:"/\\|?*\u0000-\u001f]/gu, "_")
-            .replace(/[. ]+$/u, "");
-          const name = Array.from(sanitizedName).reduce(
-            (result, character) => Buffer.byteLength(result + character) <= 200 ? result + character : result,
-            "",
-          ) || "attachment";
-          const file = path.join(temporaryDirectory, `${index + 1}-${name}`);
-          await writeFile(file, data);
-          files.push(file);
-        } catch {
-          throw new Error("Could not read one of the attached files. Please try uploading it again.");
-        }
-      }
-
+      const files = await stageAttachments(attachments, temporaryDirectory, timeoutMs, useDataUrls);
       if (stopped) throw new Error("Pipa is shutting down.");
-      const child = spawn("opencode", buildRunArguments({ prompt, sessionId, workingDirectory, attachUrl, files }), {
-        cwd: workingDirectory,
-        env: { ...cleanChildEnvironment(environment), ...contextEnvironment },
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      children.add(child);
-      const exit = waitForExit(child);
-      void exit.finally(() => children.delete(child)).catch(() => undefined);
-      let timer;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(new Error(`OpenCode timed out after ${timeoutMs}ms.`)), timeoutMs);
+      active.add(controller);
 
       try {
-        const operation = Promise.all([collect(child.stdout), collect(child.stderr), exit]);
-        const timeout = new Promise((_, reject) => {
-          timer = setTimeout(() => {
-            terminateChild(child, platform);
-            reject(new Error(`OpenCode timed out after ${timeoutMs}ms.`));
-          }, timeoutMs);
-        });
-        const [stdout, stderr, code] = await Promise.race([operation, timeout]);
-        const output = parseOpenCodeOutput(stdout);
-        if (output.error) throw new Error(output.error);
-        if (code !== 0) throw new Error(output.error || stderr.trim() || `OpenCode exited with code ${code}.`);
-        if (!output.text) throw new Error("OpenCode completed without assistant text.");
-        return { text: output.text, sessionId: output.sessionId ?? sessionId ?? null };
-      } catch (error) {
-        terminateChild(child, platform);
-        await exit.catch(() => undefined);
-        throw error;
+        let selectedSessionId = sessionId;
+        let messages;
+        if (selectedSessionId) {
+          try {
+            while (true) {
+              const status = (await request("/session/status", { method: "GET" }, workingDirectory, controller))?.[selectedSessionId]?.type;
+              if (status !== "busy" && status !== "retry") break;
+              await delay(pollIntervalMs, controller.signal);
+            }
+            messages = await request(`/session/${encodeURIComponent(selectedSessionId)}/message?limit=1`, { method: "GET" }, workingDirectory, controller);
+          } catch (error) {
+            if (!(error instanceof OpenCodeRequestError) || error.status !== 404) throw error;
+            selectedSessionId = null;
+          }
+        }
+        if (!selectedSessionId) {
+          const session = await request("/session", { method: "POST", body: "{}" }, workingDirectory, controller);
+          if (!session?.id) throw new Error("OpenCode did not create a session.");
+          selectedSessionId = session.id;
+          messages = [];
+        }
+
+        const baseline = new Set(messages.map((message) => message?.info?.id).filter(Boolean));
+        await request(`/session/${encodeURIComponent(selectedSessionId)}/prompt_async`, {
+          method: "POST",
+          body: JSON.stringify(promptBody(prompt.trim(), files, contextEnvironment)),
+        }, workingDirectory, controller, [204]);
+
+        while (true) {
+          const [currentMessages, statuses] = await Promise.all([
+            request(`/session/${encodeURIComponent(selectedSessionId)}/message?limit=1`, { method: "GET" }, workingDirectory, controller),
+            request("/session/status", { method: "GET" }, workingDirectory, controller),
+          ]);
+          const finalMessage = latestAssistantMessage(currentMessages, baseline);
+          const status = statuses?.[selectedSessionId]?.type;
+          if (["error", "failed", "cancelled"].includes(status) || finalMessage?.error) throw new Error("OpenCode failed to complete the turn.");
+          if (finalMessage && (status === "idle" || (!status && finalMessage.completed))) {
+            if (!finalMessage.text) throw new Error("OpenCode completed without assistant text.");
+            return { text: finalMessage.text, sessionId: selectedSessionId };
+          }
+          await delay(pollIntervalMs, controller.signal);
+        }
       } finally {
         clearTimeout(timer);
+        controller.abort(new Error("OpenCode turn completed."));
+        active.delete(controller);
       }
     } catch (error) {
       turnError = error;
+      if (stopped) throw new Error("Pipa is shutting down.");
       throw error;
     } finally {
       if (temporaryDirectory) {
@@ -118,7 +193,7 @@ export function createOpenCodeExecutor(options = {}) {
     runTurn,
     stopAll() {
       stopped = true;
-      for (const child of children) terminateChild(child, platform);
+      for (const controller of active) controller.abort(new Error("Pipa is shutting down."));
     },
   };
 }
@@ -152,16 +227,6 @@ export function startOpenCodeServer(config, options = {}) {
   };
 }
 
-function fetchAttachment(attachment, timeoutMs) {
-  let timer;
-  return Promise.race([
-    attachment.fetchData(),
-    new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`Attachment download timed out after ${timeoutMs}ms.`)), timeoutMs);
-    }),
-  ]).finally(() => clearTimeout(timer));
-}
-
 export async function runOpenCodeVersion(options = {}) {
   const spawn = options.spawn ?? crossSpawn;
   const platform = options.platform ?? process.platform;
@@ -184,35 +249,219 @@ export async function runOpenCodeVersion(options = {}) {
     if (code !== 0) throw new Error(stderr.trim() || "OpenCode version check failed.");
     return stdout.trim();
   } catch (error) {
-    if (error?.code === "ENOENT") {
-      throw new Error("OpenCode is unavailable. Install it and make sure `opencode --version` succeeds.");
-    }
+    if (error?.code === "ENOENT") throw new Error("OpenCode is unavailable. Install it and make sure `opencode --version` succeeds.");
     throw error;
   } finally {
     clearTimeout(timer);
   }
 }
 
-export function parseOpenCodeOutput(stdout) {
-  let text = "";
-  let sessionId = null;
-  let error = "";
-
-  for (const line of stdout.split("\n")) {
-    if (!line.trim().startsWith("{")) continue;
+async function stageAttachments(attachments, temporaryDirectory, timeoutMs, useDataUrls) {
+  const files = [];
+  for (const [index, attachment] of attachments.entries()) {
+    let data;
     try {
-      const event = JSON.parse(line);
-      const candidate = event.part?.type === "text" ? event.part.text : event.type === "text" ? event.text : null;
-      if (typeof candidate === "string" && candidate.trim()) text = candidate.trim();
-      const eventSessionId = event.sessionID ?? event.sessionId ?? event.part?.sessionID;
-      if (typeof eventSessionId === "string" && eventSessionId) sessionId = eventSessionId;
-      const eventError = event.error?.data?.message ?? event.error?.message;
-      if (typeof eventError === "string" && eventError.trim()) error = eventError.trim();
+      data = await fetchAttachment(attachment, timeoutMs);
     } catch {
-      // OpenCode can emit non-JSON diagnostics between JSON events.
+      throw new Error("Could not read one of the attached files. Please try uploading it again.");
+    }
+    if (data.byteLength > MAX_ATTACHMENT_BYTES) throw new Error("Attached files must be 100 MB or smaller.");
+    try {
+      const sanitizedName = path.basename(attachment.name || "attachment")
+        .replace(/[<>:"/\\|?*\u0000-\u001f]/gu, "_")
+        .replace(/[. ]+$/u, "");
+      const filename = Array.from(sanitizedName).reduce(
+        (result, character) => Buffer.byteLength(result + character) <= 200 ? result + character : result,
+        "",
+      ) || "attachment";
+      const file = path.join(temporaryDirectory, `${index + 1}-${filename}`);
+      await writeFile(file, data);
+      const mime = attachment.mimeType || "application/octet-stream";
+      files.push({
+        filename,
+        mime,
+        url: useDataUrls ? `data:${mime};base64,${Buffer.from(data).toString("base64")}` : pathToFileURL(file).href,
+      });
+    } catch {
+      throw new Error("Could not read one of the attached files. Please try uploading it again.");
     }
   }
-  return { text, sessionId, error };
+  return files;
+}
+
+function promptBody(prompt, files, contextEnvironment) {
+  const parts = [{ type: "text", text: prompt }, ...files.map((file) => ({ type: "file", ...file }))];
+  const context = Object.entries(contextEnvironment).filter(([, value]) => value !== undefined && value !== null && String(value));
+  return {
+    parts,
+    ...(context.length ? { system: `Runtime context for this turn:\n${context.map(([key, value]) => `${key}=${value}`).join("\n")}` } : {}),
+  };
+}
+
+function latestAssistantMessage(messages, baseline) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!message?.info?.id || baseline.has(message.info.id) || message.info.role !== "assistant") continue;
+    return {
+      completed: typeof message.info.time?.completed === "number",
+      error: message.info.error,
+      text: message.parts
+        .filter((part) => part.type === "text" && typeof part.text === "string" && part.text)
+        .map((part) => part.text)
+        .join("\n")
+        .trim(),
+    };
+  }
+  return null;
+}
+
+function ownedServer(baseUrl, child, exit, platform) {
+  let stopping = false;
+  let rejectFailure;
+  const failure = new Promise((_, reject) => rejectFailure = reject);
+  const wait = Promise.race([exit.then((code) => {
+    if (!stopping) throw new Error(`OpenCode server exited unexpectedly with code ${code}.`);
+  }), failure]);
+  void wait.catch(() => undefined);
+  return {
+    baseUrl,
+    owned: true,
+    wait: () => wait,
+    fail(error) {
+      if (!stopping) rejectFailure(error);
+    },
+    stop(signal = "SIGTERM") {
+      if (stopping) return;
+      stopping = true;
+      terminateChild(child, platform, signal);
+    },
+  };
+}
+
+function externalServer(baseUrl) {
+  let resolveWait;
+  let rejectWait;
+  let stopped = false;
+  const wait = new Promise((resolve, reject) => {
+    resolveWait = resolve;
+    rejectWait = reject;
+  });
+  void wait.catch(() => undefined);
+  return {
+    baseUrl,
+    owned: false,
+    wait: () => wait,
+    fail(error) {
+      if (!stopped) rejectWait(error);
+    },
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      resolveWait();
+    },
+  };
+}
+
+async function waitForHealth(baseUrl, fetchImpl, headers, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetchImpl(`${baseUrl}/global/health`, {
+        headers,
+        signal: AbortSignal.timeout(Math.min(5_000, Math.max(1, deadline - Date.now()))),
+      });
+      if (response.ok && (await response.json())?.healthy === true) return;
+    } catch {
+      // The server can accept its socket shortly before the health route is ready.
+    }
+    await delay(Math.min(250, Math.max(0, deadline - Date.now())));
+  }
+  throw new Error("OpenCode server health check timed out.");
+}
+
+function readListeningUrl(child, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let output = "";
+    const cleanup = () => {
+      child.stdout?.off("data", inspect);
+      child.stderr?.off("data", inspect);
+    };
+    const finish = (callback, value) => {
+      clearTimeout(timer);
+      cleanup();
+      callback(value);
+    };
+    const inspect = (chunk) => {
+      output = (output + chunk).slice(-16_384);
+      const match = output.match(LISTENING_URL);
+      if (!match) return;
+      finish(resolve, normalizeBaseUrl(match[0]));
+    };
+    const timer = setTimeout(() => finish(reject, new Error("OpenCode server did not report its listening URL.")), timeoutMs);
+    timer.unref?.();
+    child.stdout?.on("data", inspect);
+    child.stderr?.on("data", inspect);
+  });
+}
+
+function authenticationHeaders(environment) {
+  const password = environment.OPENCODE_SERVER_PASSWORD;
+  if (!password) return {};
+  const username = environment.OPENCODE_SERVER_USERNAME?.trim() || "opencode";
+  return { authorization: `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}` };
+}
+
+function normalizeBaseUrl(value) {
+  const url = new URL(value);
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("OpenCode server URL must use http or https.");
+  return url.href.replace(/\/+$/u, "");
+}
+
+function isLoopbackUrl(value) {
+  const hostname = new URL(value).hostname;
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+}
+
+function serverUrl(baseUrl, pathname, workingDirectory) {
+  const url = new URL(`${baseUrl}${pathname}`);
+  if (workingDirectory) url.searchParams.set("directory", workingDirectory);
+  return url;
+}
+
+function fetchAttachment(attachment, timeoutMs) {
+  let timer;
+  return Promise.race([
+    attachment.fetchData(),
+    new Promise((_, reject) => timer = setTimeout(() => reject(new Error(`Attachment download timed out after ${timeoutMs}ms.`)), timeoutMs)),
+  ]).finally(() => clearTimeout(timer));
+}
+
+function delay(delayMs, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const settle = (callback, value) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      callback(value);
+    };
+    const abort = () => settle(reject, signal.reason);
+    const timer = setTimeout(() => settle(resolve), delayMs);
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function isNetworkError(error) {
+  return error instanceof TypeError || ["ECONNREFUSED", "ECONNRESET", "EPIPE"].includes(error?.cause?.code ?? error?.code);
+}
+
+class OpenCodeRequestError extends Error {
+  constructor(status) {
+    super(`OpenCode request failed with status ${status}.`);
+    this.status = status;
+  }
 }
 
 function collect(stream, limit = 10 * 1024 * 1024) {
@@ -236,7 +485,13 @@ function waitForExit(child) {
 
 function terminateChild(child, platform, signal) {
   if (platform === "win32" && child.pid) {
-    crossSpawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
+    const taskkill = crossSpawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
+    const fallback = () => child.kill("SIGKILL");
+    taskkill.once("error", fallback);
+    taskkill.once("close", (code) => { if (code !== 0) fallback(); });
+    const force = setTimeout(fallback, 5_000);
+    force.unref?.();
+    child.once("close", () => clearTimeout(force));
     return;
   }
   child.kill(signal);
