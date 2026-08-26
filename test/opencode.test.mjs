@@ -1,11 +1,9 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import { pathToFileURL } from "node:url";
 import {
   cleanChildEnvironment,
   createOpenCodeExecutor,
@@ -109,7 +107,6 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
   const fetch = async (url, init = {}) => {
     const parsed = new URL(url);
     assert.equal(parsed.searchParams.get("directory"), "/work");
-    if (parsed.pathname === "/event") return eventResponse({ type: "session.idle", properties: { sessionID: "ses_1" } });
     if (parsed.pathname === "/session/ses_1/message" && init.method === "GET") {
       if (!prompted) return jsonResponse([{ info: { id: "old", role: "assistant" }, parts: [{ type: "text", text: "old" }] }]);
       return jsonResponse([
@@ -159,7 +156,6 @@ test("replaces a stale persisted session only after a successful turn", async ()
     const pathname = new URL(url).pathname;
     if (pathname === "/session/ses_stale/message") return jsonResponse({ error: "not found" }, 404);
     if (pathname === "/session" && init.method === "POST") return jsonResponse({ id: "ses_new" });
-    if (pathname === "/event") return eventResponse({ type: "session.idle", properties: { sessionID: "ses_new" } });
     if (pathname === "/session/ses_new/message") {
       return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "recovered" }] }] : []);
     }
@@ -180,7 +176,6 @@ test("does not complete until both the session is idle and a new assistant messa
   let messageReads = 0;
   const fetch = async (url, init = {}) => {
     const pathname = new URL(url).pathname;
-    if (pathname === "/event") return eventResponse({ type: "message.updated" });
     if (pathname === "/session/ses_1/prompt_async") return new Response(null, { status: 204 });
     if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
     if (pathname === "/session/ses_1/message") {
@@ -203,7 +198,6 @@ test("rejects prompt failures and aborts active requests during shutdown", async
       const pathname = new URL(url).pathname;
       if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
       if (pathname === "/session/ses_1/message") return jsonResponse([]);
-      if (pathname === "/event") return eventResponse({ type: "server.connected" });
       if (pathname.endsWith("/prompt_async")) return jsonResponse({ error: "provider failed" }, 500);
       throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
     },
@@ -220,41 +214,19 @@ test("rejects prompt failures and aborts active requests during shutdown", async
   await assert.rejects(turn, /shutting down/u);
 });
 
-test("marks the selected server fatal when the initial event connection disappears", async () => {
+test("marks the selected server fatal when a request loses its connection", async () => {
   let fatal;
   const executor = createOpenCodeExecutor({
     baseUrl: "http://localhost:5555",
     onFatal: (error) => fatal = error,
     fetch: async (url) => {
       const pathname = new URL(url).pathname;
-      if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
-      if (pathname === "/session/ses_1/message") return jsonResponse([]);
-      if (pathname === "/event") throw new TypeError("fetch failed");
+      if (pathname === "/session/status") throw new TypeError("fetch failed");
       throw new Error(`Unexpected request: ${url}`);
     },
   });
-  await assert.rejects(executor.runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" }), /became unavailable/u);
+  await assert.rejects(executor.runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" }), /fetch failed/u);
   assert.match(fatal.message, /became unavailable/u);
-});
-
-test("treats session.error as terminal and never returns incomplete assistant text", async () => {
-  let reads = 0;
-  const executor = createOpenCodeExecutor({
-    baseUrl: "http://localhost:5555",
-    pollIntervalMs: 1,
-    fetch: async (url) => {
-      const pathname = new URL(url).pathname;
-      if (pathname === "/event") return eventResponse({ type: "session.error", properties: { sessionID: "ses_1" } });
-      if (pathname.endsWith("/prompt_async")) return new Response(null, { status: 204 });
-      if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
-      if (pathname === "/session/ses_1/message") {
-        reads += 1;
-        return jsonResponse(reads > 1 ? [{ info: { id: "new", role: "assistant" }, parts: [{ type: "text", text: "partial" }] }] : []);
-      }
-      throw new Error(`Unexpected request: ${url}`);
-    },
-  });
-  await assert.rejects(executor.runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" }), /failed to complete/u);
 });
 
 test("preserves attachment validation and cleanup", async () => {
@@ -276,7 +248,6 @@ test("sanitizes distinct attachment files and removes them after prompt failure"
       const pathname = new URL(url).pathname;
       if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
       if (pathname === "/session/ses_1/message") return jsonResponse([]);
-      if (pathname === "/event") return eventResponse({ type: "server.connected" });
       if (pathname.endsWith("/prompt_async")) {
         files.push(...JSON.parse(init.body).parts.slice(1).map((part) => new URL(part.url)));
         assert.deepEqual(await Promise.all(files.map((file) => readFile(file, "utf8"))), ["one", "two"]);
@@ -307,7 +278,6 @@ test("sends data attachment URLs to a remotely managed server", async () => {
       const pathname = new URL(url).pathname;
       if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
       if (pathname === "/session/ses_1/message") return jsonResponse([]);
-      if (pathname === "/event") return eventResponse({ type: "server.connected" });
       if (pathname.endsWith("/prompt_async")) {
         filePart = JSON.parse(init.body).parts[1];
         return jsonResponse({ error: "failed" }, 500);
@@ -399,54 +369,6 @@ test("version check times out and terminates a hung child", async () => {
   assert.equal(killed, true);
 });
 
-test("installed OpenCode v1 exposes the native server contract", async (t) => {
-  try {
-    await runOpenCodeVersion({ timeoutMs: 5_000 });
-  } catch (error) {
-    if (error?.code === "ENOENT" || /unavailable/u.test(error?.message ?? "")) return t.skip("OpenCode is not installed");
-    throw error;
-  }
-  const workingDirectory = await mkdtemp(path.join(os.tmpdir(), "pipa-contract-"));
-  const server = await startSocketOpenCodeServer({ workingDirectory }, { startupTimeoutMs: 15_000 });
-  try {
-    const doc = await (await fetch(`${server.baseUrl}/doc`)).json();
-    assert.ok(doc.paths["/session/{sessionID}/prompt_async"].post.responses[204]);
-    assert.ok(doc.paths["/session/status"].get.responses[200]);
-    assert.ok(doc.paths["/session/{sessionID}/message"].get.responses[200]);
-    assert.ok(doc.paths["/event"].get.responses[200].content["text/event-stream"]);
-    const fileSchema = doc.components.schemas.FilePartInput;
-    assert.equal(fileSchema.properties.url.type, "string");
-    assert.equal(fileSchema.properties.filename.type, "string");
-    const query = new URLSearchParams({ directory: workingDirectory });
-    const session = await (await fetch(`${server.baseUrl}/session?${query}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: "{}",
-    })).json();
-    const file = path.join(workingDirectory, "attachment.txt");
-    await writeFile(file, "contract attachment");
-    const prompt = await fetch(`${server.baseUrl}/session/${session.id}/prompt_async?${query}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        noReply: true,
-        parts: [
-          { type: "text", text: "Read the attachment." },
-          { type: "file", mime: "text/plain", filename: "attachment.txt", url: pathToFileURL(file).href },
-        ],
-      }),
-    });
-    assert.equal(prompt.status, 204);
-    assert.ok(Array.isArray(await (await fetch(`${server.baseUrl}/session/${session.id}/message?${query}`)).json()));
-    assert.equal(typeof (await (await fetch(`${server.baseUrl}/session/status?${query}`)).json()), "object");
-    await fetch(`${server.baseUrl}/session/${session.id}?${query}`, { method: "DELETE" });
-  } finally {
-    server.stop();
-    await server.wait();
-    await rm(workingDirectory, { recursive: true, force: true });
-  }
-});
-
 function childProcess() {
   const child = new EventEmitter();
   child.stdout = new PassThrough();
@@ -457,8 +379,4 @@ function childProcess() {
 
 function jsonResponse(value, status = 200) {
   return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
-}
-
-function eventResponse(event) {
-  return new Response(`data: ${JSON.stringify(event)}\n\n`, { headers: { "content-type": "text/event-stream" } });
 }

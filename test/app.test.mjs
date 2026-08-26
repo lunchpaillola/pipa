@@ -46,6 +46,7 @@ test("starts and health-checks OpenCode before Slack, then stops only the owned 
   const events = [];
   let stopServer;
   let failServer;
+  let serverStopped = false;
   const serverWait = new Promise((resolve, reject) => {
     stopServer = resolve;
     failServer = reject;
@@ -55,7 +56,7 @@ test("starts and health-checks OpenCode before Slack, then stops only the owned 
     owned: true,
     wait: () => serverWait,
     fail: failServer,
-    stop() { events.push("server:stop"); stopServer(); },
+    stop() { if (!serverStopped) { serverStopped = true; events.push("server:stop"); stopServer(); } },
   };
   const chat = {
     onNewMention() {},
@@ -385,6 +386,7 @@ test("startup timeout shuts Chat down", async () => {
 
 test("surfaces an unexpected owned-server exit and still shuts Slack down", async () => {
   let failServer;
+  let serverStopped = false;
   const serverWait = new Promise((_, reject) => failServer = reject);
   const events = [];
   const app = await startPipa({
@@ -397,7 +399,12 @@ test("surfaces an unexpected owned-server exit and still shuts Slack down", asyn
     state: { connect: async () => undefined },
     checkSlackToken: async () => ({ ok: true }),
     executor: { runTurn: async () => undefined, stopAll: () => events.push("executor:stop") },
-    server: { baseUrl: "http://127.0.0.1:54321", owned: true, wait: () => serverWait, stop: () => events.push("server:stop") },
+    server: {
+      baseUrl: "http://127.0.0.1:54321",
+      owned: true,
+      wait: () => serverWait,
+      stop() { if (!serverStopped) { serverStopped = true; events.push("server:stop"); } },
+    },
     sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
     config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
   });

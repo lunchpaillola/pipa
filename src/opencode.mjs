@@ -60,7 +60,7 @@ export async function startSocketOpenCodeServer(config, options = {}) {
     return ownedServer(baseUrl, child, exit, platform);
   } catch (error) {
     terminateChild(child, platform);
-    await waitBounded(exit.catch(() => undefined), 5_000);
+    await Promise.race([exit.catch(() => undefined), delay(5_000)]);
     throw error;
   }
 }
@@ -149,17 +149,6 @@ export function createOpenCodeExecutor(options = {}) {
         }
 
         const baseline = new Set(messages.map((message) => message?.info?.id).filter(Boolean));
-        const watcher = watchEvents({
-          baseUrl,
-          workingDirectory,
-          sessionId: selectedSessionId,
-          fetchImpl,
-          headers,
-          controller,
-          requestTimeoutMs,
-          onFatal: options.onFatal,
-        });
-        await watcher.ready;
         await request(`/session/${encodeURIComponent(selectedSessionId)}/prompt_async`, {
           method: "POST",
           body: JSON.stringify(promptBody(prompt.trim(), files, contextEnvironment)),
@@ -172,13 +161,12 @@ export function createOpenCodeExecutor(options = {}) {
           ]);
           const finalMessage = latestAssistantMessage(currentMessages, baseline);
           const status = statuses?.[selectedSessionId]?.type;
-          watcher.throwIfFailed();
           if (["error", "failed", "cancelled"].includes(status) || finalMessage?.error) throw new Error("OpenCode failed to complete the turn.");
           if (finalMessage && (status === "idle" || (!status && finalMessage.completed))) {
             if (!finalMessage.text) throw new Error("OpenCode completed without assistant text.");
             return { text: finalMessage.text, sessionId: selectedSessionId };
           }
-          await watcher.next(pollIntervalMs);
+          await delay(pollIntervalMs, controller.signal);
         }
       } finally {
         clearTimeout(timer);
@@ -327,97 +315,6 @@ function latestAssistantMessage(messages, baseline) {
   return null;
 }
 
-function watchEvents({ baseUrl, workingDirectory, sessionId, fetchImpl, headers, controller, requestTimeoutMs, onFatal }) {
-  let readyResolve;
-  let readyReject;
-  let readySettled = false;
-  let changedResolve;
-  let changed = new Promise((resolve) => changedResolve = resolve);
-  let terminalError;
-  const ready = new Promise((resolve, reject) => {
-    readyResolve = resolve;
-    readyReject = reject;
-  });
-
-  const wake = () => {
-    changedResolve();
-    changed = new Promise((resolve) => changedResolve = resolve);
-  };
-  void (async () => {
-    while (!controller.signal.aborted) {
-      try {
-        const response = await fetchImpl(serverUrl(baseUrl, "/event", workingDirectory), {
-          headers: { ...headers, accept: "text/event-stream" },
-          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(requestTimeoutMs)]),
-        });
-        if (!response.ok) throw new OpenCodeRequestError(response.status);
-        if (!readySettled) {
-          readySettled = true;
-          readyResolve();
-        }
-        for await (const event of readServerSentEvents(response)) {
-          if (eventSessionId(event) !== sessionId) continue;
-          if (event?.type === "session.error") terminalError = new Error("OpenCode failed to complete the turn.");
-          wake();
-        }
-      } catch (error) {
-        if (controller.signal.aborted) return;
-        if (!readySettled && isNetworkError(error)) {
-          const unavailable = new Error("OpenCode server became unavailable.");
-          onFatal?.(unavailable);
-          readySettled = true;
-          readyReject(unavailable);
-          return;
-        }
-        if (!readySettled && error instanceof OpenCodeRequestError) {
-          readySettled = true;
-          readyReject(error);
-          return;
-        }
-      }
-      await delay(250, controller.signal).catch(() => undefined);
-    }
-  })();
-
-  return {
-    ready,
-    throwIfFailed() {
-      if (terminalError) throw terminalError;
-    },
-    async next(delayMs) {
-      await Promise.race([changed, delay(delayMs, controller.signal)]);
-      if (terminalError) throw terminalError;
-    },
-  };
-}
-
-async function* readServerSentEvents(response) {
-  const reader = response.body?.getReader();
-  if (!reader) return;
-  const decoder = new TextDecoder();
-  let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/gu, "\n");
-    if (buffer.length > 1024 * 1024) throw new Error("OpenCode event exceeded 1 MB.");
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary >= 0) {
-      const chunk = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      const data = chunk.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
-      if (data) yield JSON.parse(data);
-      boundary = buffer.indexOf("\n\n");
-    }
-  }
-}
-
-function eventSessionId(event) {
-  if (!event || typeof event !== "object") return null;
-  const properties = event.properties && typeof event.properties === "object" ? event.properties : event;
-  return properties.sessionID ?? properties.sessionId ?? properties.part?.sessionID ?? null;
-}
-
 function ownedServer(baseUrl, child, exit, platform) {
   let stopping = false;
   let rejectFailure;
@@ -554,14 +451,6 @@ function delay(delayMs, signal) {
     const timer = setTimeout(() => settle(resolve), delayMs);
     signal?.addEventListener("abort", abort, { once: true });
   });
-}
-
-function waitBounded(promise, timeoutMs) {
-  let timer;
-  return Promise.race([
-    promise,
-    new Promise((resolve) => timer = setTimeout(resolve, timeoutMs)),
-  ]).finally(() => clearTimeout(timer));
 }
 
 function isNetworkError(error) {

@@ -58,12 +58,6 @@ export async function startPipa(options = {}) {
   }
   const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn });
   let accepting = true;
-  let serverStopped = false;
-  const stopServer = () => {
-    if (serverStopped) return;
-    serverStopped = true;
-    server?.stop();
-  };
 
   const handle = async (thread, message, subscribe) => {
     if (!accepting || shouldIgnore(thread, message)) return;
@@ -105,7 +99,7 @@ export async function startPipa(options = {}) {
   } catch (error) {
     executor.stopAll();
     await withTimeout(chat.shutdown(), options.shutdownTimeoutMs ?? 15_000, "Slack shutdown timed out.").catch(() => undefined);
-    stopServer();
+    server?.stop();
     await withTimeout(server?.wait(), options.shutdownTimeoutMs ?? 15_000, "OpenCode shutdown timed out.").catch(() => undefined);
     throw error;
   }
@@ -121,11 +115,11 @@ export async function startPipa(options = {}) {
         await withTimeout((async () => {
           await runner.drain();
           await chat.shutdown();
-          stopServer();
+          server?.stop();
           await server?.wait();
         })(), options.shutdownTimeoutMs ?? 15_000, "Pipa shutdown timed out.");
       } finally {
-        stopServer();
+        server?.stop();
       }
     },
   };
