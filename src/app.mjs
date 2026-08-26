@@ -60,7 +60,7 @@ export async function startPipa(options = {}) {
   const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn });
   let accepting = true;
   const interactions = createPendingInteractions();
-  chat.onAction?.(["pipa_option", "pipa_continue", "pipa_custom", "pipa_permission", "pipa_stop"], interactions.onAction);
+  chat.onAction?.(interactions.onAction);
   chat.onModalSubmit?.("pipa_custom", interactions.onCustomAnswer);
 
   const handle = async (thread, message, subscribe) => {
@@ -189,6 +189,7 @@ function createPendingInteractions() {
       advance(entry);
       return;
     }
+    if (!event.actionId?.startsWith("pipa_option_")) return;
     const answer = String(event.value ?? "").split(".").slice(1).join(".");
     if (!answer) return;
     const answers = entry.answers[entry.questionIndex] ?? [];
@@ -221,15 +222,15 @@ function renderInteraction(entry) {
     const resources = entry.request.patterns ?? entry.request.resources ?? [];
     const detail = [`Action: ${entry.request.permission ?? entry.request.action ?? "Unknown"}`, ...(resources.length ? ["Resources:", ...resources.map((r) => `- ${r}`)] : [])].join("\n");
     return Card({ title: "Permission requested", children: [Text(detail), Actions([
-      Button({ id: "pipa_permission", label: "Allow once", value: `${entry.token}.once`, style: "primary" }),
-      Button({ id: "pipa_permission", label: "Always allow in this workspace", value: `${entry.token}.always` }),
-      Button({ id: "pipa_permission", label: "Reject", value: `${entry.token}.reject`, style: "danger" }),
+      Button({ id: "pipa_permission_once", label: "Allow once", value: `${entry.token}.once`, style: "primary" }),
+      Button({ id: "pipa_permission_always", label: "Always allow in this workspace", value: `${entry.token}.always` }),
+      Button({ id: "pipa_permission_reject", label: "Reject", value: `${entry.token}.reject`, style: "danger" }),
       Button({ id: "pipa_stop", label: "Stop", value: entry.token, style: "danger" }),
     ])] });
   }
   const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
-  const buttons = (question.options ?? []).map((option) => Button({
-    id: "pipa_option",
+  const buttons = (question.options ?? []).map((option, index) => Button({
+    id: `pipa_option_${index}`,
     label: option.label ?? option,
     value: `${entry.token}.${option.label ?? option}`,
   }));

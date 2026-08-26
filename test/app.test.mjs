@@ -462,7 +462,7 @@ test("interaction registry renders question card and resolves on button click", 
   const chat = {
     onNewMention(handler) { mention = handler; },
     onSubscribedMessage() {},
-    onAction(ids, handler) { actionHandler = handler; },
+    onAction(ids, handler) { actionHandler = handler ?? ids; },
     async initialize() {},
     async shutdown() {},
   };
@@ -495,7 +495,7 @@ test("interaction registry renders question card and resolves on button click", 
   assert.equal(posts.length, 1, "should post one interaction card");
   assert.equal(posts[0].title, "Pick");
 
-  await actionHandler({ actionId: "pipa_option", value: actionValue(posts[0], "pipa_option"), user: { userId: "U1" }, thread, messageId: "msg_1" });
+  await actionHandler({ actionId: actionId(posts[0], "pipa_option_"), value: actionValue(posts[0], "pipa_option_"), user: { userId: "U1" }, thread, messageId: "msg_1" });
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(edits.length, 1, "should edit card after decision");
   assert.equal(edits[0].title, "Pick");
@@ -517,7 +517,7 @@ test("interaction registry renders permission card and resolves with reply value
   const chat = {
     onNewMention(handler) { mention = handler; },
     onSubscribedMessage() {},
-    onAction(ids, handler) { actionHandler = handler; },
+    onAction(ids, handler) { actionHandler = handler ?? ids; },
     async initialize() {},
     async shutdown() {},
   };
@@ -551,7 +551,7 @@ test("interaction registry renders permission card and resolves with reply value
   assert.equal(posts.length, 1);
   assert.equal(posts[0].title, "Permission requested");
 
-  await actionHandler({ actionId: "pipa_permission", value: actionValue(posts[0], "pipa_permission"), user: { userId: "U1" }, thread, messageId: "msg_1" });
+  await actionHandler({ actionId: actionId(posts[0], "pipa_permission_"), value: actionValue(posts[0], "pipa_permission_"), user: { userId: "U1" }, thread, messageId: "msg_1" });
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.deepEqual(resolvedDecision, { type: "reply", reply: "once" });
 });
@@ -572,7 +572,7 @@ test("stop action resolves with stop type", async () => {
   const chat = {
     onNewMention(handler) { mention = handler; },
     onSubscribedMessage() {},
-    onAction(ids, handler) { actionHandler = handler; },
+    onAction(ids, handler) { actionHandler = handler ?? ids; },
     async initialize() {},
     async shutdown() {},
   };
@@ -624,7 +624,7 @@ test("another user can answer an active question", async () => {
   const chat = {
     onNewMention(handler) { mention = handler; },
     onSubscribedMessage() {},
-    onAction(ids, handler) { actionHandler = handler; },
+    onAction(ids, handler) { actionHandler = handler ?? ids; },
     async initialize() {},
     async shutdown() {},
   };
@@ -656,8 +656,8 @@ test("another user can answer an active question", async () => {
 
   await new Promise((resolve) => setTimeout(resolve, 20));
   await actionHandler({
-    actionId: "pipa_option",
-    value: actionValue(posts[0], "pipa_option"),
+    actionId: actionId(posts[0], "pipa_option_"),
+    value: actionValue(posts[0], "pipa_option_"),
     user: { userId: "U2" },
     thread,
     messageId: "msg_1",
@@ -667,5 +667,9 @@ test("another user can answer an active question", async () => {
 });
 
 function actionValue(card, actionId) {
-  return card.children.flatMap((child) => child.children ?? []).find((button) => button.id === actionId)?.value;
+  return card.children.flatMap((child) => child.children ?? []).find((button) => button.id.startsWith(actionId))?.value;
+}
+
+function actionId(card, prefix) {
+  return card.children.flatMap((child) => child.children ?? []).find((button) => button.id.startsWith(prefix))?.id;
 }
