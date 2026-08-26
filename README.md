@@ -43,6 +43,23 @@ pipa start
 
 Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. Pipa starts one OpenCode server bound to `127.0.0.1` on an operating-system-assigned port and reuses it for every Slack turn. Port `0` asks the operating system for an available port; no port configuration is required. Pipa replies in a thread, and follow-up messages in that thread reuse the same OpenCode session without another mention. Messages can include up to Slack's 10-file limit, with a maximum size of 100 MB per file. Attachments require a text prompt and are copied to a temporary directory only for the duration of the turn.
 
+### Access control
+
+By default Pipa answers anyone who mentions it in a channel it can see. In a shared workspace, restrict who can use it by listing the allowed Slack channel and user IDs. `pipa init` asks for these, and they are stored in the config:
+
+```json
+{
+  "botName": "Pipa",
+  "workingDirectory": "/work",
+  "slackAppToken": "xapp-...",
+  "slackBotToken": "xoxb-...",
+  "allowedSlackChannelIds": ["C0BSE2JTYPR"],
+  "allowedSlackUserIds": ["UFWBSCZ54"]
+}
+```
+
+A mention is only handled when the channel ID is in `allowedSlackChannelIds` **and** the author's user ID is in `allowedSlackUserIds`. Leave a list empty to allow any channel or any user. You can also set them non-interactively during setup with `PIPA_ALLOWED_CHANNEL_IDS` and `PIPA_ALLOWED_USER_IDS` (comma-separated).
+
 To use an existing OpenCode server instead, set its URL before starting Pipa. Pipa health-checks the server but does not start or stop it. If the server uses authentication, also set `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD`:
 
 ```sh
