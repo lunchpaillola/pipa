@@ -151,6 +151,7 @@ export function createOpenCodeExecutor(options = {}) {
         await onSession?.(selectedSessionId);
 
         const baseline = new Set(messages.map((message) => message?.info?.id).filter(Boolean));
+        let dismissed = false;
         if (onInteraction) {
           const watcher = watchInteractions({
             baseUrl,
@@ -161,6 +162,7 @@ export function createOpenCodeExecutor(options = {}) {
             workingDirectory,
             controller,
             onInteraction,
+            onDismiss: () => { dismissed = true; },
             requestTurn: request,
           });
           await watcher.ready;
@@ -177,6 +179,7 @@ export function createOpenCodeExecutor(options = {}) {
           ]);
           const finalMessage = latestAssistantMessage(currentMessages, baseline);
           const status = statuses?.[selectedSessionId]?.type;
+          if (dismissed && status !== "busy" && status !== "retry") return { text: "", sessionId: selectedSessionId };
           if (["error", "failed", "cancelled"].includes(status) || finalMessage?.error) throw new Error("OpenCode failed to complete the turn.");
           if (finalMessage && (status === "idle" || (!status && finalMessage.completed))) {
             if (!finalMessage.text) throw new Error("OpenCode completed without assistant text.");
@@ -469,7 +472,7 @@ function delay(delayMs, signal) {
   });
 }
 
-function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sessionId, workingDirectory, controller, onInteraction, requestTurn }) {
+function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sessionId, workingDirectory, controller, onInteraction, onDismiss, requestTurn }) {
   const seenIds = new Set();
   let resolveReady;
   let rejectReady;
@@ -494,7 +497,7 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
         const requestId = properties?.requestID ?? properties?.requestId ?? properties?.id;
         if (!type || eventSessionId !== sessionId || !requestId || seenIds.has(`${type}:${requestId}`)) continue;
         seenIds.add(`${type}:${requestId}`);
-        void settleInteraction({ type, requestId, sessionId, request: properties, onInteraction, controller, workingDirectory, requestTurn });
+        void settleInteraction({ type, requestId, sessionId, request: properties, onInteraction, onDismiss, controller, workingDirectory, requestTurn });
       }
     } catch (error) {
       if (controller.signal.aborted) return;
@@ -504,7 +507,7 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
   return { ready };
 }
 
-async function settleInteraction({ type, requestId, sessionId, request: interactionRequest, onInteraction, controller, workingDirectory, requestTurn }) {
+async function settleInteraction({ type, requestId, sessionId, request: interactionRequest, onInteraction, onDismiss, controller, workingDirectory, requestTurn }) {
   try {
     const decision = await abortable(Promise.resolve().then(() => onInteraction({
       type,
@@ -513,6 +516,7 @@ async function settleInteraction({ type, requestId, sessionId, request: interact
       signal: controller.signal,
     })), controller.signal);
     if (decision?.type === "stop") {
+      onDismiss?.();
       if (type === "question") await requestTurn(`/question/${encodeURIComponent(requestId)}/reject`, { method: "POST" }, workingDirectory, controller, [200, 204, 404], false);
       else await requestTurn(`/permission/${encodeURIComponent(requestId)}/reply`, { method: "POST", body: JSON.stringify({ reply: "reject" }) }, workingDirectory, controller, [200, 204, 404], false);
       await requestTurn(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }, workingDirectory, controller, [200, 204], false);

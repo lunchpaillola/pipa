@@ -147,14 +147,14 @@ function createPendingInteractions() {
     };
     pending.set(token, entry);
     try {
-      const message = entry.message = await context.thread.post(renderInteraction(entry));
+      const message = entry.message = await postInteraction(context.thread, entry);
       const decision = await new Promise((resolve, reject) => {
         entry.resolve = resolve;
         const abort = () => reject(interaction.signal.reason);
         if (interaction.signal.aborted) abort();
         else interaction.signal.addEventListener("abort", abort, { once: true });
       });
-      await message.edit(renderSubmitted(entry, decision));
+      await message.edit(renderSubmitted(entry, decision), decision);
       return decision;
     } finally {
       pending.delete(token);
@@ -184,9 +184,16 @@ function createPendingInteractions() {
     }
     if (entry.type !== "question") return;
     const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
+    if (event.actionId?.startsWith("pipa_select_")) {
+      const answers = selectedAnswers(event);
+      if (!answers.length) return;
+      entry.answers[entry.questionIndex] = answers;
+      if (!question.multiple) advance(entry, event.user);
+      return;
+    }
     if (event.actionId?.startsWith("pipa_continue_")) {
       if (!entry.answers[entry.questionIndex]?.length) return;
-      advance(entry);
+      advance(entry, event.user);
       return;
     }
     if (!event.actionId?.startsWith("pipa_option_")) return;
@@ -197,7 +204,7 @@ function createPendingInteractions() {
       ? answers.includes(answer) ? answers.filter((value) => value !== answer) : [...answers, answer]
       : [answer];
     if (question.multiple) await entry.message?.edit(renderInteraction(entry));
-    else advance(entry);
+    else advance(entry, event.user);
   }
 
   async function onCustomAnswer(event) {
@@ -209,8 +216,11 @@ function createPendingInteractions() {
     advance(entry);
   }
 
-  function advance(entry) {
-    if (++entry.questionIndex === (entry.request.questions?.length ?? 1)) entry.resolve?.({ type: "answer", answers: entry.answers });
+  function advance(entry, user) {
+    if (++entry.questionIndex === (entry.request.questions?.length ?? 1)) {
+      const selectedBy = user?.fullName ?? user?.userName;
+      entry.resolve?.({ type: "answer", answers: entry.answers, ...(selectedBy ? { selectedBy } : {}) });
+    }
     else entry.message?.edit(renderInteraction(entry));
   }
 
@@ -244,10 +254,99 @@ function renderInteraction(entry) {
 }
 
 function renderSubmitted(entry, decision) {
-  let content = "Submitted.";
+  let content = "Answered.";
   if (decision?.type === "stop") content = "Dismissed.";
-  else if (entry.type === "permission") content = `Submitted: ${decision?.reply ?? (decision?.type === "reject" ? "reject" : "permission decision")}.`;
+  else if (entry.type === "permission") content = decision?.type === "reject" ? "Permission rejected." : `Permission allowed: ${decision?.reply ?? "once"}.`;
+  else {
+    const answers = decision?.answers?.flat().filter(Boolean) ?? [];
+    content = `${decision?.selectedBy ? `${decision.selectedBy} selected` : "Selected"}: ${answers.map((answer) => `“${answer}”`).join(", ")}.`;
+  }
   return Card({ title: entry.type === "permission" ? "Permission requested" : (entry.request.questions?.[0]?.header || "Question"), children: [Text(content)] });
+}
+
+async function postInteraction(thread, entry) {
+  const [, channel, threadTs] = thread.id.split(":");
+  const client = thread.adapter?.webClient;
+  if (!client || !channel || !threadTs) return thread.post(renderInteraction(entry));
+  const message = await client.chat.postMessage({
+    channel,
+    thread_ts: threadTs,
+    text: interactionFallback(entry),
+    blocks: renderSlackInteraction(entry),
+  });
+  return {
+    edit: (_, decision) => client.chat.update({
+      channel,
+      ts: message.ts,
+      text: decision ? submittedText(entry, decision) : interactionFallback(entry),
+      blocks: decision ? renderSlackSubmitted(entry, decision) : renderSlackInteraction(entry),
+    }),
+  };
+}
+
+function renderSlackInteraction(entry) {
+  if (entry.type === "permission") {
+    const resources = entry.request.patterns ?? entry.request.resources ?? [];
+    return [
+      slackHeader("Permission requested"),
+      slackText([`Action: ${entry.request.permission ?? entry.request.action ?? "Unknown"}`, ...resources].join("\n")),
+      slackActions([
+        slackButton(`pipa_permission_once_${entry.token}`, "Allow once", `${entry.token}.once`, "primary"),
+        slackButton(`pipa_permission_always_${entry.token}`, "Always allow", `${entry.token}.always`),
+        slackButton(`pipa_permission_reject_${entry.token}`, "Reject", `${entry.token}.reject`, "danger"),
+        slackButton(`pipa_dismiss_${entry.token}`, "Dismiss", entry.token, "danger"),
+      ]),
+    ];
+  }
+  const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
+  const options = (question.options ?? []).map((option) => ({
+    text: { type: "plain_text", text: option.label ?? option },
+    value: `${entry.token}.${option.label ?? option}`,
+  }));
+  const selector = question.multiple
+    ? { type: "checkboxes", action_id: `pipa_select_${entry.token}`, options }
+    : { type: "radio_buttons", action_id: `pipa_select_${entry.token}`, options };
+  const actions = [
+    ...(question.custom ? [slackButton(`pipa_custom_${entry.token}`, "Custom answer", entry.token)] : []),
+    ...(question.multiple ? [slackButton(`pipa_continue_${entry.token}`, "Continue", entry.token, "primary")] : []),
+    slackButton(`pipa_dismiss_${entry.token}`, "Dismiss", entry.token, "danger"),
+  ];
+  return [slackHeader(question.header || "Question"), slackText(question.question ?? question.header ?? "Choose an answer."), slackActions([selector]), slackActions(actions)];
+}
+
+function renderSlackSubmitted(entry, decision) {
+  return [slackHeader(entry.type === "permission" ? "Permission requested" : (entry.request.questions?.[0]?.header || "Question")), slackText(submittedText(entry, decision))];
+}
+
+function submittedText(entry, decision) {
+  return renderSubmitted(entry, decision).children[0].content;
+}
+
+function interactionFallback(entry) {
+  const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
+  return question.question ?? question.header ?? "Action required";
+}
+
+function slackHeader(text) {
+  return { type: "header", text: { type: "plain_text", text } };
+}
+
+function slackText(text) {
+  return { type: "section", text: { type: "mrkdwn", text } };
+}
+
+function slackActions(elements) {
+  return { type: "actions", elements };
+}
+
+function slackButton(actionId, text, value, style) {
+  return { type: "button", action_id: actionId, text: { type: "plain_text", text }, value, ...(style ? { style } : {}) };
+}
+
+function selectedAnswers(event) {
+  const action = event.raw?.actions?.find((item) => item.action_id === event.actionId);
+  const values = action?.selected_options?.map((option) => option.value) ?? [event.value];
+  return values.filter(Boolean).map((value) => String(value).split(".").slice(1).join(".")).filter(Boolean);
 }
 
 export function createConversationRunner({ sessionStore, runTurn }) {

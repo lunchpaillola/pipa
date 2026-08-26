@@ -500,6 +500,64 @@ test("interaction registry renders question card and resolves on button click", 
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(edits.length, 1, "should edit card after decision");
   assert.equal(edits[0].title, "Pick");
+  assert.equal(edits[0].children[0].content, "Selected: “A”.");
+});
+
+test("interaction registry uses Block Kit selectors in Slack", async () => {
+  const posted = [];
+  const updated = [];
+  const thread = {
+    id: "slack:C1:1.0",
+    adapter: { webClient: { chat: {
+      postMessage: async (message) => { posted.push(message); return { ts: "2.0" }; },
+      update: async (message) => { updated.push(message); },
+    } } },
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async () => undefined,
+  };
+  let actionHandler;
+  let mention;
+  const chat = {
+    onNewMention(handler) { mention = handler; },
+    onSubscribedMessage() {},
+    onAction(ids, handler) { actionHandler = handler ?? ids; },
+    async initialize() {},
+    async shutdown() {},
+  };
+  void startPipa({
+    chat,
+    executor: {
+      runTurn: async ({ onInteraction }) => {
+        const decision = await onInteraction({
+          type: "question",
+          request: { questions: [
+            { header: "First", question: "Choose one", options: [{ label: "A" }, { label: "B" }] },
+            { header: "Second", question: "Choose many", multiple: true, options: [{ label: "C" }, { label: "D" }] },
+          ] },
+          signal: AbortSignal.timeout(5000),
+        });
+        return { text: decision.answers[0].join(","), sessionId: "ses_1" };
+      },
+      stopAll() {},
+    },
+    checkSlackToken: async () => ({ ok: true }),
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+  }).then(() => mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", fullName: "Lola", isMe: false, isBot: false }, raw: {} }));
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const radio = posted[0].blocks.find((block) => block.type === "actions").elements[0];
+  assert.equal(radio.type, "radio_buttons");
+  await actionHandler({ actionId: radio.action_id, value: radio.options[0].value, user: { fullName: "Lola" }, thread });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const checkbox = updated[0].blocks.find((block) => block.type === "actions" && block.elements[0].type === "checkboxes").elements[0];
+  assert.equal(checkbox.type, "checkboxes");
+  await actionHandler({ actionId: checkbox.action_id, value: `${checkbox.options[0].value}`, raw: { actions: [{ action_id: checkbox.action_id, selected_options: checkbox.options }] }, user: { fullName: "Lola" }, thread });
+  const continueButton = updated[0].blocks.at(-1).elements.find((element) => element.action_id.startsWith("pipa_continue_"));
+  await actionHandler({ actionId: continueButton.action_id, value: continueButton.value, user: { fullName: "Lola" }, thread });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(updated[1].blocks[1].text.text, "Lola selected: “A”, “C”, “D”.");
 });
 
 test("interaction registry renders permission card and resolves with reply value", async () => {
