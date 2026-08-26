@@ -441,3 +441,236 @@ test("shutdown returns after its deadline when Chat does not disconnect", async 
   await assert.rejects(app.shutdown(), /shutdown timed out/u);
   assert.equal(serverStopped, true);
 });
+
+test("interaction registry renders question card and resolves on button click", async () => {
+  const posts = [];
+  const edits = [];
+  const thread = {
+    id: "slack:C1:1.0",
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async (content) => {
+      posts.push(content);
+      return {
+        id: "msg_1",
+        edit: async (newContent) => { edits.push(newContent); return { id: "msg_1" }; },
+      };
+    },
+  };
+  let actionHandler;
+  let mention;
+  const chat = {
+    onNewMention(handler) { mention = handler; },
+    onSubscribedMessage() {},
+    onAction(ids, handler) { actionHandler = handler; },
+    async initialize() {},
+    async shutdown() {},
+  };
+  (async () => {
+    const executor = {
+      runTurn: async ({ onInteraction, onSession }) => {
+        await onSession("ses_1");
+        const decision = await onInteraction({
+          type: "question",
+          sessionId: "ses_1",
+          request: { id: "req_1", questions: [{ header: "Pick", question: "Choose one", options: [{ label: "A" }, { label: "B" }] }] },
+          signal: AbortSignal.timeout(5000),
+        });
+        return { text: `answered:${decision.answers[0][0]}`, sessionId: "ses_1" };
+      },
+      stopAll() {},
+    };
+    const app = await startPipa({
+      chat,
+      executor,
+      checkSlackToken: async () => ({ ok: true }),
+      config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+      sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    });
+    await mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} });
+    return app;
+  })();
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(posts.length, 1, "should post one interaction card");
+  assert.equal(posts[0].title, "Pick");
+
+  await actionHandler({ actionId: "pipa_option", value: actionValue(posts[0], "pipa_option"), user: { userId: "U1" }, thread, messageId: "msg_1" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(edits.length, 1, "should edit card after decision");
+  assert.equal(edits[0].title, "Pick");
+});
+
+test("interaction registry renders permission card and resolves with reply value", async () => {
+  const posts = [];
+  const thread = {
+    id: "slack:C1:1.0",
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async (content) => {
+      posts.push(content);
+      return { id: "msg_1", edit: async (c) => ({ id: "msg_1" }) };
+    },
+  };
+  let actionHandler;
+  let mention;
+  const chat = {
+    onNewMention(handler) { mention = handler; },
+    onSubscribedMessage() {},
+    onAction(ids, handler) { actionHandler = handler; },
+    async initialize() {},
+    async shutdown() {},
+  };
+  let resolvedDecision;
+  (async () => {
+    const executor = {
+      runTurn: async ({ onInteraction, onSession }) => {
+        await onSession("ses_1");
+        const decision = await onInteraction({
+          type: "permission",
+          sessionId: "ses_1",
+          request: { id: "perm_1", permission: "shell", patterns: ["rm *"] },
+          signal: AbortSignal.timeout(5000),
+        });
+        resolvedDecision = decision;
+        return { text: "done", sessionId: "ses_1" };
+      },
+      stopAll() {},
+    };
+    await startPipa({
+      chat,
+      executor,
+      checkSlackToken: async () => ({ ok: true }),
+      config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+      sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    });
+    await mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} });
+  })();
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].title, "Permission requested");
+
+  await actionHandler({ actionId: "pipa_permission", value: actionValue(posts[0], "pipa_permission"), user: { userId: "U1" }, thread, messageId: "msg_1" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(resolvedDecision, { type: "reply", reply: "once" });
+});
+
+test("stop action resolves with stop type", async () => {
+  const posts = [];
+  const thread = {
+    id: "slack:C1:1.0",
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async (content) => {
+      posts.push(content);
+      return { id: "msg_1", edit: async () => ({ id: "msg_1" }) };
+    },
+  };
+  let actionHandler;
+  let mention;
+  const chat = {
+    onNewMention(handler) { mention = handler; },
+    onSubscribedMessage() {},
+    onAction(ids, handler) { actionHandler = handler; },
+    async initialize() {},
+    async shutdown() {},
+  };
+  let resolvedDecision;
+  (async () => {
+    const executor = {
+      runTurn: async ({ onInteraction, onSession }) => {
+        await onSession("ses_1");
+        const decision = await onInteraction({
+          type: "question",
+          sessionId: "ses_1",
+          request: { id: "req_1", questions: [{ header: "Q", question: "Pick", options: [{ label: "X" }] }] },
+          signal: AbortSignal.timeout(5000),
+        });
+        resolvedDecision = decision;
+        return { text: "done", sessionId: "ses_1" };
+      },
+      stopAll() {},
+    };
+    await startPipa({
+      chat,
+      executor,
+      checkSlackToken: async () => ({ ok: true }),
+      config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+      sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    });
+    await mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} });
+  })();
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await actionHandler({ actionId: "pipa_stop", value: actionValue(posts[0], "pipa_stop"), user: { userId: "U1" }, thread, messageId: "msg_1" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(resolvedDecision, { type: "stop" });
+});
+
+test("unauthorized clicks show ephemeral error and do not resolve", async () => {
+  const posts = [];
+  const thread = {
+    id: "slack:C1:1.0",
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async (content) => {
+      posts.push(content);
+      return { id: "msg_1", edit: async () => ({ id: "msg_1" }) };
+    },
+  };
+  let actionHandler;
+  let mention;
+  let ephemeralMessage;
+  const chat = {
+    onNewMention(handler) { mention = handler; },
+    onSubscribedMessage() {},
+    onAction(ids, handler) { actionHandler = handler; },
+    async initialize() {},
+    async shutdown() {},
+  };
+  let resolvedDecision = null;
+  (async () => {
+    const executor = {
+      runTurn: async ({ onInteraction, onSession }) => {
+        await onSession("ses_1");
+        const decision = await onInteraction({
+          type: "question",
+          sessionId: "ses_1",
+          request: { id: "req_1", questions: [{ header: "Q", question: "Pick", options: [{ label: "X" }] }] },
+          signal: AbortSignal.timeout(5000),
+        });
+        resolvedDecision = decision;
+        return { text: "done", sessionId: "ses_1" };
+      },
+      stopAll() {},
+    };
+    await startPipa({
+      chat,
+      executor,
+      checkSlackToken: async () => ({ ok: true }),
+      config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+      sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    });
+    await mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} });
+  })();
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const fakeThread = {
+    postEphemeral: async (user, message) => { ephemeralMessage = message; },
+  };
+  await actionHandler({
+    actionId: "pipa_option",
+    value: actionValue(posts[0], "pipa_option"),
+    user: { userId: "U2" },
+    thread: fakeThread,
+    messageId: "msg_1",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(ephemeralMessage, "This request is no longer active.");
+  assert.equal(resolvedDecision, null, "unauthorized click should not resolve the interaction");
+});
+
+function actionValue(card, actionId) {
+  return card.children.flatMap((child) => child.children ?? []).find((button) => button.id === actionId)?.value;
+}

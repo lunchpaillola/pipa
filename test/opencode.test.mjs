@@ -369,6 +369,228 @@ test("version check times out and terminates a hung child", async () => {
   assert.equal(killed, true);
 });
 
+test("subscribes to SSE before prompt_async and parses split data: frames", async () => {
+  const requests = [];
+  let prompted = false;
+  const sseChunks = [
+    "data: {\"type\":\"question.asked\",\"properties\":{\"sessionID\":\"ses_1\",\"id\":\"req_1\",\"questions\":[{\"header\":\"Color\",\"question\":\"Pick one\",\"options\":[{\"label\":\"Red\"},{\"label\":\"Blue\"}]}]}}\n\n",
+    "data: {\"type\":\"question.asked\",\"properties\":{\"sessionID\":\"ses_1\",\"id\":\"req_1\",\"questions\":[{\"header\":\"Color\",\"question\":\"Pick one\",\"options\":[{\"label\":\"Red\"},{\"label\":\"Blue\"}]}]}}\n\n",
+  ];
+  const sseBody = () => new ReadableStream({
+    start(controller) {
+      for (const chunk of sseChunks) controller.enqueue(new TextEncoder().encode(chunk));
+      controller.close();
+    },
+  });
+  const fetch = async (url, init = {}) => {
+    const parsed = new URL(url);
+    requests.push(parsed.pathname);
+    if (parsed.pathname === "/event" && init?.headers?.accept === "text/event-stream") {
+      return new Response(sseBody(), { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+    if (parsed.pathname === "/question" || parsed.pathname === "/permission") return jsonResponse([]);
+    if (parsed.pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+    if (parsed.pathname === "/session/ses_1/message") {
+      return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
+    }
+    if (parsed.pathname === "/session/ses_1/prompt_async") {
+      prompted = true;
+      return new Response(null, { status: 204 });
+    }
+    if (parsed.pathname.startsWith("/question/") && parsed.pathname.endsWith("/reply")) return jsonResponse({});
+    if (parsed.pathname.startsWith("/question/") && parsed.pathname.endsWith("/reject")) return jsonResponse({});
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+  const seen = [];
+  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 });
+  const result = await executor.runTurn({
+    prompt: "hello",
+    sessionId: "ses_1",
+    workingDirectory: "/work",
+    onInteraction: (interaction) => {
+      seen.push(interaction);
+      return { type: "answer", answers: [["Red"]] };
+    },
+  });
+  assert.equal(result.text, "done");
+  assert.ok(prompted);
+  assert.ok(requests.includes("/event"));
+  const eventIndex = requests.indexOf("/event");
+  const promptIndex = requests.indexOf("/session/ses_1/prompt_async");
+  assert.ok(eventIndex < promptIndex, "SSE subscription must be established before prompt_async");
+  assert.equal(seen.length, 1, "duplicate question.asked events with same id should be deduplicated");
+  assert.equal(seen[0].type, "question");
+  assert.equal(seen[0].request.id, "req_1");
+});
+
+test("settles matching-session question with exact answer payload", async () => {
+  let settledBody;
+  let prompted = false;
+  const fetch = async (url, init = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === "/event" && init?.headers?.accept === "text/event-stream") {
+      return sseResponse("question.asked", { sessionID: "ses_1", requestID: "req_1" });
+    }
+    if (parsed.pathname === "/question" || parsed.pathname === "/permission") return jsonResponse([]);
+    if (parsed.pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+    if (parsed.pathname === "/session/ses_1/message") {
+      return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
+    }
+    if (parsed.pathname.endsWith("/prompt_async")) { prompted = true; return new Response(null, { status: 204 }); }
+    if (parsed.pathname.startsWith("/question/") && parsed.pathname.endsWith("/reply")) {
+      settledBody = JSON.parse(init.body);
+      return jsonResponse({});
+    }
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 });
+  await executor.runTurn({
+    prompt: "go",
+    sessionId: "ses_1",
+    workingDirectory: "/work",
+    onInteraction: () => ({ type: "answer", answers: [["Opt A"], ["Opt B"]] }),
+  });
+  assert.deepEqual(settledBody, { answers: [["Opt A"], ["Opt B"]] });
+});
+
+test("settles matching-session permission with exact reply payload", async () => {
+  let settledPath;
+  let settledBody;
+  let prompted = false;
+  const fetch = async (url, init = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === "/event" && init?.headers?.accept === "text/event-stream") {
+      return sseResponse("permission.asked", { sessionId: "ses_1", requestId: "perm_1" });
+    }
+    if (parsed.pathname === "/question" || parsed.pathname === "/permission") return jsonResponse([]);
+    if (parsed.pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+    if (parsed.pathname === "/session/ses_1/message") {
+      return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
+    }
+    if (parsed.pathname.endsWith("/prompt_async")) { prompted = true; return new Response(null, { status: 204 }); }
+    if (parsed.pathname.startsWith("/permission/") && parsed.pathname.endsWith("/reply")) {
+      settledPath = parsed.pathname;
+      settledBody = JSON.parse(init.body);
+      return jsonResponse({});
+    }
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 });
+  await executor.runTurn({
+    prompt: "go",
+    sessionId: "ses_1",
+    workingDirectory: "/work",
+    onInteraction: () => ({ type: "reply", reply: "always" }),
+  });
+  assert.ok(settledPath.includes("/permission/"));
+  assert.ok(settledPath.endsWith("/reply"));
+  assert.deepEqual(settledBody, { reply: "always" });
+});
+
+test("stop rejects active request and aborts session", async () => {
+  const settled = [];
+  let prompted = false;
+  const fetch = async (url, init = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === "/event" && init?.headers?.accept === "text/event-stream") {
+      return sseResponse("question.asked", { sessionID: "ses_1", id: "req_1" });
+    }
+    if (parsed.pathname === "/question" || parsed.pathname === "/permission") return jsonResponse([]);
+    if (parsed.pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+    if (parsed.pathname === "/session/ses_1/message") {
+      return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
+    }
+    if (parsed.pathname.endsWith("/prompt_async")) { prompted = true; return new Response(null, { status: 204 }); }
+    if (parsed.pathname.endsWith("/reject") || parsed.pathname.endsWith("/reply")) {
+      settled.push(parsed.pathname);
+      return jsonResponse({});
+    }
+    if (parsed.pathname.endsWith("/abort")) {
+      settled.push(parsed.pathname);
+      return jsonResponse({});
+    }
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 });
+  await executor.runTurn({
+    prompt: "go",
+    sessionId: "ses_1",
+    workingDirectory: "/work",
+    onInteraction: () => ({ type: "stop" }),
+  });
+  assert.ok(settled.some((p) => p.includes("/question/") && p.endsWith("/reject")));
+  assert.ok(settled.some((p) => p.includes("/session/") && p.endsWith("/abort")));
+});
+
+test("event reading stops when turn completes", async () => {
+  let sseClosed = false;
+  let prompted = false;
+  let interval;
+  const sseBody = () => new ReadableStream({
+    start(controller) {
+      interval = setInterval(() => {
+        controller.enqueue(new TextEncoder().encode("data: {\"type\":\"heartbeat\"}\n\n"));
+      }, 1);
+    },
+    cancel() {
+      sseClosed = true;
+      clearInterval(interval);
+    },
+  });
+  const fetch = async (url, init = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === "/event" && init?.headers?.accept === "text/event-stream") {
+      return new Response(sseBody(), { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+    if (parsed.pathname === "/question" || parsed.pathname === "/permission") return jsonResponse([]);
+    if (parsed.pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+    if (parsed.pathname === "/session/ses_1/message") {
+      return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
+    }
+    if (parsed.pathname.endsWith("/prompt_async")) { prompted = true; return new Response(null, { status: 204 }); }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 });
+  const result = await executor.runTurn({ prompt: "go", sessionId: "ses_1", workingDirectory: "/work", onInteraction: () => undefined });
+  assert.equal(result.text, "done");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.ok(sseClosed, "SSE stream should be closed after turn completes");
+});
+
+test("does not report fatal for non-fatal interaction settlement errors", async () => {
+  let fatal;
+  let prompted = false;
+  const fetch = async (url, init = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === "/event" && init?.headers?.accept === "text/event-stream") {
+      return sseResponse("question.asked", { sessionID: "ses_1", id: "req_1" });
+    }
+    if (parsed.pathname === "/question" || parsed.pathname === "/permission") return jsonResponse([]);
+    if (parsed.pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+    if (parsed.pathname === "/session/ses_1/message") {
+      return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
+    }
+    if (parsed.pathname.endsWith("/prompt_async")) { prompted = true; return new Response(null, { status: 204 }); }
+    if (parsed.pathname.startsWith("/question/") && parsed.pathname.endsWith("/reply")) {
+      throw new TypeError("fetch failed");
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const executor = createOpenCodeExecutor({
+    baseUrl: "http://localhost:5555",
+    fetch,
+    pollIntervalMs: 1,
+    onFatal: (error) => fatal = error,
+  });
+  await executor.runTurn({
+    prompt: "go",
+    sessionId: "ses_1",
+    workingDirectory: "/work",
+    onInteraction: () => ({ type: "answer", answers: [["Yes"]] }),
+  });
+  assert.equal(fatal, undefined, "settlement errors should not trigger onFatal");
+});
+
 function childProcess() {
   const child = new EventEmitter();
   child.stdout = new PassThrough();
@@ -379,4 +601,13 @@ function childProcess() {
 
 function jsonResponse(value, status = 200) {
   return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
+}
+
+function sseResponse(type, properties) {
+  return new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type, properties })}\n\n`));
+      controller.close();
+    },
+  }), { status: 200, headers: { "content-type": "text/event-stream" } });
 }

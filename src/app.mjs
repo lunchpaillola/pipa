@@ -1,4 +1,5 @@
-import { Chat } from "chat";
+import { randomUUID } from "node:crypto";
+import { Actions, Button, Card, CardText as Text, Chat, Modal, TextInput } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { canonicalWorkingDirectory, createManifest, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
@@ -58,6 +59,9 @@ export async function startPipa(options = {}) {
   }
   const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn });
   let accepting = true;
+  const interactions = createPendingInteractions();
+  chat.onAction?.(["pipa_option", "pipa_continue", "pipa_custom", "pipa_permission", "pipa_stop"], interactions.onAction);
+  chat.onModalSubmit?.("pipa_custom", interactions.onCustomAnswer);
 
   const handle = async (thread, message, subscribe) => {
     if (!accepting || shouldIgnore(thread, message)) return;
@@ -73,11 +77,14 @@ export async function startPipa(options = {}) {
 
     await react(thread, message, "eyes");
     try {
+      const interactionContext = { thread, ownerId: message.author?.userId ?? message.author?.id ?? "" };
       const result = await runner.enqueue(thread.id, {
         prompt,
         attachments,
         workingDirectory: config.workingDirectory,
         contextEnvironment: slackContext(thread, message),
+        onSession: () => undefined,
+        onInteraction: (interaction) => interactions.onInteraction(interactionContext, interaction),
         deliver: (text) => postInChunks(thread, text),
         deliverFailure: (error) => thread.post(`Pipa failed: ${safeError(error)}`),
       });
@@ -123,6 +130,124 @@ export async function startPipa(options = {}) {
       }
     },
   };
+}
+
+function createPendingInteractions() {
+  const pending = new Map();
+
+  async function onInteraction(context, interaction) {
+    const token = randomUUID().replaceAll("-", "");
+    const entry = {
+      token,
+      type: interaction.type,
+      request: interaction.request,
+      ownerId: context.ownerId,
+      questionIndex: 0,
+      answers: [],
+      resolve: null,
+    };
+    pending.set(token, entry);
+    try {
+      const message = entry.message = await context.thread.post(renderInteraction(entry));
+      const decision = await new Promise((resolve, reject) => {
+        entry.resolve = resolve;
+        const abort = () => reject(interaction.signal.reason);
+        if (interaction.signal.aborted) abort();
+        else interaction.signal.addEventListener("abort", abort, { once: true });
+      });
+      await message.edit(renderSubmitted(entry, decision));
+      return decision;
+    } finally {
+      pending.delete(token);
+    }
+  }
+
+  async function onAction(event) {
+    const token = String(event.value ?? "").split(".")[0];
+    const entry = pending.get(token);
+    if (!entry || entry.ownerId !== (event.user?.userId ?? event.user?.id ?? "")) {
+      await event.thread?.postEphemeral(event.user, "This request is no longer active.", { fallbackToDM: false }).catch(() => undefined);
+      return;
+    }
+    if (event.actionId === "pipa_stop") {
+      entry.resolve?.({ type: "stop" });
+      return;
+    }
+    if (entry.type === "permission") {
+      const reply = String(event.value ?? "").split(".")[1];
+      if (!["once", "always", "reject"].includes(reply)) return;
+      entry.resolve?.(reply === "reject" ? { type: "reject" } : { type: "reply", reply });
+      return;
+    }
+    if (event.actionId === "pipa_custom") {
+      await event.openModal?.(Modal({ callbackId: "pipa_custom", privateMetadata: token, title: "Custom answer", submitLabel: "Submit", children: [TextInput({ id: "answer", label: "Answer" })] }));
+      return;
+    }
+    if (entry.type !== "question") return;
+    const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
+    if (event.actionId === "pipa_continue") {
+      if (!entry.answers[entry.questionIndex]?.length) return;
+      advance(entry);
+      return;
+    }
+    const answer = String(event.value ?? "").split(".").slice(1).join(".");
+    if (!answer) return;
+    const answers = entry.answers[entry.questionIndex] ?? [];
+    entry.answers[entry.questionIndex] = question.multiple
+      ? answers.includes(answer) ? answers.filter((value) => value !== answer) : [...answers, answer]
+      : [answer];
+    if (question.multiple) await entry.message?.edit(renderInteraction(entry));
+    else advance(entry);
+  }
+
+  async function onCustomAnswer(event) {
+    const entry = pending.get(event.privateMetadata);
+    if (!entry || entry.ownerId !== (event.user?.userId ?? event.user?.id ?? "")) return;
+    const answer = event.values?.answer?.trim();
+    if (!answer) return { action: "errors", errors: { answer: "Enter an answer." } };
+    entry.answers[entry.questionIndex] = [answer];
+    advance(entry);
+  }
+
+  function advance(entry) {
+    if (++entry.questionIndex === (entry.request.questions?.length ?? 1)) entry.resolve?.({ type: "answer", answers: entry.answers });
+    else entry.message?.edit(renderInteraction(entry));
+  }
+
+  return { onInteraction, onAction, onCustomAnswer };
+}
+
+function renderInteraction(entry) {
+  if (entry.type === "permission") {
+    const resources = entry.request.patterns ?? entry.request.resources ?? [];
+    const detail = [`Action: ${entry.request.permission ?? entry.request.action ?? "Unknown"}`, ...(resources.length ? ["Resources:", ...resources.map((r) => `- ${r}`)] : [])].join("\n");
+    return Card({ title: "Permission requested", children: [Text(detail), Actions([
+      Button({ id: "pipa_permission", label: "Allow once", value: `${entry.token}.once`, style: "primary" }),
+      Button({ id: "pipa_permission", label: "Always allow in this workspace", value: `${entry.token}.always` }),
+      Button({ id: "pipa_permission", label: "Reject", value: `${entry.token}.reject`, style: "danger" }),
+      Button({ id: "pipa_stop", label: "Stop", value: entry.token, style: "danger" }),
+    ])] });
+  }
+  const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
+  const buttons = (question.options ?? []).map((option) => Button({
+    id: "pipa_option",
+    label: option.label ?? option,
+    value: `${entry.token}.${option.label ?? option}`,
+  }));
+  if (question.custom) buttons.push(Button({ id: "pipa_custom", label: "Custom answer", value: entry.token }));
+  if (question.multiple) buttons.push(Button({ id: "pipa_continue", label: "Continue", value: entry.token, style: "primary" }));
+  buttons.push(Button({ id: "pipa_stop", label: "Stop", value: entry.token, style: "danger" }));
+  return Card({
+    title: question.header || "Question",
+    children: [Text(question.question ?? question.header ?? "Choose an answer."), Actions(buttons)],
+  });
+}
+
+function renderSubmitted(entry, decision) {
+  let content = "Submitted.";
+  if (decision?.type === "stop") content = "Stopped.";
+  else if (entry.type === "permission") content = `Submitted: ${decision?.reply ?? (decision?.type === "reject" ? "reject" : "permission decision")}.`;
+  return Card({ title: entry.type === "permission" ? "Permission requested" : (entry.request.questions?.[0]?.header || "Question"), children: [Text(content)] });
 }
 
 export function createConversationRunner({ sessionStore, runTurn }) {

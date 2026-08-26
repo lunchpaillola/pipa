@@ -77,7 +77,7 @@ export function createOpenCodeExecutor(options = {}) {
   const active = new Set();
   let stopped = false;
 
-  async function request(pathname, init, workingDirectory, controller, acceptedStatuses = [200]) {
+  async function request(pathname, init, workingDirectory, controller, acceptedStatuses = [200], reportFatal = true) {
     const url = serverUrl(baseUrl, pathname, workingDirectory);
     let response;
     try {
@@ -92,7 +92,7 @@ export function createOpenCodeExecutor(options = {}) {
       });
     } catch (error) {
       if (controller.signal.aborted) throw controller.signal.reason;
-      if (isNetworkError(error)) options.onFatal?.(new Error("OpenCode server became unavailable."));
+      if (reportFatal && isNetworkError(error)) options.onFatal?.(new Error("OpenCode server became unavailable."));
       throw error;
     }
     let text;
@@ -100,7 +100,7 @@ export function createOpenCodeExecutor(options = {}) {
       text = await response.text();
     } catch (error) {
       if (controller.signal.aborted) throw controller.signal.reason;
-      if (isNetworkError(error)) options.onFatal?.(new Error("OpenCode server became unavailable."));
+      if (reportFatal && isNetworkError(error)) options.onFatal?.(new Error("OpenCode server became unavailable."));
       throw error;
     }
     if (!acceptedStatuses.includes(response.status)) throw new OpenCodeRequestError(response.status);
@@ -112,7 +112,7 @@ export function createOpenCodeExecutor(options = {}) {
     }
   }
 
-  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [] }) {
+  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [], onSession, onInteraction }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     if (stopped) throw new Error("Pipa is shutting down.");
     const temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
@@ -148,7 +148,23 @@ export function createOpenCodeExecutor(options = {}) {
           messages = [];
         }
 
+        await onSession?.(selectedSessionId);
+
         const baseline = new Set(messages.map((message) => message?.info?.id).filter(Boolean));
+        if (onInteraction) {
+          const watcher = watchInteractions({
+            baseUrl,
+            fetchImpl,
+            headers,
+            requestTimeoutMs,
+            sessionId: selectedSessionId,
+            workingDirectory,
+            controller,
+            onInteraction,
+            requestTurn: request,
+          });
+          await watcher.ready;
+        }
         await request(`/session/${encodeURIComponent(selectedSessionId)}/prompt_async`, {
           method: "POST",
           body: JSON.stringify(promptBody(prompt.trim(), files, contextEnvironment)),
@@ -450,6 +466,114 @@ function delay(delayMs, signal) {
     const abort = () => settle(reject, signal.reason);
     const timer = setTimeout(() => settle(resolve), delayMs);
     signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sessionId, workingDirectory, controller, onInteraction, requestTurn }) {
+  const seenIds = new Set();
+  let resolveReady;
+  let rejectReady;
+  const ready = new Promise((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  void (async () => {
+    try {
+      const url = serverUrl(baseUrl, "/event", workingDirectory);
+      const response = await fetchImpl(url, {
+        headers: { ...headers, accept: "text/event-stream" },
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(requestTimeoutMs)]),
+      });
+      if (!response.ok) throw new OpenCodeRequestError(response.status);
+      resolveReady();
+      for await (const event of readServerSentEvents(response, controller.signal)) {
+        if (controller.signal.aborted) return;
+        const properties = event?.properties && typeof event.properties === "object" ? event.properties : event;
+        const eventSessionId = properties?.sessionID ?? properties?.sessionId;
+        const type = event.type === "question.asked" ? "question" : event.type === "permission.asked" ? "permission" : null;
+        const requestId = properties?.requestID ?? properties?.requestId ?? properties?.id;
+        if (!type || eventSessionId !== sessionId || !requestId || seenIds.has(`${type}:${requestId}`)) continue;
+        seenIds.add(`${type}:${requestId}`);
+        void settleInteraction({ type, requestId, sessionId, request: properties, onInteraction, controller, workingDirectory, requestTurn });
+      }
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      rejectReady(error);
+    }
+  })();
+  return { ready };
+}
+
+async function settleInteraction({ type, requestId, sessionId, request: interactionRequest, onInteraction, controller, workingDirectory, requestTurn }) {
+  try {
+    const decision = await abortable(Promise.resolve().then(() => onInteraction({
+      type,
+      sessionId,
+      request: interactionRequest,
+      signal: controller.signal,
+    })), controller.signal);
+    if (decision?.type === "stop") {
+      if (type === "question") await requestTurn(`/question/${encodeURIComponent(requestId)}/reject`, { method: "POST" }, workingDirectory, controller, [200, 204, 404], false);
+      else await requestTurn(`/permission/${encodeURIComponent(requestId)}/reply`, { method: "POST", body: JSON.stringify({ reply: "reject" }) }, workingDirectory, controller, [200, 204, 404], false);
+      await requestTurn(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }, workingDirectory, controller, [200, 204], false);
+      return;
+    }
+    if (type === "question" && decision?.type === "answer") {
+      await requestTurn(`/question/${encodeURIComponent(requestId)}/reply`, { method: "POST", body: JSON.stringify({ answers: decision.answers }) }, workingDirectory, controller, [200, 204, 404], false);
+    } else if (type === "question" && decision?.type === "reject") {
+      await requestTurn(`/question/${encodeURIComponent(requestId)}/reject`, { method: "POST" }, workingDirectory, controller, [200, 204, 404], false);
+    } else if (type === "permission" && (decision?.type === "reply" || decision?.type === "reject")) {
+      const reply = decision.type === "reject" ? "reject" : decision.reply;
+      if (!["once", "always", "reject"].includes(reply)) throw new Error("Invalid OpenCode permission decision.");
+      await requestTurn(`/permission/${encodeURIComponent(requestId)}/reply`, { method: "POST", body: JSON.stringify({ reply }) }, workingDirectory, controller, [200, 204, 404], false);
+    } else {
+      throw new Error(`Invalid OpenCode ${type} decision.`);
+    }
+  } catch (error) {
+    if (!controller.signal.aborted) process.stderr.write(`OpenCode interaction handler error: ${error.message}\n`);
+  }
+}
+
+async function* readServerSentEvents(response, signal) {
+  const reader = response.body?.getReader();
+  if (!reader) return;
+  const abort = () => reader.cancel().catch(() => undefined);
+  signal?.addEventListener("abort", abort, { once: true });
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const chunk = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const data = chunk.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+        if (data) {
+          try {
+            yield JSON.parse(data);
+          } catch { /* ponytail: skip non-JSON SSE frames */ }
+        }
+        boundary = buffer.indexOf("\n\n");
+      }
+    }
+  } finally {
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+function abortable(operation, signal) {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const settle = (callback, value) => {
+      signal.removeEventListener("abort", abort);
+      callback(value);
+    };
+    const abort = () => settle(reject, signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    Promise.resolve(operation).then((value) => settle(resolve, value), (error) => settle(reject, error));
   });
 }
 
