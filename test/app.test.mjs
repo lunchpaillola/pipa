@@ -494,6 +494,7 @@ test("interaction registry renders question card and resolves on button click", 
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(posts.length, 1, "should post one interaction card");
   assert.equal(posts[0].title, "Pick");
+  assert.equal(new Set(posts[0].children.flatMap((child) => child.children ?? []).map((button) => button.id)).size, 3);
 
   await actionHandler({ actionId: actionId(posts[0], "pipa_option_"), value: actionValue(posts[0], "pipa_option_"), user: { userId: "U1" }, thread, messageId: "msg_1" });
   await new Promise((resolve) => setTimeout(resolve, 20));
@@ -556,7 +557,7 @@ test("interaction registry renders permission card and resolves with reply value
   assert.deepEqual(resolvedDecision, { type: "reply", reply: "once" });
 });
 
-test("stop action resolves with stop type", async () => {
+test("dismiss action resolves with stop type", async () => {
   const posts = [];
   const thread = {
     id: "slack:C1:1.0",
@@ -603,7 +604,7 @@ test("stop action resolves with stop type", async () => {
   })();
 
   await new Promise((resolve) => setTimeout(resolve, 20));
-  await actionHandler({ actionId: "pipa_stop", value: actionValue(posts[0], "pipa_stop"), user: { userId: "U1" }, thread, messageId: "msg_1" });
+  await actionHandler({ actionId: actionId(posts[0], "pipa_dismiss_"), value: actionValue(posts[0], "pipa_dismiss_"), user: { userId: "U1" }, thread, messageId: "msg_1" });
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.deepEqual(resolvedDecision, { type: "stop" });
 });

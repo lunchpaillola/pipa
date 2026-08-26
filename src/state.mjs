@@ -76,6 +76,19 @@ export async function acquireInstanceLock(file = pipaPaths().lock) {
   return () => rm(file, { force: true });
 }
 
+export async function stopInstance(file = pipaPaths().lock, kill = process.kill) {
+  const pid = Number.parseInt(await readFile(file, "utf8").catch(() => ""), 10);
+  if (!pid) return null;
+  try {
+    kill(pid, "SIGTERM");
+    return pid;
+  } catch (error) {
+    if (error?.code === "ESRCH") await rm(file, { force: true });
+    else throw error;
+    return null;
+  }
+}
+
 export function createManifest(botName) {
   const name = validateBotName(botName);
   const manifest = structuredClone(MANIFEST);

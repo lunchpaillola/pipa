@@ -168,7 +168,7 @@ function createPendingInteractions() {
       await event.thread?.postEphemeral(event.user, "This request is no longer active.", { fallbackToDM: false }).catch(() => undefined);
       return;
     }
-    if (event.actionId === "pipa_stop") {
+    if (event.actionId?.startsWith("pipa_dismiss_")) {
       entry.resolve?.({ type: "stop" });
       return;
     }
@@ -178,13 +178,13 @@ function createPendingInteractions() {
       entry.resolve?.(reply === "reject" ? { type: "reject" } : { type: "reply", reply });
       return;
     }
-    if (event.actionId === "pipa_custom") {
+    if (event.actionId?.startsWith("pipa_custom_")) {
       await event.openModal?.(Modal({ callbackId: "pipa_custom", privateMetadata: token, title: "Custom answer", submitLabel: "Submit", children: [TextInput({ id: "answer", label: "Answer" })] }));
       return;
     }
     if (entry.type !== "question") return;
     const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
-    if (event.actionId === "pipa_continue") {
+    if (event.actionId?.startsWith("pipa_continue_")) {
       if (!entry.answers[entry.questionIndex]?.length) return;
       advance(entry);
       return;
@@ -222,21 +222,21 @@ function renderInteraction(entry) {
     const resources = entry.request.patterns ?? entry.request.resources ?? [];
     const detail = [`Action: ${entry.request.permission ?? entry.request.action ?? "Unknown"}`, ...(resources.length ? ["Resources:", ...resources.map((r) => `- ${r}`)] : [])].join("\n");
     return Card({ title: "Permission requested", children: [Text(detail), Actions([
-      Button({ id: "pipa_permission_once", label: "Allow once", value: `${entry.token}.once`, style: "primary" }),
-      Button({ id: "pipa_permission_always", label: "Always allow in this workspace", value: `${entry.token}.always` }),
-      Button({ id: "pipa_permission_reject", label: "Reject", value: `${entry.token}.reject`, style: "danger" }),
-      Button({ id: "pipa_stop", label: "Stop", value: entry.token, style: "danger" }),
+      Button({ id: `pipa_permission_once_${entry.token}`, label: "Allow once", value: `${entry.token}.once`, style: "primary" }),
+      Button({ id: `pipa_permission_always_${entry.token}`, label: "Always allow in this workspace", value: `${entry.token}.always` }),
+      Button({ id: `pipa_permission_reject_${entry.token}`, label: "Reject", value: `${entry.token}.reject`, style: "danger" }),
+      Button({ id: `pipa_dismiss_${entry.token}`, label: "Dismiss", value: entry.token, style: "danger" }),
     ])] });
   }
   const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
   const buttons = (question.options ?? []).map((option, index) => Button({
-    id: `pipa_option_${index}`,
+    id: `pipa_option_${entry.token}_${index}`,
     label: option.label ?? option,
     value: `${entry.token}.${option.label ?? option}`,
   }));
-  if (question.custom) buttons.push(Button({ id: "pipa_custom", label: "Custom answer", value: entry.token }));
-  if (question.multiple) buttons.push(Button({ id: "pipa_continue", label: "Continue", value: entry.token, style: "primary" }));
-  buttons.push(Button({ id: "pipa_stop", label: "Stop", value: entry.token, style: "danger" }));
+  if (question.custom) buttons.push(Button({ id: `pipa_custom_${entry.token}`, label: "Custom answer", value: entry.token }));
+  if (question.multiple) buttons.push(Button({ id: `pipa_continue_${entry.token}`, label: "Continue", value: entry.token, style: "primary" }));
+  buttons.push(Button({ id: `pipa_dismiss_${entry.token}`, label: "Dismiss", value: entry.token, style: "danger" }));
   return Card({
     title: question.header || "Question",
     children: [Text(question.question ?? question.header ?? "Choose an answer."), Actions(buttons)],
@@ -245,7 +245,7 @@ function renderInteraction(entry) {
 
 function renderSubmitted(entry, decision) {
   let content = "Submitted.";
-  if (decision?.type === "stop") content = "Stopped.";
+  if (decision?.type === "stop") content = "Dismissed.";
   else if (entry.type === "permission") content = `Submitted: ${decision?.reply ?? (decision?.type === "reject" ? "reject" : "permission decision")}.`;
   return Card({ title: entry.type === "permission" ? "Permission requested" : (entry.request.questions?.[0]?.header || "Question"), children: [Text(content)] });
 }

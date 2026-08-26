@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { stdin, stdout } from "node:process";
-import { acquireInstanceLock, createManifest, createManifestUrl, loadConfig } from "../src/state.mjs";
+import { acquireInstanceLock, createManifest, createManifestUrl, loadConfig, stopInstance } from "../src/state.mjs";
 import { initializePipa, startPipa } from "../src/app.mjs";
 import { startOpenCodeServer } from "../src/opencode.mjs";
 
@@ -19,7 +19,13 @@ async function main(argv = process.argv.slice(2), io = { input: stdin, output: s
   }
   if (command === "init") return init(io);
   if (command === "start") return start(io);
-  throw new Error("Usage: pipa init | pipa start | pipa --version");
+  if (command === "stop") return stop(io);
+  throw new Error("Usage: pipa init | pipa start | pipa stop | pipa --version");
+}
+
+async function stop(io) {
+  const pid = await stopInstance();
+  io.output.write(pid ? `Pipa is stopping (PID ${pid}).\n` : "Pipa is not running.\n");
 }
 
 async function init(io) {
