@@ -283,6 +283,7 @@ function renderInteraction(entry) {
   }));
   if (question.custom || !question.options?.length) buttons.push(Button({ id: `pipa_custom_${entry.token}`, label: "Custom answer", value: entry.token }));
   if (question.options?.length) buttons.push(Button({ id: `pipa_submit_${entry.token}`, label: "Submit", value: entry.token, style: "primary" }));
+  buttons.push(Button({ id: `pipa_dismiss_${entry.token}`, label: "Dismiss", value: entry.token, style: "danger" }));
   return Card({
     title: question.header || "Question",
     children: [Text(question.question ?? question.header ?? "Choose an answer."), Actions(buttons)],
@@ -345,6 +346,7 @@ function renderSlackInteraction(entry) {
   const actions = [
     ...(question.custom || !options.length ? [slackButton(`pipa_custom_${entry.token}`, "Custom answer", entry.token)] : []),
     ...(options.length ? [slackButton(`pipa_submit_${entry.token}`, "Submit", entry.token, "primary")] : []),
+    slackButton(`pipa_dismiss_${entry.token}`, "Dismiss", entry.token, "danger"),
   ];
   return [slackHeader(question.header || "Question"), slackText(question.question ?? question.header ?? "Choose an answer."), ...(selector ? [slackActions([selector])] : []), slackActions(actions)];
 }

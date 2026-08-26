@@ -500,7 +500,7 @@ test("interaction registry renders question card and resolves on button click", 
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(posts.length, 1, "should post one interaction card");
   assert.equal(posts[0].title, "Pick");
-  assert.equal(new Set(posts[0].children.flatMap((child) => child.children ?? []).map((button) => button.id)).size, 3);
+  assert.equal(new Set(posts[0].children.flatMap((child) => child.children ?? []).map((button) => button.id)).size, 4);
 
   await actionHandler({ actionId: actionId(posts[0], "pipa_option_"), value: actionValue(posts[0], "pipa_option_"), user: { userId: "U1" }, thread, messageId: "msg_1" });
   await actionHandler({ actionId: actionId(posts[0], "pipa_submit_"), value: actionValue(posts[0], "pipa_submit_"), user: { userId: "U1" }, thread, messageId: "msg_1" });
