@@ -372,6 +372,7 @@ test("version check times out and terminates a hung child", async () => {
 
 test("subscribes to interaction events before prompt_async", async () => {
   const requests = [];
+  let settledBody;
   let prompted = false;
   const sseChunks = [
     "id: evt_1\nevent: question.asked\ndata: {\"sessionID\":\"ses_1\",\"id\":\"req_1\",\"questions\":[{\"header\":\"Color\",\"question\":\"Pick one\",\"options\":[{\"label\":\"Red\"},{\"label\":\"Blue\"}]}]}\n\n",
@@ -398,7 +399,10 @@ test("subscribes to interaction events before prompt_async", async () => {
       prompted = true;
       return new Response(null, { status: 204 });
     }
-    if (parsed.pathname.startsWith("/question/") && parsed.pathname.endsWith("/reply")) return jsonResponse({});
+    if (parsed.pathname.startsWith("/question/") && parsed.pathname.endsWith("/reply")) {
+      settledBody = JSON.parse(init.body);
+      return jsonResponse({});
+    }
     if (parsed.pathname.startsWith("/question/") && parsed.pathname.endsWith("/reject")) return jsonResponse({});
     throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
   };
@@ -422,6 +426,7 @@ test("subscribes to interaction events before prompt_async", async () => {
   assert.equal(seen.length, 1, "duplicate question.asked events with same id should be deduplicated");
   assert.equal(seen[0].type, "question");
   assert.equal(seen[0].request.id, "req_1");
+  assert.deepEqual(settledBody, { answers: [["Red"]] });
 });
 
 test("routes a subagent permission through its parent session", async () => {
@@ -470,36 +475,6 @@ test("forwards permission replies from the OpenCode event stream", async () => {
   const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 });
   await executor.runTurn({ prompt: "go", sessionId: "ses_1", workingDirectory: "/work", onInteraction: () => ({ type: "reply", reply: "always" }), onPermissionReplied: (reply) => replies.push(reply) });
   assert.deepEqual(replies, [{ sessionId: "ses_1", requestId: "perm_1", reply: "always" }]);
-});
-
-test("settles matching-session question with exact answer payload", async () => {
-  let settledBody;
-  let prompted = false;
-  const fetch = async (url, init = {}) => {
-    const parsed = new URL(url);
-    if (parsed.pathname === "/event" && init?.headers?.accept === "text/event-stream") {
-      return sseResponse("question.asked", { sessionID: "ses_1", requestID: "req_1" });
-    }
-    if (parsed.pathname === "/question" || parsed.pathname === "/permission") return jsonResponse([]);
-    if (parsed.pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
-    if (parsed.pathname === "/session/ses_1/message") {
-      return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
-    }
-    if (parsed.pathname.endsWith("/prompt_async")) { prompted = true; return new Response(null, { status: 204 }); }
-    if (parsed.pathname.startsWith("/question/") && parsed.pathname.endsWith("/reply")) {
-      settledBody = JSON.parse(init.body);
-      return jsonResponse({});
-    }
-    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
-  };
-  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 });
-  await executor.runTurn({
-    prompt: "go",
-    sessionId: "ses_1",
-    workingDirectory: "/work",
-    onInteraction: () => ({ type: "answer", answers: [["Opt A"], ["Opt B"]] }),
-  });
-  assert.deepEqual(settledBody, { answers: [["Opt A"], ["Opt B"]] });
 });
 
 test("settles matching-session permission with exact reply payload", async () => {
