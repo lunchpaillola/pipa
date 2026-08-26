@@ -17,6 +17,30 @@ try {
   const { stdout } = await run(command, args);
   if (stdout.trim() !== packageJson.version) throw new Error(`Packed CLI returned ${JSON.stringify(stdout.trim())}.`);
 
+  const installedRoot = path.join(directory, "install", "node_modules", "@usepipa", "pipa");
+  const { createOpenCodeExecutor } = await import(pathToFileURL(path.join(installedRoot, "src", "opencode.mjs")).href);
+  let prompted = false;
+  const executor = createOpenCodeExecutor({
+    baseUrl: "http://127.0.0.1:54321",
+    pollIntervalMs: 1,
+    fetch: async (url, init = {}) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/event") return new Response('data: {"type":"session.idle","properties":{"sessionID":"ses_pack"}}\n\n');
+      if (pathname === "/session/ses_pack/prompt_async") {
+        prompted = true;
+        return new Response(null, { status: 204 });
+      }
+      if (pathname === "/session/ses_pack/message") {
+        const messages = prompted ? [{ info: { id: "msg_pack", role: "assistant" }, parts: [{ type: "text", text: "packed-native-ok" }] }] : [];
+        return new Response(JSON.stringify(messages));
+      }
+      if (pathname === "/session/status") return new Response(JSON.stringify({ ses_pack: { type: "idle" } }));
+      throw new Error(`Unexpected packed native request: ${init.method ?? "GET"} ${url}`);
+    },
+  });
+  const nativeResult = await executor.runTurn({ prompt: "hello", sessionId: "ses_pack", workingDirectory: directory });
+  if (nativeResult.text !== "packed-native-ok") throw new Error("Packed native OpenCode executor failed.");
+
   const home = path.join(directory, "home");
   const workingDirectory = path.join(directory, "work");
   const fakeBin = path.join(directory, "fake-bin");
@@ -47,7 +71,7 @@ if (process.argv[2] === "--version") {
     : `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/fake-opencode.cjs" "$@"\n`);
   if (process.platform !== "win32") await chmod(fakeOpenCode, 0o755);
 
-  const installedCli = path.join(directory, "install", "node_modules", "@usepipa", "pipa", "bin", "pipa.mjs");
+  const installedCli = path.join(installedRoot, "bin", "pipa.mjs");
   const init = await run(process.execPath, [installedCli, "init"], {
     ...process.env,
     HOME: home,
@@ -114,7 +138,7 @@ if (process.argv[2] === "--version") {
   if (await readFile(assertionFile, "utf8") !== "managed-ok") throw new Error("Packed Managed start did not run OpenCode.");
   if (!managedError?.message.includes("OpenCode server exited unexpectedly with code 23")) throw new Error("Packed Managed start did not propagate the OpenCode exit.");
   if (managedError.message.includes("pack-sentinel")) throw new Error("Packed Managed start exposed an environment secret.");
-  process.stdout.write(`Packed CLI ${stdout.trim()} installed, initialized, cancelled, and ran Managed start successfully.\n`);
+  process.stdout.write(`Packed CLI ${stdout.trim()} installed, ran native sessions, initialized, cancelled, and ran Managed start successfully.\n`);
 } finally {
   await rm(directory, { recursive: true, force: true });
 }

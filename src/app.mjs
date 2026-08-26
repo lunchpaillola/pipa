@@ -2,7 +2,7 @@ import { Chat } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { canonicalWorkingDirectory, createManifest, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
-import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, runOpenCodeVersion } from "./opencode.mjs";
+import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
 
 export async function initializePipa(input, options = {}) {
   const paths = options.paths ?? pipaPaths();
@@ -27,8 +27,6 @@ export async function startPipa(options = {}) {
   const config = options.config ?? await loadConfig(paths.config);
   await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
   const sessionStore = options.sessionStore ?? await createSessionStore(paths.sessions);
-  const executor = options.executor ?? createOpenCodeExecutor();
-  const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn });
   const state = options.state ?? createMemoryState();
   const chat = options.chat ?? new Chat({
     adapters: {
@@ -44,7 +42,28 @@ export async function startPipa(options = {}) {
     state,
     userName: config.botName,
   });
+  const server = options.server ?? (options.executor ? null : await (options.startServer ?? startSocketOpenCodeServer)(config, {
+    startupTimeoutMs: options.startupTimeoutMs,
+  }));
+  let executor;
+  try {
+    executor = options.executor ?? (options.createExecutor ?? createOpenCodeExecutor)({
+      baseUrl: server.baseUrl,
+      onFatal: server.fail,
+    });
+  } catch (error) {
+    server?.stop();
+    await withTimeout(server?.wait(), options.shutdownTimeoutMs ?? 15_000, "OpenCode shutdown timed out.").catch(() => undefined);
+    throw error;
+  }
+  const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn });
   let accepting = true;
+  let serverStopped = false;
+  const stopServer = () => {
+    if (serverStopped) return;
+    serverStopped = true;
+    server?.stop();
+  };
 
   const handle = async (thread, message, subscribe) => {
     if (!accepting || shouldIgnore(thread, message)) return;
@@ -86,18 +105,28 @@ export async function startPipa(options = {}) {
   } catch (error) {
     executor.stopAll();
     await withTimeout(chat.shutdown(), options.shutdownTimeoutMs ?? 15_000, "Slack shutdown timed out.").catch(() => undefined);
+    stopServer();
+    await withTimeout(server?.wait(), options.shutdownTimeoutMs ?? 15_000, "OpenCode shutdown timed out.").catch(() => undefined);
     throw error;
   }
 
   return {
+    server: server ? { baseUrl: server.baseUrl, owned: server.owned } : null,
+    wait: () => server?.wait() ?? new Promise(() => undefined),
     async shutdown() {
       accepting = false;
       runner.close();
       executor.stopAll();
-      await withTimeout((async () => {
-        await runner.drain();
-        await chat.shutdown();
-      })(), options.shutdownTimeoutMs ?? 15_000, "Pipa shutdown timed out.");
+      try {
+        await withTimeout((async () => {
+          await runner.drain();
+          await chat.shutdown();
+          stopServer();
+          await server?.wait();
+        })(), options.shutdownTimeoutMs ?? 15_000, "Pipa shutdown timed out.");
+      } finally {
+        stopServer();
+      }
     },
   };
 }
@@ -221,6 +250,7 @@ async function finishReaction(thread, message, emoji) {
 }
 
 async function withTimeout(promise, timeoutMs, message) {
+  if (!promise) return;
   let timer;
   try {
     return await Promise.race([

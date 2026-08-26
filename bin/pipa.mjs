@@ -117,17 +117,24 @@ async function start(io) {
     }
 
     const app = await startPipa({ config });
+    io.output.write(app.server.owned
+      ? `Pipa started a private OpenCode server at ${app.server.baseUrl}.\n`
+      : `Pipa is using the configured OpenCode server at ${app.server.baseUrl}.\n`);
     io.output.write("Pipa is connected through Slack Socket Mode.\n");
-    await new Promise((resolve, reject) => {
-      let stopping = false;
-      const shutdown = () => {
-        if (stopping) return;
-        stopping = true;
-        app.shutdown().then(resolve, reject);
-      };
-      process.once("SIGINT", shutdown);
-      process.once("SIGTERM", shutdown);
-    });
+    let stop;
+    const signal = new Promise((resolve) => stop = resolve);
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+    try {
+      await Promise.race([signal, app.wait()]);
+    } finally {
+      try {
+        await app.shutdown();
+      } finally {
+        process.off("SIGINT", stop);
+        process.off("SIGTERM", stop);
+      }
+    }
   } finally {
     await releaseLock();
   }

@@ -3,7 +3,7 @@
 [![CI](https://github.com/lunchpaillola/pipa/actions/workflows/ci.yml/badge.svg)](https://github.com/lunchpaillola/pipa/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Pipa runs OpenCode in one of two profile modes: local Slack Socket Mode or a Managed OpenCode server. Local mode uses no hosted relay, database, public endpoint, or sandbox.
+Pipa runs OpenCode in one of two profile modes: local Slack Socket Mode or a Managed OpenCode server. Local mode uses one persistent private OpenCode server and no hosted relay, database, public endpoint, or sandbox.
 
 **Pipa is in early preview. Features may break unintentionally, and CLI commands, configuration, and Slack behavior may continue to change.**
 
@@ -41,9 +41,9 @@ pipa init
 pipa start
 ```
 
-Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. Pipa replies in a thread, and follow-up messages in that thread do not need another mention. Messages can include up to Slack's 10-file limit, with a maximum size of 100 MB per file. Attachments require a text prompt and are copied to a temporary directory only for the duration of the turn.
+Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. Pipa starts one OpenCode server bound to `127.0.0.1` on an operating-system-assigned port and reuses it for every Slack turn. Port `0` asks the operating system for an available port; no port configuration is required. Pipa replies in a thread, and follow-up messages in that thread reuse the same OpenCode session without another mention. Messages can include up to Slack's 10-file limit, with a maximum size of 100 MB per file. Attachments require a text prompt and are copied to a temporary directory only for the duration of the turn.
 
-To use an existing OpenCode server instead of starting standalone OpenCode runs, set its URL before starting Pipa:
+To use an existing OpenCode server instead, set its URL before starting Pipa. Pipa health-checks the server but does not start or stop it. If the server uses authentication, also set `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD`:
 
 ```sh
 export PIPA_OPENCODE_ATTACH_URL=http://localhost:5555

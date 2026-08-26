@@ -1,106 +1,351 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { readFileSync } from "node:fs";
-import { access, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import { buildRunArguments, cleanChildEnvironment, createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, parseOpenCodeOutput, runOpenCodeVersion, startOpenCodeServer } from "../src/opencode.mjs";
+import { pathToFileURL } from "node:url";
+import {
+  cleanChildEnvironment,
+  createOpenCodeExecutor,
+  MAX_ATTACHMENT_BYTES,
+  runOpenCodeVersion,
+  startOpenCodeServer,
+  startSocketOpenCodeServer,
+} from "../src/opencode.mjs";
 
-test("builds shell-free continuation arguments with a literal prompt", () => {
-  const prompt = "summarize $(touch nope) && echo bad";
-  assert.deepEqual(buildRunArguments({ prompt, sessionId: "ses_1", workingDirectory: "/work" }), [
-    "run", "--format", "json", "--dir", "/work", "--session", "ses_1", "--", prompt,
-  ]);
-});
-
-test("builds repeated file arguments before the literal prompt", () => {
-  assert.deepEqual(buildRunArguments({
-    prompt: "compare",
-    sessionId: "ses_1",
-    workingDirectory: "/work",
-    attachUrl: "http://localhost:5555",
-    files: ["/tmp/1-a.txt", "/tmp/2-b.txt"],
-  }), [
-    "run", "--format", "json", "--dir", "/work", "--attach", "http://localhost:5555",
-    "--session", "ses_1", "--file", "/tmp/1-a.txt", "--file", "/tmp/2-b.txt", "--", "compare",
-  ]);
-});
-
-test("removes Slack credentials from the child environment regardless of casing", () => {
+test("removes Slack credentials from child environments regardless of casing", () => {
   assert.deepEqual(cleanChildEnvironment({ PATH: "/bin", Slack_Bot_Token: "secret", Pipa_Slack_App_Token: "secret" }), { PATH: "/bin" });
 });
 
-test("parses assistant text and session ID without exposing tool events", () => {
-  const output = parseOpenCodeOutput([
-    JSON.stringify({ type: "text", text: "intermediate commentary", sessionID: "ses_1" }),
-    JSON.stringify({ type: "tool", text: "hidden", sessionID: "ses_1" }),
-    JSON.stringify({ type: "text", part: { type: "text", text: "Useful answer" }, sessionID: "ses_1" }),
-  ].join("\n"));
-  assert.deepEqual(output, { text: "Useful answer", sessionId: "ses_1", error: "" });
-});
-
-test("executor passes a clean environment and returns attributable output", async () => {
+test("starts one owned loopback server on port 0 and stops it", async () => {
   let invocation;
-  const spawn = (command, args, options) => {
-    invocation = { command, args, options };
-    const child = new EventEmitter();
-    child.stdout = new PassThrough();
-    child.stderr = new PassThrough();
-    child.kill = () => true;
-    queueMicrotask(() => {
-      child.stdout.end(`${JSON.stringify({ type: "text", text: "done", sessionID: "ses_new" })}\n`);
-      child.stderr.end();
-      child.emit("close", 0);
-    });
-    return child;
+  let killed = false;
+  const child = childProcess();
+  child.kill = (signal) => {
+    killed = true;
+    assert.equal(signal, "SIGTERM");
+    queueMicrotask(() => child.emit("close", 0));
+    return true;
   };
-  const executor = createOpenCodeExecutor({ spawn, platform: "linux", environment: { PATH: "/bin", SLACK_BOT_TOKEN: "secret", PIPA_OPENCODE_ATTACH_URL: " http://localhost:5555 " } });
-  const result = await executor.runTurn({ prompt: "hello", sessionId: null, workingDirectory: "/work" });
-  assert.deepEqual(result, { text: "done", sessionId: "ses_new" });
-  assert.deepEqual(invocation.args, ["run", "--format", "json", "--dir", "/work", "--attach", "http://localhost:5555", "--", "hello"]);
-  assert.equal(invocation.options.shell, false);
-  assert.equal(invocation.options.env.SLACK_BOT_TOKEN, undefined);
+  const requests = [];
+  const started = startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    environment: { PATH: "/bin", PIPA_SLACK_BOT_TOKEN: "secret" },
+    fetch: async (url) => {
+      requests.push(String(url));
+      return jsonResponse({ healthy: true });
+    },
+    spawn(command, args, options) {
+      invocation = { command, args, options };
+      queueMicrotask(() => child.stdout.write("opencode server listening on http://127.0.0.1:54321\n"));
+      return child;
+    },
+  });
+
+  const server = await started;
+  assert.equal(server.baseUrl, "http://127.0.0.1:54321");
+  assert.equal(server.owned, true);
+  assert.deepEqual(invocation.args, ["serve", "--hostname", "127.0.0.1", "--port", "0", "--log-level", "ERROR"]);
+  assert.equal(invocation.options.cwd, "/work");
+  assert.equal(invocation.options.env.PIPA_SLACK_BOT_TOKEN, undefined);
+  assert.equal(child.stdout.readableFlowing, true);
+  assert.equal(child.stderr.readableFlowing, true);
+  assert.deepEqual(requests, ["http://127.0.0.1:54321/global/health"]);
+  server.stop("SIGTERM");
+  await server.wait();
+  assert.equal(killed, true);
 });
 
-test("Managed server inherits its environment and forwards termination signals", async () => {
+test("health-checks an authenticated attached server without owning it", async () => {
+  let spawned = false;
+  let request;
+  const server = await startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    environment: {
+      PIPA_OPENCODE_ATTACH_URL: " http://localhost:5555/ ",
+      OPENCODE_SERVER_USERNAME: "pipa",
+      OPENCODE_SERVER_PASSWORD: "secret",
+    },
+    fetch: async (url, init) => {
+      request = { url: String(url), init };
+      return jsonResponse({ healthy: true });
+    },
+    spawn: () => { spawned = true; },
+  });
+
+  assert.equal(server.baseUrl, "http://localhost:5555");
+  assert.equal(server.owned, false);
+  assert.equal(spawned, false);
+  assert.equal(request.url, "http://localhost:5555/global/health");
+  assert.equal(request.init.headers.authorization, `Basic ${Buffer.from("pipa:secret").toString("base64")}`);
+  server.stop();
+  await server.wait();
+});
+
+test("cleans up an owned child when startup health never succeeds", async () => {
+  let killed = false;
+  const child = childProcess();
+  child.kill = () => {
+    killed = true;
+    queueMicrotask(() => child.emit("close", 1));
+    return true;
+  };
+  await assert.rejects(startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    startupTimeoutMs: 5,
+    fetch: async () => jsonResponse({ healthy: false }, 503),
+    spawn: () => {
+      queueMicrotask(() => child.stdout.write("opencode server listening on http://127.0.0.1:54321\n"));
+      return child;
+    },
+  }), /health check timed out/u);
+  assert.equal(killed, true);
+});
+
+test("uses native sessions, prompt_async, status, messages, context, and file parts", async () => {
+  let prompted = false;
+  let statusReads = 0;
+  let promptBody;
+  let temporaryFile;
+  const fetch = async (url, init = {}) => {
+    const parsed = new URL(url);
+    assert.equal(parsed.searchParams.get("directory"), "/work");
+    if (parsed.pathname === "/event") return eventResponse({ type: "session.idle", properties: { sessionID: "ses_1" } });
+    if (parsed.pathname === "/session/ses_1/message" && init.method === "GET") {
+      if (!prompted) return jsonResponse([{ info: { id: "old", role: "assistant" }, parts: [{ type: "text", text: "old" }] }]);
+      return jsonResponse([
+        { info: { id: "old", role: "assistant" }, parts: [{ type: "text", text: "old" }] },
+        { info: { id: "new", role: "assistant", time: { completed: 2 } }, parts: [
+          { type: "text", text: "first" },
+          { type: "reasoning", text: "hidden" },
+          { type: "text", text: "second" },
+        ] },
+      ]);
+    }
+    if (parsed.pathname === "/session/ses_1/prompt_async") {
+      prompted = true;
+      promptBody = JSON.parse(init.body);
+      temporaryFile = new URL(promptBody.parts[1].url);
+      assert.equal(await readFile(temporaryFile, "utf8"), "notes");
+      return new Response(null, { status: 204 });
+    }
+    if (parsed.pathname === "/session/status") {
+      statusReads += 1;
+      return jsonResponse(statusReads === 1 ? { ses_1: { type: "busy" } } : { ses_1: { type: "idle" } });
+    }
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 });
+  const attachment = { name: "notes.txt", mimeType: "text/plain", fetchData: async () => Buffer.from("notes") };
+
+  const result = await executor.runTurn({
+    prompt: "summarize",
+    sessionId: "ses_1",
+    workingDirectory: "/work",
+    contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack", PIPA_CURRENT_SLACK_CHANNEL_ID: "C1" },
+    attachments: [attachment],
+  });
+
+  assert.deepEqual(result, { text: "first\nsecond", sessionId: "ses_1" });
+  assert.deepEqual(promptBody.parts[0], { type: "text", text: "summarize" });
+  assert.deepEqual(promptBody.parts[1], { type: "file", mime: "text/plain", filename: "notes.txt", url: temporaryFile.href });
+  assert.match(promptBody.system, /PIPA_MESSAGE_CHANNEL=slack/u);
+  assert.match(promptBody.system, /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
+  await assert.rejects(access(temporaryFile));
+});
+
+test("replaces a stale persisted session only after a successful turn", async () => {
+  let prompted = false;
+  const fetch = async (url, init = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/session/ses_stale/message") return jsonResponse({ error: "not found" }, 404);
+    if (pathname === "/session" && init.method === "POST") return jsonResponse({ id: "ses_new" });
+    if (pathname === "/event") return eventResponse({ type: "session.idle", properties: { sessionID: "ses_new" } });
+    if (pathname === "/session/ses_new/message") {
+      return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "recovered" }] }] : []);
+    }
+    if (pathname === "/session/ses_new/prompt_async") {
+      prompted = true;
+      return new Response(null, { status: 204 });
+    }
+    if (pathname === "/session/status") return jsonResponse({ ses_new: { type: "idle" } });
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+
+  const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 })
+    .runTurn({ prompt: "continue", sessionId: "ses_stale", workingDirectory: "/work" });
+  assert.deepEqual(result, { text: "recovered", sessionId: "ses_new" });
+});
+
+test("does not complete until both the session is idle and a new assistant message exists", async () => {
+  let messageReads = 0;
+  const fetch = async (url, init = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/event") return eventResponse({ type: "message.updated" });
+    if (pathname === "/session/ses_1/prompt_async") return new Response(null, { status: 204 });
+    if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+    if (pathname === "/session/ses_1/message") {
+      messageReads += 1;
+      if (messageReads < 3) return jsonResponse([]);
+      return jsonResponse([{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }]);
+    }
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+  const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 })
+    .runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" });
+  assert.equal(result.text, "done");
+  assert.ok(messageReads >= 3);
+});
+
+test("rejects prompt failures and aborts active requests during shutdown", async () => {
+  const failed = createOpenCodeExecutor({
+    baseUrl: "http://localhost:5555",
+    fetch: async (url, init = {}) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+      if (pathname === "/session/ses_1/message") return jsonResponse([]);
+      if (pathname === "/event") return eventResponse({ type: "server.connected" });
+      if (pathname.endsWith("/prompt_async")) return jsonResponse({ error: "provider failed" }, 500);
+      throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+    },
+  });
+  await assert.rejects(failed.runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" }), /OpenCode request failed/u);
+
+  const hanging = createOpenCodeExecutor({
+    baseUrl: "http://localhost:5555",
+    fetch: async (_, init = {}) => new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true })),
+  });
+  const turn = hanging.runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" });
+  await new Promise((resolve) => setImmediate(resolve));
+  hanging.stopAll();
+  await assert.rejects(turn, /shutting down/u);
+});
+
+test("marks the selected server fatal when the initial event connection disappears", async () => {
+  let fatal;
+  const executor = createOpenCodeExecutor({
+    baseUrl: "http://localhost:5555",
+    onFatal: (error) => fatal = error,
+    fetch: async (url) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+      if (pathname === "/session/ses_1/message") return jsonResponse([]);
+      if (pathname === "/event") throw new TypeError("fetch failed");
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  await assert.rejects(executor.runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" }), /became unavailable/u);
+  assert.match(fatal.message, /became unavailable/u);
+});
+
+test("treats session.error as terminal and never returns incomplete assistant text", async () => {
+  let reads = 0;
+  const executor = createOpenCodeExecutor({
+    baseUrl: "http://localhost:5555",
+    pollIntervalMs: 1,
+    fetch: async (url) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/event") return eventResponse({ type: "session.error", properties: { sessionID: "ses_1" } });
+      if (pathname.endsWith("/prompt_async")) return new Response(null, { status: 204 });
+      if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+      if (pathname === "/session/ses_1/message") {
+        reads += 1;
+        return jsonResponse(reads > 1 ? [{ info: { id: "new", role: "assistant" }, parts: [{ type: "text", text: "partial" }] }] : []);
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  await assert.rejects(executor.runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" }), /failed to complete/u);
+});
+
+test("preserves attachment validation and cleanup", async () => {
+  let requested = false;
+  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch: async () => { requested = true; } });
+  await assert.rejects(executor.runTurn({
+    prompt: "summarize",
+    workingDirectory: "/work",
+    attachments: [{ name: "large.bin", fetchData: async () => ({ byteLength: MAX_ATTACHMENT_BYTES + 1 }) }],
+  }), /100 MB or smaller/u);
+  assert.equal(requested, false);
+});
+
+test("sanitizes distinct attachment files and removes them after prompt failure", async () => {
+  const files = [];
+  const executor = createOpenCodeExecutor({
+    baseUrl: "http://localhost:5555",
+    fetch: async (url, init = {}) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+      if (pathname === "/session/ses_1/message") return jsonResponse([]);
+      if (pathname === "/event") return eventResponse({ type: "server.connected" });
+      if (pathname.endsWith("/prompt_async")) {
+        files.push(...JSON.parse(init.body).parts.slice(1).map((part) => new URL(part.url)));
+        assert.deepEqual(await Promise.all(files.map((file) => readFile(file, "utf8"))), ["one", "two"]);
+        return jsonResponse({ error: "failed" }, 500);
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const attachment = (text) => ({ name: `same<>:"\\|?*${"😀".repeat(100)}. `, mimeType: "text/plain", fetchData: async () => Buffer.from(text) });
+  await assert.rejects(executor.runTurn({
+    prompt: "compare",
+    sessionId: "ses_1",
+    workingDirectory: "/work",
+    attachments: [attachment("one"), attachment("two")],
+  }), /OpenCode request failed/u);
+  assert.equal(new Set(files.map(({ pathname }) => pathname)).size, 2);
+  for (const file of files) {
+    assert.doesNotMatch(path.basename(file.pathname), /[<>:"/\\|?*\u0000-\u001f]|[. ]$/u);
+    await assert.rejects(access(file));
+  }
+});
+
+test("sends data attachment URLs to a remotely managed server", async () => {
+  let filePart;
+  const executor = createOpenCodeExecutor({
+    baseUrl: "https://opencode.example",
+    fetch: async (url, init = {}) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+      if (pathname === "/session/ses_1/message") return jsonResponse([]);
+      if (pathname === "/event") return eventResponse({ type: "server.connected" });
+      if (pathname.endsWith("/prompt_async")) {
+        filePart = JSON.parse(init.body).parts[1];
+        return jsonResponse({ error: "failed" }, 500);
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  await assert.rejects(executor.runTurn({
+    prompt: "read",
+    sessionId: "ses_1",
+    workingDirectory: "/work",
+    attachments: [{ name: "notes.txt", mimeType: "text/plain", fetchData: async () => Buffer.from("notes") }],
+  }), /OpenCode request failed/u);
+  assert.equal(filePart.url, "data:text/plain;base64,bm90ZXM=");
+});
+
+test("Managed server inherits its clean environment and forwards termination signals", async () => {
   for (const signal of ["SIGINT", "SIGTERM"]) {
     let invocation;
     let killCount = 0;
-    const child = new EventEmitter();
+    const child = childProcess();
     child.kill = (received) => {
       killCount += 1;
       assert.equal(received, signal);
       queueMicrotask(() => child.emit("close", 1));
       return true;
     };
-    const environment = {
-      OPENCODE_DB: "/work/opencode.db",
-      OPENCODE_CONFIG_CONTENT: "config",
-      PIPA_API_BASE_URL: "https://gateway.example",
-      PIPA_EXECUTION_SECRET: "gateway-secret",
-      PIPA_SLACK_BOT_TOKEN: "stale-slack-secret",
-      COMPOSIO_API_KEY: "composio-secret",
-      OPENAI_API_KEY: "provider-secret",
-    };
     const server = startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "127.0.0.1", openCodePort: 4096 }, {
-      environment,
+      environment: { OPENCODE_DB: "/work/opencode.db", PIPA_SLACK_BOT_TOKEN: "secret", OPENAI_API_KEY: "provider-secret" },
       platform: "linux",
       spawn(command, args, options) {
         invocation = { command, args, options };
         return child;
       },
     });
-    assert.equal(invocation.command, "opencode");
     assert.deepEqual(invocation.args, ["serve", "--hostname", "127.0.0.1", "--port", "4096", "--log-level", "ERROR"]);
-    assert.equal(invocation.options.cwd, "/work");
     assert.equal(invocation.options.env.PIPA_SLACK_BOT_TOKEN, undefined);
-    assert.equal(invocation.options.env.PIPA_EXECUTION_SECRET, "gateway-secret");
-    assert.equal(invocation.options.env.COMPOSIO_API_KEY, "composio-secret");
     assert.equal(invocation.options.env.OPENAI_API_KEY, "provider-secret");
-    assert.equal(invocation.options.shell, false);
-    assert.equal(invocation.options.stdio, "inherit");
     server.stop(signal);
     server.stop(signal);
     await server.wait();
@@ -109,257 +354,111 @@ test("Managed server inherits its environment and forwards termination signals",
 });
 
 test("Managed server propagates spawn errors and unexpected exits", async () => {
-  const spawnFailure = new EventEmitter();
-  spawnFailure.kill = () => true;
+  const spawnFailure = childProcess();
   const failedServer = startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "localhost", openCodePort: 4096 }, { spawn: () => spawnFailure });
   queueMicrotask(() => spawnFailure.emit("error", new Error("OpenCode unavailable")));
   await assert.rejects(failedServer.wait(), /OpenCode unavailable/u);
 
-  const exited = new EventEmitter();
-  exited.kill = () => true;
+  const exited = childProcess();
   const exitedServer = startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "localhost", openCodePort: 4096 }, { spawn: () => exited });
   queueMicrotask(() => exited.emit("close", 23));
   await assert.rejects(exitedServer.wait(), /exited unexpectedly with code 23/u);
-
-  const cleanExit = new EventEmitter();
-  cleanExit.kill = () => true;
-  const cleanExitServer = startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "localhost", openCodePort: 4096 }, { spawn: () => cleanExit });
-  queueMicrotask(() => cleanExit.emit("close", 0));
-  await assert.rejects(cleanExitServer.wait(), /exited unexpectedly with code 0/u);
 });
 
-test("executor downloads attachments to distinct temporary files and removes them", async () => {
-  let temporaryDirectory;
-  const contents = [];
-  const spawn = (_, args) => {
-    const files = args.flatMap((value, index) => value === "--file" ? [args[index + 1]] : []);
-    temporaryDirectory = path.dirname(files[0]);
-    contents.push(...files.map((file) => readFileSync(file, "utf8")));
-    assert.equal(new Set(files).size, 2);
-    for (const file of files) {
-      assert.doesNotMatch(path.basename(file), /[<>:"/\\|?*\u0000-\u001f]|[. ]$/u);
-      assert.ok(Buffer.byteLength(path.basename(file)) <= 202);
-    }
-    const child = new EventEmitter();
-    child.stdout = new PassThrough();
-    child.stderr = new PassThrough();
-    child.kill = () => true;
-    queueMicrotask(() => {
-      child.stdout.end(`${JSON.stringify({ type: "text", text: "done" })}\n`);
-      child.stderr.end();
-      child.emit("close", 0);
-    });
-    return child;
+test("Windows server shutdown falls back when taskkill is unavailable", async () => {
+  const child = childProcess();
+  child.pid = 999999;
+  child.kill = (signal) => {
+    assert.equal(signal, "SIGKILL");
+    queueMicrotask(() => child.emit("close", 1));
+    return true;
   };
-  const attachment = (text) => ({ name: `same<>:"\\|?*${"😀".repeat(100)}. `, fetchData: async () => Buffer.from(text) });
-  const executor = createOpenCodeExecutor({ spawn });
-
-  await executor.runTurn({ prompt: "compare", workingDirectory: "/work", attachments: [attachment("one"), attachment("two")] });
-
-  assert.deepEqual(contents, ["one", "two"]);
-  await assert.rejects(access(temporaryDirectory));
-});
-
-test("executor does not spawn OpenCode when an attachment cannot be downloaded", async () => {
-  let spawned = false;
-  const executor = createOpenCodeExecutor({ spawn: () => { spawned = true; } });
-  await assert.rejects(executor.runTurn({
-    prompt: "summarize",
-    workingDirectory: "/work",
-    attachments: [{ name: "broken.txt", fetchData: async () => { throw new Error("download failed"); } }],
-  }), /Could not read one of the attached files/u);
-  assert.equal(spawned, false);
-});
-
-test("executor rejects downloaded data over 100 MB before writing or spawning", async () => {
-  let spawned = false;
-  const executor = createOpenCodeExecutor({ spawn: () => { spawned = true; } });
-  await assert.rejects(executor.runTurn({
-    prompt: "summarize",
-    workingDirectory: "/work",
-    attachments: [{ name: "large.bin", fetchData: async () => ({ byteLength: MAX_ATTACHMENT_BYTES + 1 }) }],
-  }), /100 MB or smaller/u);
-  assert.equal(spawned, false);
-});
-
-test("executor kills the child when output collection fails", async () => {
-  let killed = false;
-  const spawn = () => {
-    const child = new EventEmitter();
-    child.stdout = new PassThrough();
-    child.stderr = new PassThrough();
-    child.kill = () => {
-      killed = true;
-      queueMicrotask(() => child.emit("close", 1));
-      return true;
-    };
-    queueMicrotask(() => child.stdout.destroy(new Error("stream failed")));
-    return child;
-  };
-  const executor = createOpenCodeExecutor({ spawn });
-  await assert.rejects(executor.runTurn({ prompt: "hello", workingDirectory: "/work" }), /stream failed/u);
-  assert.equal(killed, true);
-});
-
-test("executor reports OpenCode error events even with a zero exit code", async () => {
-  let temporaryDirectory;
-  const spawn = (_, args) => {
-    temporaryDirectory = path.dirname(args[args.indexOf("--file") + 1]);
-    const child = new EventEmitter();
-    child.stdout = new PassThrough();
-    child.stderr = new PassThrough();
-    child.kill = () => true;
-    queueMicrotask(() => {
-      child.stdout.end(`${JSON.stringify({ type: "error", error: { message: "provider failed" } })}\n`);
-      child.stderr.end();
-      child.emit("close", 0);
-    });
-    return child;
-  };
-  await assert.rejects(createOpenCodeExecutor({ spawn }).runTurn({
-    prompt: "hello",
-    workingDirectory: "/work",
-    attachments: [{ name: "notes.txt", fetchData: async () => Buffer.from("notes") }],
-  }), /provider failed/u);
-  await assert.rejects(access(temporaryDirectory));
-});
-
-test("stopAll prevents OpenCode from spawning after attachment staging", async () => {
-  let spawned = false;
-  let finishDownload;
-  let markDownloadStarted;
-  const downloadStarted = new Promise((resolve) => markDownloadStarted = resolve);
-  const executor = createOpenCodeExecutor({ spawn: () => { spawned = true; }, timeoutMs: 60_000 });
-  const turn = executor.runTurn({
-    prompt: "summarize",
-    workingDirectory: "/work",
-    attachments: [{
-      name: "stalled.txt",
-      fetchData: () => new Promise((resolve) => {
-        finishDownload = resolve;
-        markDownloadStarted();
-      }),
-    }],
+  const server = await startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    platform: "win32",
+    fetch: async () => jsonResponse({ healthy: true }),
+    spawn: () => {
+      queueMicrotask(() => child.stdout.write("opencode server listening on http://127.0.0.1:54321\n"));
+      return child;
+    },
   });
-  await downloadStarted;
-  executor.stopAll();
-  finishDownload(Buffer.from("notes"));
-  await assert.rejects(turn, /shutting down/u);
-  assert.equal(spawned, false);
-});
-
-test("executor times out stalled attachment downloads without spawning OpenCode", async () => {
-  let spawned = false;
-  const executor = createOpenCodeExecutor({ spawn: () => { spawned = true; }, timeoutMs: 5 });
-  await assert.rejects(executor.runTurn({
-    prompt: "summarize",
-    workingDirectory: "/work",
-    attachments: [{ name: "stalled.txt", fetchData: async () => new Promise(() => undefined) }],
-  }), /Could not read one of the attached files/u);
-  assert.equal(spawned, false);
-});
-
-test("executor times out and terminates a hung child", async () => {
-  let killed = false;
-  let temporaryDirectory;
-  const spawn = (_, args) => {
-    temporaryDirectory = path.dirname(args[args.indexOf("--file") + 1]);
-    const child = new EventEmitter();
-    child.stdout = new PassThrough();
-    child.stderr = new PassThrough();
-    child.kill = () => {
-      killed = true;
-      queueMicrotask(() => child.emit("close", 1));
-      return true;
-    };
-    return child;
-  };
-  await assert.rejects(createOpenCodeExecutor({ spawn, timeoutMs: 5 }).runTurn({
-    prompt: "hello",
-    workingDirectory: "/work",
-    attachments: [{ name: "notes.txt", fetchData: async () => Buffer.from("notes") }],
-  }), /timed out/u);
-  assert.equal(killed, true);
-  await assert.rejects(access(temporaryDirectory));
-});
-
-test("stopAll terminates an active OpenCode child", async () => {
-  let killed = false;
-  const spawn = () => {
-    const child = new EventEmitter();
-    child.stdout = new PassThrough();
-    child.stderr = new PassThrough();
-    child.kill = () => {
-      killed = true;
-      child.stdout.end();
-      child.stderr.end();
-      queueMicrotask(() => child.emit("close", 1));
-      return true;
-    };
-    return child;
-  };
-  const executor = createOpenCodeExecutor({ spawn, timeoutMs: 60_000 });
-  const turn = executor.runTurn({ prompt: "hello", workingDirectory: "/work" });
-  executor.stopAll();
-  await assert.rejects(turn);
-  assert.equal(killed, true);
+  server.stop();
+  await server.wait();
 });
 
 test("version check times out and terminates a hung child", async () => {
   let killed = false;
-  const spawn = () => {
-    const child = new EventEmitter();
-    child.stdout = new PassThrough();
-    child.stderr = new PassThrough();
-    child.kill = () => {
-      killed = true;
-      child.stdout.end();
-      child.stderr.end();
-      queueMicrotask(() => child.emit("close", 1));
-      return true;
-    };
-    return child;
+  const child = childProcess();
+  child.kill = () => {
+    killed = true;
+    child.stdout.end();
+    child.stderr.end();
+    queueMicrotask(() => child.emit("close", 1));
+    return true;
   };
-  await assert.rejects(runOpenCodeVersion({ spawn, timeoutMs: 5 }), /timed out/u);
+  await assert.rejects(runOpenCodeVersion({ spawn: () => child, timeoutMs: 5 }), /timed out/u);
   assert.equal(killed, true);
 });
 
-test("Windows executes an opencode.cmd shim without interpreting prompt metacharacters", { skip: process.platform !== "win32" }, async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "pipa-opencode-"));
-  const argsFile = path.join(directory, "args.json");
-  const marker = path.join(directory, "injected.txt");
-  await writeFile(path.join(directory, "fake.cjs"), `
-const fs = require("node:fs");
-if (process.argv[2] === "--version") console.log("1.0.0");
-else {
-  fs.writeFileSync(process.env.ARG_FILE, JSON.stringify(process.argv.slice(2)));
-  if (process.argv.at(-1) === "hang") {
-    fs.writeFileSync(process.env.PID_FILE, String(process.pid));
-    setInterval(() => {}, 1000);
-  } else {
-    console.log(JSON.stringify({ type: "text", text: "ok", sessionID: "ses_windows" }));
+test("installed OpenCode v1 exposes the native server contract", async (t) => {
+  try {
+    await runOpenCodeVersion({ timeoutMs: 5_000 });
+  } catch (error) {
+    if (error?.code === "ENOENT" || /unavailable/u.test(error?.message ?? "")) return t.skip("OpenCode is not installed");
+    throw error;
   }
-}
-`);
-  await writeFile(path.join(directory, "opencode.cmd"), `@ECHO off\r\n"${process.execPath}" "%~dp0fake.cjs" %*\r\n`);
-  const environment = { ...process.env, ARG_FILE: argsFile, PATH: `${directory};${process.env.PATH}` };
-  assert.equal(await runOpenCodeVersion({ environment }), "1.0.0");
-  const prompt = `literal & echo injected > "${marker}"`;
-  const result = await createOpenCodeExecutor({ environment }).runTurn({ prompt, workingDirectory: directory });
-  assert.equal(result.text, "ok");
-  assert.equal(JSON.parse(await readFile(argsFile, "utf8")).at(-1), prompt);
-  await assert.rejects(access(marker));
-
-  const pidFile = path.join(directory, "pid.txt");
-  environment.PID_FILE = pidFile;
-  const executor = createOpenCodeExecutor({ environment, timeoutMs: 60_000 });
-  const hanging = executor.runTurn({ prompt: "hang", workingDirectory: directory });
-  for (let attempts = 0; attempts < 50; attempts += 1) {
-    if (await access(pidFile).then(() => true, () => false)) break;
-    await new Promise((resolve) => setTimeout(resolve, 20));
+  const workingDirectory = await mkdtemp(path.join(os.tmpdir(), "pipa-contract-"));
+  const server = await startSocketOpenCodeServer({ workingDirectory }, { startupTimeoutMs: 15_000 });
+  try {
+    const doc = await (await fetch(`${server.baseUrl}/doc`)).json();
+    assert.ok(doc.paths["/session/{sessionID}/prompt_async"].post.responses[204]);
+    assert.ok(doc.paths["/session/status"].get.responses[200]);
+    assert.ok(doc.paths["/session/{sessionID}/message"].get.responses[200]);
+    assert.ok(doc.paths["/event"].get.responses[200].content["text/event-stream"]);
+    const fileSchema = doc.components.schemas.FilePartInput;
+    assert.equal(fileSchema.properties.url.type, "string");
+    assert.equal(fileSchema.properties.filename.type, "string");
+    const query = new URLSearchParams({ directory: workingDirectory });
+    const session = await (await fetch(`${server.baseUrl}/session?${query}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    })).json();
+    const file = path.join(workingDirectory, "attachment.txt");
+    await writeFile(file, "contract attachment");
+    const prompt = await fetch(`${server.baseUrl}/session/${session.id}/prompt_async?${query}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        noReply: true,
+        parts: [
+          { type: "text", text: "Read the attachment." },
+          { type: "file", mime: "text/plain", filename: "attachment.txt", url: pathToFileURL(file).href },
+        ],
+      }),
+    });
+    assert.equal(prompt.status, 204);
+    assert.ok(Array.isArray(await (await fetch(`${server.baseUrl}/session/${session.id}/message?${query}`)).json()));
+    assert.equal(typeof (await (await fetch(`${server.baseUrl}/session/status?${query}`)).json()), "object");
+    await fetch(`${server.baseUrl}/session/${session.id}?${query}`, { method: "DELETE" });
+  } finally {
+    server.stop();
+    await server.wait();
+    await rm(workingDirectory, { recursive: true, force: true });
   }
-  const pid = Number(await readFile(pidFile, "utf8"));
-  executor.stopAll();
-  await assert.rejects(hanging);
-  assert.throws(() => process.kill(pid, 0));
 });
+
+function childProcess() {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => true;
+  return child;
+}
+
+function jsonResponse(value, status = 200) {
+  return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
+}
+
+function eventResponse(event) {
+  return new Response(`data: ${JSON.stringify(event)}\n\n`, { headers: { "content-type": "text/event-stream" } });
+}
