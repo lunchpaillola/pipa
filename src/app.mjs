@@ -77,7 +77,7 @@ export async function startPipa(options = {}) {
 
     await react(thread, message, "eyes");
     try {
-      const interactionContext = { thread, ownerId: message.author?.userId ?? message.author?.id ?? "" };
+      const interactionContext = { thread };
       const result = await runner.enqueue(thread.id, {
         prompt,
         attachments,
@@ -141,7 +141,6 @@ function createPendingInteractions() {
       token,
       type: interaction.type,
       request: interaction.request,
-      ownerId: context.ownerId,
       questionIndex: 0,
       answers: [],
       resolve: null,
@@ -165,7 +164,7 @@ function createPendingInteractions() {
   async function onAction(event) {
     const token = String(event.value ?? "").split(".")[0];
     const entry = pending.get(token);
-    if (!entry || entry.ownerId !== (event.user?.userId ?? event.user?.id ?? "")) {
+    if (!entry) {
       await event.thread?.postEphemeral(event.user, "This request is no longer active.", { fallbackToDM: false }).catch(() => undefined);
       return;
     }
@@ -202,7 +201,7 @@ function createPendingInteractions() {
 
   async function onCustomAnswer(event) {
     const entry = pending.get(event.privateMetadata);
-    if (!entry || entry.ownerId !== (event.user?.userId ?? event.user?.id ?? "")) return;
+    if (!entry) return;
     const answer = event.values?.answer?.trim();
     if (!answer) return { action: "errors", errors: { answer: "Enter an answer." } };
     entry.answers[entry.questionIndex] = [answer];

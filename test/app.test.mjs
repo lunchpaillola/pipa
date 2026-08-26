@@ -608,7 +608,7 @@ test("stop action resolves with stop type", async () => {
   assert.deepEqual(resolvedDecision, { type: "stop" });
 });
 
-test("unauthorized clicks show ephemeral error and do not resolve", async () => {
+test("another user can answer an active question", async () => {
   const posts = [];
   const thread = {
     id: "slack:C1:1.0",
@@ -621,7 +621,6 @@ test("unauthorized clicks show ephemeral error and do not resolve", async () => 
   };
   let actionHandler;
   let mention;
-  let ephemeralMessage;
   const chat = {
     onNewMention(handler) { mention = handler; },
     onSubscribedMessage() {},
@@ -656,19 +655,15 @@ test("unauthorized clicks show ephemeral error and do not resolve", async () => 
   })();
 
   await new Promise((resolve) => setTimeout(resolve, 20));
-  const fakeThread = {
-    postEphemeral: async (user, message) => { ephemeralMessage = message; },
-  };
   await actionHandler({
     actionId: "pipa_option",
     value: actionValue(posts[0], "pipa_option"),
     user: { userId: "U2" },
-    thread: fakeThread,
+    thread,
     messageId: "msg_1",
   });
   await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(ephemeralMessage, "This request is no longer active.");
-  assert.equal(resolvedDecision, null, "unauthorized click should not resolve the interaction");
+  assert.deepEqual(resolvedDecision, { type: "answer", answers: [["X"]] });
 });
 
 function actionValue(card, actionId) {
