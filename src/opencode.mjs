@@ -152,6 +152,7 @@ export function createOpenCodeExecutor(options = {}) {
 
         const baseline = new Set(messages.map((message) => message?.info?.id).filter(Boolean));
         let dismissed = false;
+        let permissionRejected = false;
         if (onInteraction) {
           const watcher = watchInteractions({
             baseUrl,
@@ -164,6 +165,7 @@ export function createOpenCodeExecutor(options = {}) {
             onInteraction,
             onPermissionReplied,
             onPermissionsReconciled,
+            onPermissionRejected: () => { permissionRejected = true; },
             onDismiss: () => { dismissed = true; },
             requestTurn: request,
           });
@@ -184,6 +186,7 @@ export function createOpenCodeExecutor(options = {}) {
           if (dismissed && status !== "busy" && status !== "retry") return { text: "", sessionId: selectedSessionId };
           if (["error", "failed", "cancelled"].includes(status) || finalMessage?.error) throw new Error("OpenCode failed to complete the turn.");
           if (finalMessage && (status === "idle" || (!status && finalMessage.completed))) {
+            if (!finalMessage.text && permissionRejected) return { text: "Stopped after a permission was rejected.", sessionId: selectedSessionId };
             if (!finalMessage.text) throw new Error("OpenCode completed without assistant text.");
             return { text: finalMessage.text, sessionId: selectedSessionId };
           }
@@ -474,7 +477,7 @@ function delay(delayMs, signal) {
   });
 }
 
-function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sessionId, workingDirectory, controller, onInteraction, onPermissionReplied, onPermissionsReconciled, onDismiss, requestTurn }) {
+function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sessionId, workingDirectory, controller, onInteraction, onPermissionReplied, onPermissionsReconciled, onPermissionRejected, onDismiss, requestTurn }) {
   const seenIds = new Set();
   const messages = new Map();
   const parents = new Map();
@@ -494,7 +497,7 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
     if (!type || (interactionSessionId !== sessionId && !await belongsToSession(interactionSessionId)) || !requestId || seenIds.has(`${type}:${requestId}`)) return;
     seenIds.add(`${type}:${requestId}`);
     const request = type === "permission" ? await hydratePermission(properties, interactionSessionId) : properties;
-    void settleInteraction({ type, requestId, sessionId: interactionSessionId, request, onInteraction, onDismiss, controller, workingDirectory, requestTurn });
+    void settleInteraction({ type, requestId, sessionId: interactionSessionId, request, onInteraction, onPermissionRejected, onDismiss, controller, workingDirectory, requestTurn });
   };
 
   const belongsToSession = async (candidate) => {
@@ -562,6 +565,7 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
           await dispatch(event);
         }
         await reconcile();
+        await delay(250, controller.signal).catch(() => undefined);
       } catch (error) {
         if (controller.signal.aborted) return;
         if (!subscribed) {
@@ -575,7 +579,7 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
   return { ready };
 }
 
-async function settleInteraction({ type, requestId, sessionId, request: interactionRequest, onInteraction, onDismiss, controller, workingDirectory, requestTurn }) {
+async function settleInteraction({ type, requestId, sessionId, request: interactionRequest, onInteraction, onPermissionRejected, onDismiss, controller, workingDirectory, requestTurn }) {
   try {
     const decision = await abortable(Promise.resolve().then(() => onInteraction({
       type,
@@ -583,7 +587,7 @@ async function settleInteraction({ type, requestId, sessionId, request: interact
       request: interactionRequest,
       signal: controller.signal,
     })), controller.signal);
-    if (decision?.type === "cancelled") return;
+    if (decision?.type === "cancelled" || decision?.type === "stopped") return;
     if (decision?.type === "stop") {
       onDismiss?.();
       if (type === "question") await requestTurn(`/question/${encodeURIComponent(requestId)}/reject`, { method: "POST" }, workingDirectory, controller, [200, 204, 404], false);
@@ -598,6 +602,7 @@ async function settleInteraction({ type, requestId, sessionId, request: interact
     } else if (type === "permission" && (decision?.type === "reply" || decision?.type === "reject")) {
       const reply = decision.type === "reject" ? "reject" : decision.reply;
       if (!["once", "always", "reject"].includes(reply)) throw new Error("Invalid OpenCode permission decision.");
+      if (reply === "reject") onPermissionRejected?.();
       await requestTurn(`/permission/${encodeURIComponent(requestId)}/reply`, { method: "POST", body: JSON.stringify({ reply }) }, workingDirectory, controller, [200, 204, 404], false);
     } else {
       throw new Error(`Invalid OpenCode ${type} decision.`);

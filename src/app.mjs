@@ -106,6 +106,7 @@ export async function startPipa(options = {}) {
     }
     await withTimeout(chat.initialize(), options.startupTimeoutMs ?? 30_000, "Slack Socket Mode startup timed out.");
   } catch (error) {
+    await interactions.close();
     executor.stopAll();
     await withTimeout(chat.shutdown(), options.shutdownTimeoutMs ?? 15_000, "Slack shutdown timed out.").catch(() => undefined);
     server?.stop();
@@ -119,6 +120,7 @@ export async function startPipa(options = {}) {
     async shutdown() {
       accepting = false;
       runner.close();
+      await interactions.close();
       executor.stopAll();
       try {
         await withTimeout((async () => {
@@ -178,7 +180,7 @@ function createPendingInteractions() {
         if (interaction.signal.aborted) throw interaction.signal.reason;
       }
       const result = await decision;
-      await entry.message?.edit(renderSubmitted(entry, result), result);
+      await submit(entry, result);
       return result;
     } finally {
       pending.delete(token);
@@ -199,13 +201,16 @@ function createPendingInteractions() {
     }
   }
 
+  async function close() {
+    const entries = [...pending.values()];
+    for (const entry of entries) entry.resolve?.({ type: "stopped" });
+    await Promise.all(entries.map((entry) => submit(entry, { type: "stopped" })));
+  }
+
   async function onAction(event) {
     const token = interactionToken(event);
     const entry = pending.get(token);
-    if (!entry) {
-      await event.thread?.postEphemeral(event.user, "This request is no longer active.", { fallbackToDM: false }).catch(() => undefined);
-      return;
-    }
+    if (!entry) return;
     if (event.actionId?.startsWith("pipa_dismiss_")) {
       entry.resolve?.({ type: "stop" });
       return;
@@ -262,7 +267,17 @@ function createPendingInteractions() {
     else entry.message?.edit(renderInteraction(entry));
   }
 
-  return { onInteraction, onPermissionReplied, onPermissionsReconciled, onAction, onCustomAnswer };
+  return { onInteraction, onPermissionReplied, onPermissionsReconciled, onAction, onCustomAnswer, close };
+}
+
+async function submit(entry, decision) {
+  if (entry.submitted) return;
+  entry.submitted = true;
+  if (decision?.type === "cancelled" || decision?.type === "stopped") {
+    await entry.message?.delete?.();
+    return;
+  }
+  await entry.message?.edit(renderSubmitted(entry, decision), decision);
 }
 
 function renderInteraction(entry) {
@@ -319,6 +334,7 @@ async function postInteraction(thread, entry) {
       text: decision ? submittedText(entry, decision) : interactionFallback(entry),
       blocks: decision ? renderSlackSubmitted(entry, decision) : renderSlackInteraction(entry),
     }),
+    delete: () => client.chat.delete({ channel, ts: message.ts }),
   };
 }
 
@@ -375,10 +391,6 @@ function permissionOutcome(request, decision) {
   if (decision?.type === "reject") return {
     title: "Permission rejected",
     content: `Rejected${actor}. Blocked ${action}. OpenCode may cancel related requests from the same batch.\n\n${detail}`,
-  };
-  if (decision?.type === "cancelled") return {
-    title: "Permission no longer needed",
-    content: `No action needed. OpenCode cancelled ${action}.\n\n${detail}`,
   };
   if (decision?.reply === "always") return {
     title: "Permission allowed",

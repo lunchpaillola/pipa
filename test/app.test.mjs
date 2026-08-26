@@ -506,21 +506,22 @@ test("interaction registry renders question card and resolves on button click", 
 
 test("permission cards disappear when OpenCode no longer lists the request", async () => {
   const posts = [];
-  const edits = [];
+  const deleted = [];
   const thread = {
     id: "slack:C1:1.0",
     channel: { isDM: false, channelVisibility: "private" },
     subscribe: async () => undefined,
     post: async (content) => {
       posts.push(content);
-      return { edit: async (newContent) => { edits.push(newContent); } };
+      return { delete: async () => { deleted.push(content); } };
     },
   };
   let mention;
+  let actionHandler;
   const chat = {
     onNewMention(handler) { mention = handler; },
     onSubscribedMessage() {},
-    onAction() {},
+    onAction(ids, handler) { actionHandler = handler ?? ids; },
     async initialize() {},
     async shutdown() {},
   };
@@ -541,8 +542,53 @@ test("permission cards disappear when OpenCode no longer lists the request", asy
   await mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} });
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(posts.filter((post) => post?.title === "Permission requested").length, 1);
-  assert.equal(edits.at(-1).title, "Permission no longer needed");
-  assert.match(edits.at(-1).children[0].content, /No action needed\. OpenCode cancelled the external_directory action\./u);
+  assert.deepEqual(deleted, [posts[0]]);
+  const ephemeral = [];
+  await actionHandler({
+    actionId: actionId(posts[0], "pipa_permission_"),
+    value: actionValue(posts[0], "pipa_permission_"),
+    user: { userId: "U1" },
+    thread: { ...thread, postEphemeral: async (...args) => ephemeral.push(args) },
+  });
+  assert.deepEqual(ephemeral, []);
+});
+
+test("shutdown expires active interaction cards", async () => {
+  const posts = [];
+  const deleted = [];
+  const thread = {
+    id: "slack:C1:1.0",
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async (content) => {
+      posts.push(content);
+      return { delete: async () => { deleted.push(content); } };
+    },
+  };
+  let mention;
+  const chat = {
+    onNewMention(handler) { mention = handler; },
+    onSubscribedMessage() {},
+    onAction() {},
+    async initialize() {},
+    async shutdown() {},
+  };
+  const app = await startInteractionPipa(chat, {
+    runTurn: async ({ onInteraction }) => {
+      await onInteraction({
+        type: "permission",
+        sessionId: "ses_1",
+        request: { id: "per_1", permission: "external_directory", patterns: ["/outside"] },
+        signal: AbortSignal.timeout(5000),
+      });
+      return { text: "done", sessionId: "ses_1" };
+    },
+    stopAll() {},
+  });
+  await mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} });
+  await waitFor(() => posts.length === 1);
+  await app.shutdown();
+  assert.deepEqual(deleted, [posts[0]]);
 });
 
 test("interaction registry uses Block Kit selectors in Slack", async () => {
