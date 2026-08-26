@@ -275,6 +275,7 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   const restoredPosts = [];
   const restoredThread = { id: "slack:C1:1.0", channel: { isDM: false, channelVisibility: "private" }, post: async (text) => restoredPosts.push(text) };
   await handlers.subscribed(restoredThread, { text: "continue", author: human, raw: {} });
+  await waitFor(() => restoredPosts.length === 1);
   assert.deepEqual(restoredPosts, [{ markdown: "continue:ses_old" }]);
   assert.equal(calls[0].sessionId, "ses_old");
 
@@ -288,6 +289,7 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   const attachment = { name: "notes.txt", size: 100 * 1024 * 1024, fetchData: async () => Buffer.from("notes") };
   await handlers.mention(thread, { id: "file-1", text: "@U1 summarize", attachments: [attachment], author: human, raw: {} });
   await handlers.subscribed(thread, { id: "file-2", text: "compare this", attachments: [attachment], author: human, raw: { subtype: "file_share" } });
+  await waitFor(() => posts.length === 4);
   const beforeIgnored = calls.length;
   for (const [threadOverride, messageOverride] of [
     [{ channel: { isDM: true } }, {}],
@@ -299,15 +301,19 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   ]) {
     await handlers.subscribed({ ...thread, ...threadOverride }, { text: "ignored", author: human, raw: {}, ...messageOverride });
   }
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(calls.length, beforeIgnored);
   await handlers.mention(thread, { id: "too-large", text: "@U1 summarize", attachments: [{ ...attachment, size: 100 * 1024 * 1024 + 1 }], author: human, raw: {} });
+  await waitFor(() => posts.includes("Pipa can read files up to 100 MB each."));
   assert.equal(calls.length, beforeIgnored);
   await handlers.subscribed(thread, { id: "missing-size", text: "no declared size", attachments: [{ ...attachment, size: undefined }], author: human, raw: { subtype: "file_share" } });
+  await waitFor(() => calls.length === beforeIgnored + 1);
   assert.equal(calls.length, beforeIgnored + 1);
   await handlers.subscribed(thread, { id: "broken", text: "broken attachment", attachments: [attachment], author: human, raw: { subtype: "file_share" } });
   await handlers.subscribed(thread, { id: "3", text: "long", author: human, raw: {} });
   await handlers.subscribed(thread, { id: "4", text: "secret failure", author: human, raw: {} });
   await handlers.subscribed(thread, { id: "5", text: "markdown", author: human, raw: {} });
+  await waitFor(() => posts.length === 12);
   assert.deepEqual(posts.slice(0, 2), [
     { markdown: "ask <@U2> for help:new" },
     { markdown: "<@U2> follow up:ses_1" },
@@ -329,7 +335,7 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   assert.deepEqual(calls.find(({ prompt }) => prompt === "compare this").attachments, [attachment]);
   assert.equal(calls.find(({ prompt }) => prompt === "no declared size").attachments[0].size, undefined);
   assert.equal(restored.filter((item) => item === "subscribed").length, 3);
-  assert.deepEqual(reactions, [
+  assert.deepEqual([...reactions].sort(), [
     "add:1:eyes", "remove:1:eyes", "add:1:white_check_mark",
     "add:2:eyes", "remove:2:eyes", "add:2:white_check_mark",
     "add:file-1:eyes", "remove:file-1:eyes", "add:file-1:white_check_mark",
@@ -339,7 +345,7 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
     "add:3:eyes", "remove:3:eyes", "add:3:white_check_mark",
     "add:4:eyes", "remove:4:eyes", "add:4:warning",
     "add:5:eyes", "remove:5:eyes", "add:5:white_check_mark",
-  ]);
+  ].sort());
   await app.shutdown();
   assert.deepEqual(restored.slice(-2), ["stopped", "shutdown"]);
 });
@@ -497,10 +503,58 @@ test("interaction registry renders question card and resolves on button click", 
   assert.equal(new Set(posts[0].children.flatMap((child) => child.children ?? []).map((button) => button.id)).size, 3);
 
   await actionHandler({ actionId: actionId(posts[0], "pipa_option_"), value: actionValue(posts[0], "pipa_option_"), user: { userId: "U1" }, thread, messageId: "msg_1" });
+  await actionHandler({ actionId: actionId(posts[0], "pipa_submit_"), value: actionValue(posts[0], "pipa_submit_"), user: { userId: "U1" }, thread, messageId: "msg_1" });
   await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(edits.length, 1, "should edit card after decision");
-  assert.equal(edits[0].title, "Pick");
-  assert.equal(edits[0].children[0].content, "Selected: “A”.");
+  assert.equal(edits.length, 2, "should update selection, then submit it");
+  assert.equal(edits.at(-1).title, "Pick");
+  assert.equal(edits.at(-1).children[0].content, "Selected: “A”.");
+});
+
+test("permission cards disappear when OpenCode no longer lists the request", async () => {
+  const posts = [];
+  const edits = [];
+  const thread = {
+    id: "slack:C1:1.0",
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async (content) => {
+      posts.push(content);
+      return { edit: async (newContent) => { edits.push(newContent); } };
+    },
+  };
+  let mention;
+  const chat = {
+    onNewMention(handler) { mention = handler; },
+    onSubscribedMessage() {},
+    onAction() {},
+    async initialize() {},
+    async shutdown() {},
+  };
+  await startPipa({
+    chat,
+    executor: {
+      runTurn: async ({ onInteraction, onPermissionsReconciled }) => {
+        const decision = onInteraction({
+          type: "permission",
+          sessionId: "ses_1",
+          request: { id: "per_1", permission: "external_directory", patterns: ["/outside"] },
+          signal: AbortSignal.timeout(5000),
+        });
+        await new Promise((resolve) => setImmediate(resolve));
+        onPermissionsReconciled({ sessionId: "ses_1", requestIds: new Set() });
+        return { text: (await decision).type, sessionId: "ses_1" };
+      },
+      stopAll() {},
+    },
+    checkSlackToken: async () => ({ ok: true }),
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+  });
+  await mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(posts.filter((post) => post?.title === "Permission requested").length, 1);
+  assert.equal(edits.at(-1).title, "Permission no longer needed");
+  assert.match(edits.at(-1).children[0].content, /No action needed\. OpenCode cancelled the external_directory action\./u);
 });
 
 test("interaction registry uses Block Kit selectors in Slack", async () => {
@@ -549,15 +603,70 @@ test("interaction registry uses Block Kit selectors in Slack", async () => {
   await new Promise((resolve) => setTimeout(resolve, 20));
   const radio = posted[0].blocks.find((block) => block.type === "actions").elements[0];
   assert.equal(radio.type, "radio_buttons");
-  await actionHandler({ actionId: radio.action_id, value: radio.options[0].value, user: { fullName: "Lola" }, thread });
+  await actionHandler({ actionId: radio.action_id, value: radio.options[0].value, user: { fullName: "lola" }, thread });
+  const firstSubmit = posted[0].blocks.at(-1).elements.find((element) => element.action_id.startsWith("pipa_submit_"));
+  await actionHandler({ actionId: firstSubmit.action_id, value: firstSubmit.value, user: { fullName: "lola" }, thread });
   await new Promise((resolve) => setTimeout(resolve, 20));
   const checkbox = updated[0].blocks.find((block) => block.type === "actions" && block.elements[0].type === "checkboxes").elements[0];
   assert.equal(checkbox.type, "checkboxes");
-  await actionHandler({ actionId: checkbox.action_id, value: `${checkbox.options[0].value}`, raw: { actions: [{ action_id: checkbox.action_id, selected_options: checkbox.options }] }, user: { fullName: "Lola" }, thread });
-  const continueButton = updated[0].blocks.at(-1).elements.find((element) => element.action_id.startsWith("pipa_continue_"));
-  await actionHandler({ actionId: continueButton.action_id, value: continueButton.value, user: { fullName: "Lola" }, thread });
+  await actionHandler({ actionId: checkbox.action_id, raw: { actions: [{ action_id: checkbox.action_id, selected_options: checkbox.options }] }, user: { fullName: "lola" }, thread });
+  const submitButton = updated[0].blocks.at(-1).elements.find((element) => element.action_id.startsWith("pipa_submit_"));
+  await actionHandler({ actionId: submitButton.action_id, value: submitButton.value, user: { fullName: "lola" }, thread });
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(updated[1].blocks[1].text.text, "Lola selected: “A”, “C”, “D”.");
+});
+
+test("interaction registry uses custom answer instead of an empty Slack selector", async () => {
+  const posted = [];
+  const updated = [];
+  const thread = {
+    id: "slack:C1:1.0",
+    adapter: { webClient: { chat: {
+      postMessage: async (message) => { posted.push(message); return { ts: "2.0" }; },
+      update: async (message) => { updated.push(message); },
+    } } },
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async () => undefined,
+  };
+  let actionHandler;
+  let customAnswerHandler;
+  let mention;
+  const chat = {
+    onNewMention(handler) { mention = handler; },
+    onSubscribedMessage() {},
+    onAction(ids, handler) { actionHandler = handler ?? ids; },
+    onModalSubmit(_, handler) { customAnswerHandler = handler; },
+    async initialize() {},
+    async shutdown() {},
+  };
+  let decision;
+  void startPipa({
+    chat,
+    executor: {
+      runTurn: async ({ onInteraction }) => {
+        decision = await onInteraction({
+          type: "question",
+          request: { header: "Project name", question: "What should we call it?", custom: true, options: [] },
+          signal: AbortSignal.timeout(5000),
+        });
+        return { text: "done", sessionId: "ses_1" };
+      },
+      stopAll() {},
+    },
+    checkSlackToken: async () => ({ ok: true }),
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+  }).then(() => mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} }));
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(posted[0].blocks.some((block) => block.elements?.some((element) => ["radio_buttons", "checkboxes"].includes(element.type))), false);
+  const custom = posted[0].blocks.at(-1).elements.find((element) => element.action_id.startsWith("pipa_custom_"));
+  await actionHandler({ actionId: custom.action_id, value: custom.value, thread, openModal: async () => undefined });
+  await customAnswerHandler({ privateMetadata: custom.value, values: { answer: "Orbit" }, user: { fullName: "lola" } });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(decision, { type: "answer", answers: [["Orbit"]], selectedBy: "Lola" });
+  assert.equal(updated[0].blocks[1].text.text, "Lola selected: “Orbit”.");
 });
 
 test("interaction registry renders permission card and resolves with reply value", async () => {
@@ -588,7 +697,7 @@ test("interaction registry renders permission card and resolves with reply value
         const decision = await onInteraction({
           type: "permission",
           sessionId: "ses_1",
-          request: { id: "perm_1", permission: "shell", patterns: ["rm *"] },
+          request: { id: "perm_1", permission: "external_directory", patterns: ["/outside"], tool: { name: "glob", input: { pattern: "agents/**/*" } } },
           signal: AbortSignal.timeout(5000),
         });
         resolvedDecision = decision;
@@ -609,21 +718,23 @@ test("interaction registry renders permission card and resolves with reply value
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(posts.length, 1);
   assert.equal(posts[0].title, "Permission requested");
+  assert.match(posts[0].children[0].content, /Tool: glob\nPattern: agents\/\*\*\/*/u);
 
   await actionHandler({ actionId: actionId(posts[0], "pipa_permission_"), value: actionValue(posts[0], "pipa_permission_"), user: { userId: "U1" }, thread, messageId: "msg_1" });
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.deepEqual(resolvedDecision, { type: "reply", reply: "once" });
 });
 
-test("dismiss action resolves with stop type", async () => {
+test("permission decisions explain the selected scope", async () => {
   const posts = [];
+  const edits = [];
   const thread = {
     id: "slack:C1:1.0",
     channel: { isDM: false, channelVisibility: "private" },
     subscribe: async () => undefined,
     post: async (content) => {
       posts.push(content);
-      return { id: "msg_1", edit: async () => ({ id: "msg_1" }) };
+      return { edit: async (content) => { edits.push(content); } };
     },
   };
   let actionHandler;
@@ -635,36 +746,110 @@ test("dismiss action resolves with stop type", async () => {
     async initialize() {},
     async shutdown() {},
   };
-  let resolvedDecision;
-  (async () => {
-    const executor = {
-      runTurn: async ({ onInteraction, onSession }) => {
-        await onSession("ses_1");
-        const decision = await onInteraction({
-          type: "question",
+  void startPipa({
+    chat,
+    executor: {
+      runTurn: async ({ onInteraction }) => {
+        await onInteraction({
+          type: "permission",
           sessionId: "ses_1",
-          request: { id: "req_1", questions: [{ header: "Q", question: "Pick", options: [{ label: "X" }] }] },
+          request: { id: "perm_1", permission: "external_directory", patterns: ["/outside"], tool: { name: "glob", input: { pattern: "agents/**/*" } } },
           signal: AbortSignal.timeout(5000),
         });
-        resolvedDecision = decision;
         return { text: "done", sessionId: "ses_1" };
       },
       stopAll() {},
-    };
-    await startPipa({
-      chat,
-      executor,
-      checkSlackToken: async () => ({ ok: true }),
-      config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
-      sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
-    });
-    await mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} });
-  })();
+    },
+    checkSlackToken: async () => ({ ok: true }),
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+  }).then(() => mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} }));
 
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  await actionHandler({ actionId: actionId(posts[0], "pipa_dismiss_"), value: actionValue(posts[0], "pipa_dismiss_"), user: { userId: "U1" }, thread, messageId: "msg_1" });
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.deepEqual(resolvedDecision, { type: "stop" });
+  await waitFor(() => posts.length === 1);
+  await actionHandler({ actionId: actionId(posts[0], "pipa_permission_reject_"), value: actionValue(posts[0], "pipa_permission_reject_"), user: { fullName: "lola" }, thread });
+  await waitFor(() => edits.length === 1);
+  assert.equal(edits[0].title, "Permission rejected");
+  assert.match(edits[0].children[0].content, /Rejected by Lola\. Blocked `glob agents\/\*\*\/\*`\. OpenCode may cancel related requests from the same batch\./u);
+});
+
+test("permission cards in separate Slack threads do not block one another", async () => {
+  const posts = [];
+  let request = 0;
+  const threads = ["slack:C1:1.0", "slack:C1:2.0"].map((id) => ({
+    id,
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async (content) => {
+      posts.push({ id, content });
+      return { edit: async () => undefined };
+    },
+  }));
+  let mention;
+  const chat = {
+    onNewMention(handler) { mention = handler; },
+    onSubscribedMessage() {},
+    onAction() {},
+    async initialize() {},
+    async shutdown() {},
+  };
+  void startPipa({
+    chat,
+    executor: {
+      runTurn: ({ onInteraction }) => onInteraction({
+        type: "permission",
+        sessionId: "ses_1",
+        request: { id: `perm_${++request}`, permission: "external_directory", patterns: ["/outside"] },
+        signal: AbortSignal.timeout(5000),
+      }).then(() => ({ text: "done", sessionId: "ses_1" })),
+      stopAll() {},
+    },
+    checkSlackToken: async () => ({ ok: true }),
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+  }).then(() => Promise.all(threads.map((thread) => mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} }))));
+
+  await waitFor(() => posts.length === 2);
+  assert.deepEqual(posts.map((post) => post.id).sort(), ["slack:C1:1.0", "slack:C1:2.0"]);
+});
+
+test("interaction registry queues concurrent permission cards", async () => {
+  const posts = [];
+  const thread = {
+    id: "slack:C1:1.0",
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async (content) => {
+      posts.push(content);
+      return { id: `msg_${posts.length}`, edit: async () => undefined };
+    },
+  };
+  let actionHandler;
+  let mention;
+  const chat = {
+    onNewMention(handler) { mention = handler; },
+    onSubscribedMessage() {},
+    onAction(ids, handler) { actionHandler = handler ?? ids; },
+    async initialize() {},
+    async shutdown() {},
+  };
+  void startPipa({
+    chat,
+    executor: {
+      runTurn: ({ onInteraction }) => Promise.all([
+        onInteraction({ type: "permission", sessionId: "ses_1", request: { id: "perm_1", permission: "read", patterns: ["one"] }, signal: AbortSignal.timeout(5000) }),
+        onInteraction({ type: "permission", sessionId: "ses_1", request: { id: "perm_2", permission: "read", patterns: ["two"] }, signal: AbortSignal.timeout(5000) }),
+      ]).then(() => ({ text: "done", sessionId: "ses_1" })),
+      stopAll() {},
+    },
+    checkSlackToken: async () => ({ ok: true }),
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+  }).then(() => mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} }));
+
+  await waitFor(() => posts.length === 1);
+  await actionHandler({ actionId: actionId(posts[0], "pipa_permission_once_"), value: actionValue(posts[0], "pipa_permission_once_"), thread });
+  await waitFor(() => posts.length === 2);
+  await actionHandler({ actionId: actionId(posts[1], "pipa_permission_once_"), value: actionValue(posts[1], "pipa_permission_once_"), thread });
 });
 
 test("another user can answer an active question", async () => {
@@ -721,12 +906,21 @@ test("another user can answer an active question", async () => {
     thread,
     messageId: "msg_1",
   });
+  await actionHandler({ actionId: actionId(posts[0], "pipa_submit_"), value: actionValue(posts[0], "pipa_submit_"), user: { userId: "U2" }, thread, messageId: "msg_1" });
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.deepEqual(resolvedDecision, { type: "answer", answers: [["X"]] });
 });
 
 function actionValue(card, actionId) {
   return card.children.flatMap((child) => child.children ?? []).find((button) => button.id.startsWith(actionId))?.value;
+}
+
+async function waitFor(predicate) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  throw new Error("Timed out waiting for test condition.");
 }
 
 function actionId(card, prefix) {

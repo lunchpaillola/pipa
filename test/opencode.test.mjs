@@ -145,6 +145,7 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
   assert.deepEqual(result, { text: "first\nsecond", sessionId: "ses_1" });
   assert.deepEqual(promptBody.parts[0], { type: "text", text: "summarize" });
   assert.deepEqual(promptBody.parts[1], { type: "file", mime: "text/plain", filename: "notes.txt", url: temporaryFile.href });
+  assert.match(promptBody.system, /not as shell environment variables/u);
   assert.match(promptBody.system, /PIPA_MESSAGE_CHANNEL=slack/u);
   assert.match(promptBody.system, /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
   await assert.rejects(access(temporaryFile));
@@ -369,12 +370,12 @@ test("version check times out and terminates a hung child", async () => {
   assert.equal(killed, true);
 });
 
-test("subscribes to SSE before prompt_async and parses split data: frames", async () => {
+test("subscribes to interaction events before prompt_async", async () => {
   const requests = [];
   let prompted = false;
   const sseChunks = [
-    "data: {\"type\":\"question.asked\",\"properties\":{\"sessionID\":\"ses_1\",\"id\":\"req_1\",\"questions\":[{\"header\":\"Color\",\"question\":\"Pick one\",\"options\":[{\"label\":\"Red\"},{\"label\":\"Blue\"}]}]}}\n\n",
-    "data: {\"type\":\"question.asked\",\"properties\":{\"sessionID\":\"ses_1\",\"id\":\"req_1\",\"questions\":[{\"header\":\"Color\",\"question\":\"Pick one\",\"options\":[{\"label\":\"Red\"},{\"label\":\"Blue\"}]}]}}\n\n",
+    "id: evt_1\nevent: question.asked\ndata: {\"sessionID\":\"ses_1\",\"id\":\"req_1\",\"questions\":[{\"header\":\"Color\",\"question\":\"Pick one\",\"options\":[{\"label\":\"Red\"},{\"label\":\"Blue\"}]}]}\n\n",
+    "id: evt_1\nevent: question.asked\ndata: {\"sessionID\":\"ses_1\",\"id\":\"req_1\",\"questions\":[{\"header\":\"Color\",\"question\":\"Pick one\",\"options\":[{\"label\":\"Red\"},{\"label\":\"Blue\"}]}]}\n\n",
   ];
   const sseBody = () => new ReadableStream({
     start(controller) {
@@ -421,6 +422,54 @@ test("subscribes to SSE before prompt_async and parses split data: frames", asyn
   assert.equal(seen.length, 1, "duplicate question.asked events with same id should be deduplicated");
   assert.equal(seen[0].type, "question");
   assert.equal(seen[0].request.id, "req_1");
+});
+
+test("routes a subagent permission through its parent session", async () => {
+  let prompted = false;
+  const event = `data: ${JSON.stringify({ type: "permission.asked", properties: { sessionID: "ses_child", id: "perm_1", permission: "external_directory", patterns: ["/outside"] } })}\n\n`;
+  const fetch = async (url) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/event") return new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(event)); controller.close(); } }), { status: 200 });
+    if (pathname === "/permission") return jsonResponse([]);
+    if (pathname === "/session/ses_child") return jsonResponse({ id: "ses_child", parentID: "ses_1" });
+    if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+    if (pathname === "/session/ses_1/message") return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
+    if (pathname.endsWith("/prompt_async")) { prompted = true; return new Response(null, { status: 204 }); }
+    if (pathname.startsWith("/permission/") && pathname.endsWith("/reply")) return jsonResponse({});
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const seen = [];
+  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 });
+  await executor.runTurn({
+    prompt: "go",
+    sessionId: "ses_1",
+    workingDirectory: "/work",
+    onInteraction: (interaction) => { seen.push(interaction); return { type: "reply", reply: "once" }; },
+  });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].sessionId, "ses_child");
+});
+
+test("forwards permission replies from the OpenCode event stream", async () => {
+  let prompted = false;
+  const events = [
+    `data: ${JSON.stringify({ type: "permission.asked", properties: { sessionID: "ses_1", id: "perm_1", permission: "shell", patterns: ["ls"] } })}\n\n`,
+    `data: ${JSON.stringify({ type: "permission.replied", properties: { sessionID: "ses_1", requestID: "perm_1", reply: "always" } })}\n\n`,
+  ];
+  const fetch = async (url) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/event") return new Response(new ReadableStream({ start(controller) { events.forEach((event) => controller.enqueue(new TextEncoder().encode(event))); controller.close(); } }), { status: 200 });
+    if (pathname === "/permission") return jsonResponse([]);
+    if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+    if (pathname === "/session/ses_1/message") return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
+    if (pathname.endsWith("/prompt_async")) { prompted = true; return new Response(null, { status: 204 }); }
+    if (pathname.startsWith("/permission/") && pathname.endsWith("/reply")) return jsonResponse({});
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const replies = [];
+  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 });
+  await executor.runTurn({ prompt: "go", sessionId: "ses_1", workingDirectory: "/work", onInteraction: () => ({ type: "reply", reply: "always" }), onPermissionReplied: (reply) => replies.push(reply) });
+  assert.deepEqual(replies, [{ sessionId: "ses_1", requestId: "perm_1", reply: "always" }]);
 });
 
 test("settles matching-session question with exact answer payload", async () => {

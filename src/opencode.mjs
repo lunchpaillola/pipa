@@ -112,7 +112,7 @@ export function createOpenCodeExecutor(options = {}) {
     }
   }
 
-  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [], onSession, onInteraction }) {
+  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [], onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     if (stopped) throw new Error("Pipa is shutting down.");
     const temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
@@ -162,6 +162,8 @@ export function createOpenCodeExecutor(options = {}) {
             workingDirectory,
             controller,
             onInteraction,
+            onPermissionReplied,
+            onPermissionsReconciled,
             onDismiss: () => { dismissed = true; },
             requestTurn: request,
           });
@@ -313,7 +315,7 @@ function promptBody(prompt, files, contextEnvironment) {
   const context = Object.entries(contextEnvironment).filter(([, value]) => value !== undefined && value !== null && String(value));
   return {
     parts,
-    ...(context.length ? { system: `Runtime context for this turn:\n${context.map(([key, value]) => `${key}=${value}`).join("\n")}` } : {}),
+    ...(context.length ? { system: `Slack context for this turn (provided here, not as shell environment variables):\n${context.map(([key, value]) => `${key}=${value}`).join("\n")}` } : {}),
   };
 }
 
@@ -472,36 +474,102 @@ function delay(delayMs, signal) {
   });
 }
 
-function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sessionId, workingDirectory, controller, onInteraction, onDismiss, requestTurn }) {
+function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sessionId, workingDirectory, controller, onInteraction, onPermissionReplied, onPermissionsReconciled, onDismiss, requestTurn }) {
   const seenIds = new Set();
+  const messages = new Map();
+  const parents = new Map();
+  const interactionSessionIds = new Set([sessionId]);
   let resolveReady;
   let rejectReady;
+  let subscribed = false;
   const ready = new Promise((resolve, reject) => {
     resolveReady = resolve;
     rejectReady = reject;
   });
-  void (async () => {
-    try {
-      const url = serverUrl(baseUrl, "/event", workingDirectory);
-      const response = await fetchImpl(url, {
-        headers: { ...headers, accept: "text/event-stream" },
-        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(requestTimeoutMs)]),
-      });
-      if (!response.ok) throw new OpenCodeRequestError(response.status);
-      resolveReady();
-      for await (const event of readServerSentEvents(response, controller.signal)) {
-        if (controller.signal.aborted) return;
-        const properties = event?.properties && typeof event.properties === "object" ? event.properties : event;
-        const eventSessionId = properties?.sessionID ?? properties?.sessionId;
-        const type = event.type === "question.asked" ? "question" : event.type === "permission.asked" ? "permission" : null;
-        const requestId = properties?.requestID ?? properties?.requestId ?? properties?.id;
-        if (!type || eventSessionId !== sessionId || !requestId || seenIds.has(`${type}:${requestId}`)) continue;
-        seenIds.add(`${type}:${requestId}`);
-        void settleInteraction({ type, requestId, sessionId, request: properties, onInteraction, onDismiss, controller, workingDirectory, requestTurn });
+  const dispatch = async (event) => {
+    const type = event.type === "question.asked" ? "question" : event.type === "permission.asked" ? "permission" : null;
+    const properties = event.properties && typeof event.properties === "object" ? event.properties : event.data && typeof event.data === "object" ? event.data : event;
+    const interactionSessionId = properties?.sessionID ?? properties?.sessionId;
+    const requestId = properties?.requestID ?? properties?.requestId ?? properties?.id;
+    if (!type || (interactionSessionId !== sessionId && !await belongsToSession(interactionSessionId)) || !requestId || seenIds.has(`${type}:${requestId}`)) return;
+    seenIds.add(`${type}:${requestId}`);
+    const request = type === "permission" ? await hydratePermission(properties, interactionSessionId) : properties;
+    void settleInteraction({ type, requestId, sessionId: interactionSessionId, request, onInteraction, onDismiss, controller, workingDirectory, requestTurn });
+  };
+
+  const belongsToSession = async (candidate) => {
+    const original = candidate;
+    const visited = new Set();
+    while (candidate && !visited.has(candidate)) {
+      if (candidate === sessionId) {
+        interactionSessionIds.add(original);
+        return true;
       }
-    } catch (error) {
-      if (controller.signal.aborted) return;
-      rejectReady(error);
+      visited.add(candidate);
+      if (!parents.has(candidate)) parents.set(candidate, requestTurn(`/session/${encodeURIComponent(candidate)}`, { method: "GET" }, workingDirectory, controller)
+        .then((session) => session?.parentID));
+      candidate = await parents.get(candidate);
+    }
+    return false;
+  };
+
+  const hydratePermission = async (permission, interactionSessionId) => {
+    const tool = permission.tool;
+    if (!tool?.messageID || !tool.callID) return permission;
+    if (!messages.has(tool.messageID)) {
+      messages.set(tool.messageID, requestTurn(`/session/${encodeURIComponent(interactionSessionId)}/message?limit=100`, { method: "GET" }, workingDirectory, controller)
+        .then((items) => items.flatMap((message) => message.info?.id === tool.messageID ? message.parts ?? [] : [])));
+    }
+    const part = (await messages.get(tool.messageID)).find((item) => item.callID === tool.callID);
+    return part ? { ...permission, tool: { ...tool, name: part.tool, input: part.state?.input } } : permission;
+  };
+
+  const reconcile = async () => {
+    const permissions = await requestTurn("/permission", { method: "GET" }, workingDirectory, controller);
+    const pending = (await Promise.all((permissions ?? []).map(async (permission) => {
+      return await belongsToSession(permission?.sessionID) ? permission : null;
+    }))).filter(Boolean);
+    await Promise.all(pending.map((permission) => dispatch({ type: "permission.asked", properties: permission })));
+    for (const interactionSessionId of interactionSessionIds) {
+      const requests = pending.filter((permission) => permission.sessionID === interactionSessionId);
+      onPermissionsReconciled?.({ sessionId: interactionSessionId, requestIds: new Set(requests.map((permission) => permission.id)) });
+    }
+  };
+
+  void (async () => {
+    while (!controller.signal.aborted) {
+      try {
+        const url = serverUrl(baseUrl, "/event", workingDirectory);
+        const response = await fetchImpl(url, {
+          headers: { ...headers, accept: "text/event-stream" },
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(requestTimeoutMs)]),
+        });
+        if (!response.ok) throw new OpenCodeRequestError(response.status);
+        await reconcile();
+        if (!subscribed) {
+          subscribed = true;
+          resolveReady();
+        }
+        for await (const event of readServerSentEvents(response, controller.signal)) {
+          if (controller.signal.aborted) return;
+          const properties = event.properties && typeof event.properties === "object" ? event.properties : event.data && typeof event.data === "object" ? event.data : event;
+          const interactionSessionId = properties?.sessionID ?? properties?.sessionId;
+          if (event.type === "permission.replied" && (interactionSessionId === sessionId || await belongsToSession(interactionSessionId))) {
+            onPermissionReplied?.({ sessionId: interactionSessionId, requestId: properties?.requestID ?? properties?.requestId, reply: properties?.reply });
+            await reconcile();
+            continue;
+          }
+          await dispatch(event);
+        }
+        await reconcile();
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        if (!subscribed) {
+          rejectReady(error);
+          return;
+        }
+        await delay(250, controller.signal).catch(() => undefined);
+      }
     }
   })();
   return { ready };
@@ -515,6 +583,7 @@ async function settleInteraction({ type, requestId, sessionId, request: interact
       request: interactionRequest,
       signal: controller.signal,
     })), controller.signal);
+    if (decision?.type === "cancelled") return;
     if (decision?.type === "stop") {
       onDismiss?.();
       if (type === "question") await requestTurn(`/question/${encodeURIComponent(requestId)}/reject`, { method: "POST" }, workingDirectory, controller, [200, 204, 404], false);
@@ -554,10 +623,14 @@ async function* readServerSentEvents(response, signal) {
       while (boundary >= 0) {
         const chunk = buffer.slice(0, boundary);
         buffer = buffer.slice(boundary + 2);
-        const data = chunk.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+        const lines = chunk.split("\n");
+        const data = lines.filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+        const id = lines.find((line) => line.startsWith("id:"))?.slice(3).trim();
+        const type = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
         if (data) {
           try {
-            yield JSON.parse(data);
+            const event = JSON.parse(data);
+            yield type ? { id, type, data: event } : event;
           } catch { /* ponytail: skip non-JSON SSE frames */ }
         }
         boundary = buffer.indexOf("\n\n");
