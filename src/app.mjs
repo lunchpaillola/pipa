@@ -12,6 +12,8 @@ export async function initializePipa(input, options = {}) {
     slackAppToken: requireToken(input.slackAppToken, "Slack app token", "xapp-"),
     slackBotToken: requireToken(input.slackBotToken, "Slack bot token", "xoxb-"),
     workingDirectory: await canonicalWorkingDirectory(input.workingDirectory),
+    allowedSlackChannelIds: normalizeIdList(input.allowedSlackChannelIds),
+    allowedSlackUserIds: normalizeIdList(input.allowedSlackUserIds),
   };
   const openCodeVersion = await (options.checkOpenCode ?? runOpenCodeVersion)();
   if (!/^v?1(?:\.|$)/u.test(openCodeVersion)) throw new Error(`Pipa requires OpenCode v1; found ${openCodeVersion || "an unknown version"}.`);
@@ -60,7 +62,7 @@ export async function startPipa(options = {}) {
   let accepting = true;
 
   const handle = async (thread, message, subscribe) => {
-    if (!accepting || shouldIgnore(thread, message)) return;
+    if (!accepting || !isAuthorized(thread, message, config) || shouldIgnore(thread, message)) return;
     const prompt = subscribe || message.isMention ? stripMention(message.text) : message.text.trim();
     if (!prompt) return;
     const attachments = message.attachments ?? [];
@@ -199,6 +201,20 @@ function shouldIgnore(thread, message) {
     || thread.channel?.channelVisibility === "external"
     || Boolean(message.raw?.subtype && message.raw.subtype !== "file_share")
     || !message.text?.trim();
+}
+
+function isAuthorized(thread, message, config) {
+  const channelId = thread.id.split(":")[1];
+  const userId = message.author?.userId ?? message.author?.id;
+  if (config.allowedSlackChannelIds?.length && !config.allowedSlackChannelIds.includes(channelId)) return false;
+  if (config.allowedSlackUserIds?.length && !config.allowedSlackUserIds.includes(userId)) return false;
+  return true;
+}
+
+function normalizeIdList(value) {
+  if (value === undefined || value === null) return [];
+  const list = Array.isArray(value) ? value : String(value).split(/[\s,]+/u);
+  return list.map((item) => String(item).trim()).filter(Boolean);
 }
 
 function stripMention(text = "") {

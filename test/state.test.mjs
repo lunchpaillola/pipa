@@ -64,6 +64,33 @@ test("config validates Socket and Managed profiles", async () => {
   await assert.rejects(loadConfig(file), (error) => !error.message.includes("not-a-real-mode-secret"));
 });
 
+test("config validates allowed Slack access lists", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-config-"));
+  const file = pipaPaths(home).config;
+  await mkdir(path.dirname(file), { recursive: true });
+  const writeConfig = (config) => writeFile(file, JSON.stringify(config));
+  const base = { botName: "Pipa", workingDirectory: home, slackAppToken: "xapp-test", slackBotToken: "xoxb-test" };
+
+  const valid = { ...base, allowedSlackChannelIds: ["C1", "C2"], allowedSlackUserIds: ["U1"] };
+  await writeConfig(valid);
+  assert.deepEqual(await loadConfig(file), { ...valid, slackMode: "socket" });
+
+  await writeConfig(base);
+  assert.deepEqual(await loadConfig(file), { ...base, slackMode: "socket" });
+
+  for (const [key, value] of [
+    ["allowedSlackChannelIds", "C1"],
+    ["allowedSlackChannelIds", [1]],
+    ["allowedSlackChannelIds", ["", "C1"]],
+    ["allowedSlackUserIds", 42],
+    ["allowedSlackUserIds", [null]],
+    ["allowedSlackUserIds", [" "]],
+  ]) {
+    await writeConfig({ ...base, [key]: value });
+    await assert.rejects(loadConfig(file), /Invalid Pipa config/u);
+  }
+});
+
 test("malformed session state fails instead of discarding continuity", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-state-"));
   const file = pipaPaths(home).sessions;
