@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { Actions, Button, Card, CardText as Text, Chat, Modal, TextInput } from "chat";
+import { Chat, Modal, TextInput } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { canonicalWorkingDirectory, createManifest, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
@@ -257,14 +257,6 @@ function createPendingInteractions() {
       advance(entry, event.user);
       return;
     }
-    if (!event.actionId?.startsWith("pipa_option_")) return;
-    const answer = String(event.value ?? "").split(".").slice(1).join(".");
-    if (!answer) return;
-    const answers = entry.answers[entry.questionIndex] ?? [];
-    entry.answers[entry.questionIndex] = question.multiple
-      ? answers.includes(answer) ? answers.filter((value) => value !== answer) : [...answers, answer]
-      : [answer];
-    await entry.message?.edit(renderInteraction(entry));
   }
 
   async function onCustomAnswer(event) {
@@ -281,7 +273,7 @@ function createPendingInteractions() {
       const selectedBy = displayName(user?.fullName ?? user?.userName);
       entry.resolve?.({ type: "answer", answers: entry.answers, ...(selectedBy ? { selectedBy } : {}) });
     }
-    else entry.message?.edit(renderInteraction(entry));
+    else entry.message?.edit();
   }
 
   return { onInteraction, onPermissionReplied, onPermissionsReconciled, onAction, onCustomAnswer, close };
@@ -294,32 +286,7 @@ async function submit(entry, decision) {
     await entry.message?.delete?.();
     return;
   }
-  await entry.message?.edit(renderSubmitted(entry, decision), decision);
-}
-
-function renderInteraction(entry) {
-  if (entry.type === "permission") {
-    const resources = entry.request.patterns ?? entry.request.resources ?? [];
-    const detail = permissionDetail(entry.request, resources);
-    return Card({ title: "Permission requested", children: [Text(detail), Actions([
-      Button({ id: `pipa_permission_once_${entry.token}`, label: "Allow once", value: `${entry.token}.once`, style: "primary" }),
-      Button({ id: `pipa_permission_always_${entry.token}`, label: "Always allow in this workspace", value: `${entry.token}.always` }),
-      Button({ id: `pipa_permission_reject_${entry.token}`, label: "Reject", value: `${entry.token}.reject`, style: "danger" }),
-    ])] });
-  }
-  const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
-  const buttons = (question.options ?? []).map((option, index) => Button({
-    id: `pipa_option_${entry.token}_${index}`,
-    label: option.label ?? option,
-    value: `${entry.token}.${option.label ?? option}`,
-  }));
-  if (question.custom || !question.options?.length) buttons.push(Button({ id: `pipa_custom_${entry.token}`, label: "Custom answer", value: entry.token }));
-  if (question.options?.length) buttons.push(Button({ id: `pipa_submit_${entry.token}`, label: "Submit", value: entry.token, style: "primary" }));
-  buttons.push(Button({ id: `pipa_dismiss_${entry.token}`, label: "Dismiss", value: entry.token, style: "danger" }));
-  return Card({
-    title: question.header || "Question",
-    children: [Text(question.question ?? question.header ?? "Choose an answer."), Actions(buttons)],
-  });
+  await entry.message?.edit(decision);
 }
 
 function renderSubmitted(entry, decision) {
@@ -331,13 +298,13 @@ function renderSubmitted(entry, decision) {
     const answers = decision?.answers?.flat().filter(Boolean) ?? [];
     content = `${decision?.selectedBy ? `${decision.selectedBy} selected` : "Selected"}: ${answers.map((answer) => `“${answer}”`).join(", ")}.`;
   }
-  return Card({ title, children: [Text(content)] });
+  return { title, content };
 }
 
 async function postInteraction(thread, entry) {
   const [, channel, threadTs] = thread.id.split(":");
   const client = thread.adapter?.webClient;
-  if (!client || !channel || !threadTs) return thread.post(renderInteraction(entry));
+  if (!client || !channel || !threadTs) throw new Error("Slack interaction context is unavailable.");
   const message = await client.chat.postMessage({
     channel,
     thread_ts: threadTs,
@@ -345,7 +312,7 @@ async function postInteraction(thread, entry) {
     blocks: renderSlackInteraction(entry),
   });
   return {
-    edit: (_, decision) => client.chat.update({
+    edit: (decision) => client.chat.update({
       channel,
       ts: message.ts,
       text: decision ? submittedText(entry, decision) : interactionFallback(entry),
@@ -386,11 +353,11 @@ function renderSlackInteraction(entry) {
 
 function renderSlackSubmitted(entry, decision) {
   const submitted = renderSubmitted(entry, decision);
-  return [slackHeader(submitted.title), slackText(submitted.children[0].content)];
+  return [slackHeader(submitted.title), slackText(submitted.content)];
 }
 
 function submittedText(entry, decision) {
-  return renderSubmitted(entry, decision).children[0].content;
+  return renderSubmitted(entry, decision).content;
 }
 
 function permissionDetail(request, resources) {
