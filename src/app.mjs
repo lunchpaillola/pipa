@@ -585,28 +585,32 @@ export async function postInStreams(thread, output) {
 async function* boundedStreams(source, limit) {
   const iterator = source[Symbol.asyncIterator]();
   let pending = "";
-  while (true) {
-    if (!pending) {
-      const next = await iterator.next();
-      if (next.done) return;
-      pending = String(next.value);
-    }
-    yield {
-      async *[Symbol.asyncIterator]() {
-        let length = 0;
-        while (length < limit) {
-          if (!pending) {
-            const next = await iterator.next();
-            if (next.done) return;
-            pending = String(next.value);
+  try {
+    while (true) {
+      if (!pending) {
+        const next = await iterator.next();
+        if (next.done) return;
+        pending = String(next.value);
+      }
+      yield {
+        async *[Symbol.asyncIterator]() {
+          let length = 0;
+          while (length < limit) {
+            if (!pending) {
+              const next = await iterator.next();
+              if (next.done) return;
+              pending = String(next.value);
+            }
+            const chunk = pending.slice(0, limit - length);
+            pending = pending.slice(chunk.length);
+            length += chunk.length;
+            if (chunk) yield chunk;
           }
-          const chunk = pending.slice(0, limit - length);
-          pending = pending.slice(chunk.length);
-          length += chunk.length;
-          if (chunk) yield chunk;
-        }
-      },
-    };
+        },
+      };
+    }
+  } finally {
+    await iterator.return?.();
   }
 }
 

@@ -120,15 +120,10 @@ export function createOpenCodeExecutor(options = {}) {
   }
 
   function startTurn(input) {
-    const output = asyncChannel();
-    const completion = executeTurn(input, output).then((result) => {
-      output.close();
-      return result;
-    }, (error) => {
-      output.close();
-      throw error;
-    });
-    return { output, completion };
+    let controller;
+    const output = new ReadableStream({ start(value) { controller = value; } });
+    const completion = executeTurn(input, { push: (value) => controller.enqueue(value) }).finally(() => controller.close());
+    return { output: { [Symbol.asyncIterator]: () => output.values({ preventCancel: true }) }, completion };
   }
 
   function runTurn(input) {
@@ -743,39 +738,6 @@ async function* readServerSentEvents(response, signal, maxBufferChars) {
     signal?.removeEventListener("abort", abort);
     await cancel();
   }
-}
-
-function asyncChannel() {
-  const values = [];
-  const waiters = [];
-  let ended = false;
-  let failure;
-  const settle = () => {
-    while (waiters.length && values.length) waiters.shift().resolve({ value: values.shift(), done: false });
-    if (!values.length && failure) while (waiters.length) waiters.shift().reject(failure);
-    else if (!values.length && ended) while (waiters.length) waiters.shift().resolve({ value: undefined, done: true });
-  };
-  return {
-    push(value) {
-      if (!ended && !failure) {
-        if (!waiters.length && typeof value === "string" && typeof values.at(-1) === "string") values[values.length - 1] += value;
-        else values.push(value);
-      }
-      settle();
-    },
-    close() { ended = true; settle(); },
-    fail(error) { failure = error; settle(); },
-    [Symbol.asyncIterator]() {
-      return {
-        next() {
-          if (values.length) return Promise.resolve({ value: values.shift(), done: false });
-          if (failure) return Promise.reject(failure);
-          if (ended) return Promise.resolve({ value: undefined, done: true });
-          return new Promise((resolve, reject) => waiters.push({ resolve, reject }));
-        },
-      };
-    },
-  };
 }
 
 function abortable(operation, signal) {

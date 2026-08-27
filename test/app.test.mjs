@@ -363,6 +363,27 @@ test("streaming delivery creates ordered messages bounded to 3500 characters", a
   assert.equal(posts.join(""), "a".repeat(3499) + "b".repeat(3502));
 });
 
+test("streaming delivery releases native streams after a failed post", async () => {
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue("first");
+      controller.enqueue("remaining");
+      controller.close();
+    },
+  });
+  const output = { [Symbol.asyncIterator]: () => stream.values({ preventCancel: true }) };
+
+  await assert.rejects(postInStreams({
+    async post(segment) {
+      for await (const _ of segment) throw new Error("Slack failed");
+    },
+  }, output), /Slack failed/u);
+
+  let remaining = "";
+  for await (const chunk of output) remaining += chunk;
+  assert.equal(remaining, "remaining");
+});
+
 test("Slack composition subscribes mentions, restores sessions, and ignores unsupported traffic", async () => {
   const handlers = {};
   const restored = [];
