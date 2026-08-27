@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { acquireInstanceLock, createManifest, createManifestUrl, createSessionStore, loadConfig, loadSessions, pipaPaths, saveConfig } from "../src/state.mjs";
+import { acquireInstanceLock, createManifest, createManifestUrl, createSessionStore, loadConfig, loadSessions, pipaPaths, saveConfig, stopInstance } from "../src/state.mjs";
 
 test("manifest preserves approved capabilities and substitutes the bot name", () => {
   const manifest = createManifest('Workshop "Bot"');
@@ -125,4 +125,14 @@ test("instance lock rejects a second process and can be reacquired", async () =>
   const simultaneous = await Promise.allSettled([acquireInstanceLock(file), acquireInstanceLock(file)]);
   assert.deepEqual(simultaneous.map(({ status }) => status).sort(), ["fulfilled", "rejected"]);
   await simultaneous.find(({ status }) => status === "fulfilled").value();
+});
+
+test("stops the process recorded in the instance lock", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-stop-"));
+  const file = pipaPaths(home).lock;
+  await mkdir(path.dirname(file), { recursive: true });
+  await writeFile(file, "12345");
+  let signal;
+  assert.equal(await stopInstance(file, (pid, received) => { signal = { pid, received }; }), 12345);
+  assert.deepEqual(signal, { pid: 12345, received: "SIGTERM" });
 });

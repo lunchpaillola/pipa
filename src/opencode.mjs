@@ -14,6 +14,12 @@ const LISTENING_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+/u;
 
 export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 
+export class PipaStoppedError extends Error {
+  constructor(message = "Pipa is shutting down.") {
+    super(message);
+  }
+}
+
 export function cleanChildEnvironment(environment = process.env) {
   return Object.fromEntries(Object.entries(environment).filter(([key]) => !SECRET_ENV_KEYS.has(key.toUpperCase())));
 }
@@ -75,9 +81,9 @@ export function createOpenCodeExecutor(options = {}) {
   const pollIntervalMs = options.pollIntervalMs ?? 1_000;
   const useDataUrls = !isLoopbackUrl(baseUrl);
   const active = new Set();
-  let stopped = false;
+  let stopReason;
 
-  async function request(pathname, init, workingDirectory, controller, acceptedStatuses = [200]) {
+  async function request(pathname, init, workingDirectory, controller, acceptedStatuses = [200], reportFatal = true) {
     const url = serverUrl(baseUrl, pathname, workingDirectory);
     let response;
     try {
@@ -92,7 +98,7 @@ export function createOpenCodeExecutor(options = {}) {
       });
     } catch (error) {
       if (controller.signal.aborted) throw controller.signal.reason;
-      if (isNetworkError(error)) options.onFatal?.(new Error("OpenCode server became unavailable."));
+      if (reportFatal && isNetworkError(error)) options.onFatal?.(new Error("OpenCode server became unavailable."));
       throw error;
     }
     let text;
@@ -100,7 +106,7 @@ export function createOpenCodeExecutor(options = {}) {
       text = await response.text();
     } catch (error) {
       if (controller.signal.aborted) throw controller.signal.reason;
-      if (isNetworkError(error)) options.onFatal?.(new Error("OpenCode server became unavailable."));
+      if (reportFatal && isNetworkError(error)) options.onFatal?.(new Error("OpenCode server became unavailable."));
       throw error;
     }
     if (!acceptedStatuses.includes(response.status)) throw new OpenCodeRequestError(response.status);
@@ -112,15 +118,15 @@ export function createOpenCodeExecutor(options = {}) {
     }
   }
 
-  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [] }) {
+  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [], onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
-    if (stopped) throw new Error("Pipa is shutting down.");
+    if (stopReason) throw stopReason;
     const temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
     let turnError;
 
     try {
       const files = await stageAttachments(attachments, temporaryDirectory, timeoutMs, useDataUrls);
-      if (stopped) throw new Error("Pipa is shutting down.");
+      if (stopReason) throw stopReason;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(new Error(`OpenCode timed out after ${timeoutMs}ms.`)), timeoutMs);
       active.add(controller);
@@ -148,7 +154,29 @@ export function createOpenCodeExecutor(options = {}) {
           messages = [];
         }
 
+        await onSession?.(selectedSessionId);
+
         const baseline = new Set(messages.map((message) => message?.info?.id).filter(Boolean));
+        let dismissed = false;
+        let permissionRejected = false;
+        if (onInteraction) {
+          const watcher = watchInteractions({
+            baseUrl,
+            fetchImpl,
+            headers,
+            requestTimeoutMs,
+            sessionId: selectedSessionId,
+            workingDirectory,
+            controller,
+            onInteraction,
+            onPermissionReplied,
+            onPermissionsReconciled,
+            onPermissionRejected: () => { permissionRejected = true; },
+            onDismiss: () => { dismissed = true; },
+            requestTurn: request,
+          });
+          await watcher.ready;
+        }
         await request(`/session/${encodeURIComponent(selectedSessionId)}/prompt_async`, {
           method: "POST",
           body: JSON.stringify(promptBody(prompt.trim(), files, contextEnvironment)),
@@ -161,8 +189,10 @@ export function createOpenCodeExecutor(options = {}) {
           ]);
           const finalMessage = latestAssistantMessage(currentMessages, baseline);
           const status = statuses?.[selectedSessionId]?.type;
+          if (dismissed && status !== "busy" && status !== "retry") return { text: "", sessionId: selectedSessionId };
           if (["error", "failed", "cancelled"].includes(status) || finalMessage?.error) throw new Error("OpenCode failed to complete the turn.");
           if (finalMessage && (status === "idle" || (!status && finalMessage.completed))) {
+            if (!finalMessage.text && permissionRejected) return { text: "Stopped after a permission was rejected.", sessionId: selectedSessionId };
             if (!finalMessage.text) throw new Error("OpenCode completed without assistant text.");
             return { text: finalMessage.text, sessionId: selectedSessionId };
           }
@@ -175,7 +205,7 @@ export function createOpenCodeExecutor(options = {}) {
       }
     } catch (error) {
       turnError = error;
-      if (stopped) throw new Error("Pipa is shutting down.");
+      if (stopReason) throw stopReason;
       throw error;
     } finally {
       if (temporaryDirectory) {
@@ -191,9 +221,9 @@ export function createOpenCodeExecutor(options = {}) {
 
   return {
     runTurn,
-    stopAll() {
-      stopped = true;
-      for (const controller of active) controller.abort(new Error("Pipa is shutting down."));
+    stopAll(reason = new PipaStoppedError()) {
+      stopReason ??= reason;
+      for (const controller of active) controller.abort(stopReason);
     },
   };
 }
@@ -294,7 +324,7 @@ function promptBody(prompt, files, contextEnvironment) {
   const context = Object.entries(contextEnvironment).filter(([, value]) => value !== undefined && value !== null && String(value));
   return {
     parts,
-    ...(context.length ? { system: `Runtime context for this turn:\n${context.map(([key, value]) => `${key}=${value}`).join("\n")}` } : {}),
+    ...(context.length ? { system: `Slack context for this turn (provided here, not as shell environment variables):\n${context.map(([key, value]) => `${key}=${value}`).join("\n")}` } : {}),
   };
 }
 
@@ -450,6 +480,188 @@ function delay(delayMs, signal) {
     const abort = () => settle(reject, signal.reason);
     const timer = setTimeout(() => settle(resolve), delayMs);
     signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sessionId, workingDirectory, controller, onInteraction, onPermissionReplied, onPermissionsReconciled, onPermissionRejected, onDismiss, requestTurn }) {
+  const seenIds = new Set();
+  const messages = new Map();
+  const parents = new Map();
+  const interactionSessionIds = new Set([sessionId]);
+  let resolveReady;
+  let rejectReady;
+  let subscribed = false;
+  const ready = new Promise((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  const dispatch = async (event) => {
+    const type = event.type === "question.asked" ? "question" : event.type === "permission.asked" ? "permission" : null;
+    const properties = event.properties && typeof event.properties === "object" ? event.properties : event.data && typeof event.data === "object" ? event.data : event;
+    const interactionSessionId = properties?.sessionID ?? properties?.sessionId;
+    const requestId = properties?.requestID ?? properties?.requestId ?? properties?.id;
+    if (!type || (interactionSessionId !== sessionId && !await belongsToSession(interactionSessionId)) || !requestId || seenIds.has(`${type}:${requestId}`)) return;
+    seenIds.add(`${type}:${requestId}`);
+    const request = type === "permission" ? await hydratePermission(properties, interactionSessionId) : properties;
+    void settleInteraction({ type, requestId, sessionId: interactionSessionId, request, onInteraction, onPermissionRejected, onDismiss, controller, workingDirectory, requestTurn });
+  };
+
+  const belongsToSession = async (candidate) => {
+    const original = candidate;
+    const visited = new Set();
+    while (candidate && !visited.has(candidate)) {
+      if (candidate === sessionId) {
+        interactionSessionIds.add(original);
+        return true;
+      }
+      visited.add(candidate);
+      if (!parents.has(candidate)) parents.set(candidate, requestTurn(`/session/${encodeURIComponent(candidate)}`, { method: "GET" }, workingDirectory, controller)
+        .then((session) => session?.parentID));
+      candidate = await parents.get(candidate);
+    }
+    return false;
+  };
+
+  const hydratePermission = async (permission, interactionSessionId) => {
+    const tool = permission.tool;
+    if (!tool?.messageID || !tool.callID) return permission;
+    if (!messages.has(tool.messageID)) {
+      messages.set(tool.messageID, requestTurn(`/session/${encodeURIComponent(interactionSessionId)}/message?limit=100`, { method: "GET" }, workingDirectory, controller)
+        .then((items) => items.flatMap((message) => message.info?.id === tool.messageID ? message.parts ?? [] : [])));
+    }
+    const part = (await messages.get(tool.messageID)).find((item) => item.callID === tool.callID);
+    return part ? { ...permission, tool: { ...tool, name: part.tool, input: part.state?.input } } : permission;
+  };
+
+  const reconcile = async () => {
+    const permissions = await requestTurn("/permission", { method: "GET" }, workingDirectory, controller);
+    const pending = (await Promise.all((permissions ?? []).map(async (permission) => {
+      return await belongsToSession(permission?.sessionID) ? permission : null;
+    }))).filter(Boolean);
+    await Promise.all(pending.map((permission) => dispatch({ type: "permission.asked", properties: permission })));
+    for (const interactionSessionId of interactionSessionIds) {
+      const requests = pending.filter((permission) => permission.sessionID === interactionSessionId);
+      onPermissionsReconciled?.({ sessionId: interactionSessionId, requestIds: new Set(requests.map((permission) => permission.id)) });
+    }
+  };
+
+  void (async () => {
+    while (!controller.signal.aborted) {
+      try {
+        const url = serverUrl(baseUrl, "/event", workingDirectory);
+        const response = await fetchImpl(url, {
+          headers: { ...headers, accept: "text/event-stream" },
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(requestTimeoutMs)]),
+        });
+        if (!response.ok) throw new OpenCodeRequestError(response.status);
+        await reconcile();
+        if (!subscribed) {
+          subscribed = true;
+          resolveReady();
+        }
+        for await (const event of readServerSentEvents(response, controller.signal)) {
+          if (controller.signal.aborted) return;
+          const properties = event.properties && typeof event.properties === "object" ? event.properties : event.data && typeof event.data === "object" ? event.data : event;
+          const interactionSessionId = properties?.sessionID ?? properties?.sessionId;
+          if (event.type === "permission.replied" && (interactionSessionId === sessionId || await belongsToSession(interactionSessionId))) {
+            onPermissionReplied?.({ sessionId: interactionSessionId, requestId: properties?.requestID ?? properties?.requestId, reply: properties?.reply });
+            await reconcile();
+            continue;
+          }
+          await dispatch(event);
+        }
+        await reconcile();
+        await delay(250, controller.signal).catch(() => undefined);
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        if (!subscribed) {
+          rejectReady(error);
+          return;
+        }
+        await delay(250, controller.signal).catch(() => undefined);
+      }
+    }
+  })();
+  return { ready };
+}
+
+async function settleInteraction({ type, requestId, sessionId, request: interactionRequest, onInteraction, onPermissionRejected, onDismiss, controller, workingDirectory, requestTurn }) {
+  try {
+    const decision = await abortable(Promise.resolve().then(() => onInteraction({
+      type,
+      sessionId,
+      request: interactionRequest,
+      signal: controller.signal,
+    })), controller.signal);
+    if (decision?.type === "cancelled" || decision?.type === "stopped") return;
+    if (decision?.type === "stop") {
+      onDismiss?.();
+      if (type === "question") await requestTurn(`/question/${encodeURIComponent(requestId)}/reject`, { method: "POST" }, workingDirectory, controller, [200, 204, 404], false);
+      else await requestTurn(`/permission/${encodeURIComponent(requestId)}/reply`, { method: "POST", body: JSON.stringify({ reply: "reject" }) }, workingDirectory, controller, [200, 204, 404], false);
+      await requestTurn(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }, workingDirectory, controller, [200, 204], false);
+      return;
+    }
+    if (type === "question" && decision?.type === "answer") {
+      await requestTurn(`/question/${encodeURIComponent(requestId)}/reply`, { method: "POST", body: JSON.stringify({ answers: decision.answers }) }, workingDirectory, controller, [200, 204, 404], false);
+    } else if (type === "question" && decision?.type === "reject") {
+      await requestTurn(`/question/${encodeURIComponent(requestId)}/reject`, { method: "POST" }, workingDirectory, controller, [200, 204, 404], false);
+    } else if (type === "permission" && (decision?.type === "reply" || decision?.type === "reject")) {
+      const reply = decision.type === "reject" ? "reject" : decision.reply;
+      if (!["once", "always", "reject"].includes(reply)) throw new Error("Invalid OpenCode permission decision.");
+      if (reply === "reject") onPermissionRejected?.();
+      await requestTurn(`/permission/${encodeURIComponent(requestId)}/reply`, { method: "POST", body: JSON.stringify({ reply }) }, workingDirectory, controller, [200, 204, 404], false);
+    } else {
+      throw new Error(`Invalid OpenCode ${type} decision.`);
+    }
+  } catch (error) {
+    if (!controller.signal.aborted) process.stderr.write(`OpenCode interaction handler error: ${error.message}\n`);
+  }
+}
+
+async function* readServerSentEvents(response, signal) {
+  const reader = response.body?.getReader();
+  if (!reader) return;
+  const abort = () => reader.cancel().catch(() => undefined);
+  signal?.addEventListener("abort", abort, { once: true });
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const chunk = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const lines = chunk.split("\n");
+        const data = lines.filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+        const id = lines.find((line) => line.startsWith("id:"))?.slice(3).trim();
+        const type = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
+        if (data) {
+          try {
+            const event = JSON.parse(data);
+            yield type ? { id, type, data: event } : event;
+          } catch { /* ponytail: skip non-JSON SSE frames */ }
+        }
+        boundary = buffer.indexOf("\n\n");
+      }
+    }
+  } finally {
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+function abortable(operation, signal) {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const settle = (callback, value) => {
+      signal.removeEventListener("abort", abort);
+      callback(value);
+    };
+    const abort = () => settle(reject, signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    Promise.resolve(operation).then((value) => settle(resolve, value), (error) => settle(reject, error));
   });
 }
 
