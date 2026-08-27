@@ -651,9 +651,10 @@ test("interaction registry uses Block Kit selectors in Slack", async () => {
   const radio = posted[0].blocks.find((block) => block.type === "actions").elements[0];
   assert.equal(radio.type, "radio_buttons");
   await actionHandler({ actionId: radio.action_id, value: radio.options[0].value, user: { fullName: "lola" }, thread });
-  const firstSubmit = posted[0].blocks.at(-1).elements.find((element) => element.action_id.startsWith("pipa_submit_"));
+  assert.equal(updated.length, 0);
+  const firstSubmit = slackAction(posted[0], "pipa_submit_");
   await actionHandler({ actionId: firstSubmit.action_id, value: firstSubmit.value, user: { fullName: "lola" }, thread });
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await waitFor(() => updated.length === 1);
   const checkbox = updated[0].blocks.find((block) => block.type === "actions" && block.elements[0].type === "checkboxes").elements[0];
   assert.equal(checkbox.type, "checkboxes");
   await actionHandler({ actionId: checkbox.action_id, raw: { actions: [{ action_id: checkbox.action_id, selected_options: checkbox.options }] }, user: { fullName: "lola" }, thread });
@@ -882,9 +883,10 @@ test("another user can answer an active question", async () => {
     thread,
     messageId: "msg_1",
   });
+  assert.equal(resolvedDecision, null);
   const submit = slackAction(posts[0], "pipa_submit_");
   await actionHandler({ actionId: submit.action_id, value: submit.value, user: { userId: "U2" }, thread, messageId: "msg_1" });
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await waitFor(() => resolvedDecision);
   assert.deepEqual(resolvedDecision, { type: "answer", answers: [["X"]] });
 });
 

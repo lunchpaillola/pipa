@@ -244,12 +244,10 @@ function createPendingInteractions() {
       return;
     }
     if (entry.type !== "question") return;
-    const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
     if (event.actionId?.startsWith("pipa_select_")) {
       const answers = selectedAnswers(event);
       if (!answers.length) return;
       entry.answers[entry.questionIndex] = answers;
-      if (!question.multiple) advance(entry, event.user);
       return;
     }
     if (event.actionId?.startsWith("pipa_submit_")) {
