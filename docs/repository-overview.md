@@ -8,8 +8,8 @@ Pipa is a Node.js command-line application with Socket and Managed profile modes
 2. During initialization, `src/app.mjs` validates OpenCode and Slack credentials, then `src/state.mjs` saves the configuration and generated Slack manifest under `~/.pipa`.
 3. During Socket Mode startup, `src/app.mjs` health-checks `PIPA_OPENCODE_ATTACH_URL` or starts one owned OpenCode server on loopback port `0`, then creates the Slack connection and restores previously subscribed Slack threads from `~/.pipa/sessions.json`. During Managed startup, `src/opencode.mjs` starts one `opencode serve` child with the profile's working directory, hostname, and port.
 4. A mention or thread reply, including any attachments, is queued per Slack thread. Different threads can run concurrently, but messages in one thread run in order.
-5. `src/opencode.mjs` downloads attachments through Chat SDK into a temporary directory, sends the prompt, Slack context, and native file parts through OpenCode's session API, and polls authoritative status and message endpoints until completion. It removes temporary files after terminal state and returns the final assistant text and session ID.
-6. `src/app.mjs` saves the session ID, posts the response back to Slack in safe-sized chunks, and updates the message reaction.
+5. `src/opencode.mjs` downloads attachments through Chat SDK into a temporary directory, subscribes to OpenCode's authenticated event feed, then sends the prompt, Slack context, and native file parts through the session API. Assistant text events feed a bounded output stream while status and message endpoints remain authoritative for terminal state and final transcript reconciliation.
+6. `src/app.mjs` streams that output through Chat SDK in ordered segments of at most 3,500 characters, saves a successful session ID independently of Slack delivery, waits for delivery and cleanup before releasing the thread queue, and updates the message reaction.
 
 ## Files and folders
 
@@ -35,22 +35,22 @@ Long-form repository documentation.
 
 Repository maintenance and release checks that are not part of the installed runtime.
 
-- `scripts/pack-smoke.mjs`: Tests the package users will actually receive. It packs and installs the archive in a temporary directory, verifies version, Local initialization, and cancellation, then starts a Managed profile with a fake OpenCode executable that checks arguments, working directory, and inherited environment without Slack credentials. It removes the temporary artifact when finished.
+- `scripts/pack-smoke.mjs`: Tests the package users will actually receive. It packs and installs the archive in a temporary directory, verifies version, the progressive OpenCode executor contract, Local initialization, and cancellation, then starts a Managed profile with a fake OpenCode executable that checks arguments, working directory, and inherited environment without Slack credentials. It removes the temporary artifact when finished.
 
 ### `src/`
 
 The application implementation.
 
-- `src/app.mjs`: Coordinates Slack, OpenCode, and persisted sessions. `initializePipa` validates input and credentials before saving configuration. `startPipa` creates the Slack adapter, restores thread subscriptions, filters unsupported messages, enforces the 100 MB per-file limit, sends prompts and attachment descriptors to OpenCode, posts responses, shows progress reactions, and handles startup and shutdown timeouts. `createConversationRunner` serializes work within each thread while allowing separate threads to run concurrently.
-- `src/opencode.mjs`: Owns OpenCode server selection, the native session HTTP client, and child-process boundaries. Socket Mode health-checks an explicit attached server without owning it, or starts one private loopback server on an ephemeral port. Managed mode starts the configured server-only profile. Both owned modes inherit the runtime environment except Slack credentials. The module also handles attachment staging, status/message reconciliation, timeouts, exit propagation, and child termination. Windows process termination uses `taskkill` so descendant processes are also stopped.
+- `src/app.mjs`: Coordinates Slack, OpenCode, and persisted sessions. `initializePipa` validates input and credentials before saving configuration. `startPipa` creates the Slack adapter, restores thread subscriptions, filters unsupported messages, enforces the 100 MB per-file limit, streams bounded responses without a placeholder, shows progress reactions, and handles startup and shutdown timeouts. `createConversationRunner` serializes execution, persistence, delivery, and cleanup within each thread while allowing separate threads to run concurrently.
+- `src/opencode.mjs`: Owns OpenCode server selection, the native session HTTP and event clients, and child-process boundaries. Socket Mode health-checks an explicit attached server without owning it, or starts one private loopback server on an ephemeral port. Managed mode starts the configured server-only profile. Both owned modes inherit the runtime environment except Slack credentials. The module also handles progressive assistant-text filtering, final transcript reconciliation, attachment staging, timeouts, exit propagation, and child termination. Windows process termination uses `taskkill` so descendant processes are also stopped.
 - `src/state.mjs`: Owns local state and the Slack app manifest. It defaults profiles without `slackMode` to `socket`, validates shared and mode-specific fields, writes private JSON files atomically, loads sessions, serializes session writes, and uses a lock file to prevent two Pipa instances from controlling the same local state.
 
 ### `test/`
 
 Tests run by Node's built-in test runner through `npm test`.
 
-- `test/app.test.mjs`: Tests application orchestration: safe initialization, Slack token error handling, per-thread queueing, session continuity, attachment routing and limits, Slack filtering and delivery, reactions, secret redaction, chunked responses, and startup and shutdown cleanup.
-- `test/opencode.test.mjs`: Tests owned and attached server selection, authentication, native session completion, stale-session recovery, attachment cleanup, secret removal, timeout behavior, and cross-platform child lifecycle.
+- `test/app.test.mjs`: Tests application orchestration: safe initialization, Slack token error handling, per-thread queueing, session continuity, attachment routing and limits, Slack filtering and streaming delivery, reactions, secret redaction, partial failures, and startup and shutdown cleanup.
+- `test/opencode.test.mjs`: Tests owned and attached server selection, authentication, progressive assistant output, final transcript reconciliation, native session completion, stale-session recovery, attachment cleanup, secret removal, timeout behavior, and cross-platform child lifecycle.
 - `test/state.test.mjs`: Tests state management: Socket and Managed profile validation, Slack manifest generation, private file permissions, separate configuration and session storage, malformed state errors, recovery after failed writes, and single-instance locking.
 
 ### Root files

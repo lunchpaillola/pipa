@@ -41,7 +41,7 @@ pipa init
 pipa start
 ```
 
-Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. Pipa starts one OpenCode server bound to `127.0.0.1` on an operating-system-assigned port and reuses it for every Slack turn. Port `0` asks the operating system for an available port; no port configuration is required. Pipa replies in a thread, and follow-up messages in that thread reuse the same OpenCode session without another mention. Messages can include up to Slack's 10-file limit, with a maximum size of 100 MB per file. Attachments require a text prompt and are copied to a temporary directory only for the duration of the turn.
+Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. Pipa starts one OpenCode server bound to `127.0.0.1` on an operating-system-assigned port and reuses it for every Slack turn. Port `0` asks the operating system for an available port; no port configuration is required. Pipa streams assistant text into the Slack thread as OpenCode produces it, then reconciles the completed transcript before the next message in that thread can run. Follow-up messages reuse the same OpenCode session without another mention. Messages can include up to Slack's 10-file limit, with a maximum size of 100 MB per file. Attachments require a text prompt and are copied to a temporary directory only for the duration of the turn.
 
 ### Access control
 

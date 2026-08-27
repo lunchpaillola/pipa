@@ -42,6 +42,7 @@ export async function startPipa(options = {}) {
       }),
     },
     concurrency: "concurrent",
+    fallbackStreamingPlaceholderText: null,
     state,
     userName: config.botName,
   });
@@ -59,7 +60,7 @@ export async function startPipa(options = {}) {
     await withTimeout(server?.wait(), options.shutdownTimeoutMs ?? 15_000, "OpenCode shutdown timed out.").catch(() => undefined);
     throw error;
   }
-  const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn });
+  const runner = createConversationRunner({ sessionStore, runTurn: executor.startTurn ?? executor.runTurn });
   let accepting = true;
   const interactions = createPendingInteractions();
   chat.onAction?.(interactions.onAction);
@@ -89,10 +90,11 @@ export async function startPipa(options = {}) {
         onInteraction: (interaction) => interactions.onInteraction(interactionContext, interaction),
         onPermissionReplied: interactions.onPermissionReplied,
         onPermissionsReconciled: interactions.onPermissionsReconciled,
-        deliver: (text) => postInChunks(thread, text),
+        deliver: (response) => typeof response === "string" ? postInChunks(thread, response) : postInStreams(thread, response),
         deliverFailure: (error) => thread.post(error instanceof PipaStoppedError
           ? `${config.botName} stopped before finishing this request.`
           : `${config.botName} failed: ${safeError(error)}`),
+        deliverIncomplete: () => thread.post(`${config.botName} could not finish this response.`),
       });
       await finishReaction(thread, message, result.error instanceof PipaStoppedError ? null : result.error ? "warning" : "white_check_mark");
     } catch (error) {
@@ -438,15 +440,40 @@ export function createConversationRunner({ sessionStore, runTurn }) {
     if (closed) return Promise.reject(closeReason);
     const previous = tails.get(conversationKey) ?? Promise.resolve();
     const current = previous.catch(() => undefined).then(async () => {
-      const { deliver, deliverFailure, ...turn } = input;
+      const { deliver, deliverFailure, deliverIncomplete, ...turn } = input;
       let result;
       try {
         if (closed) throw closeReason;
-        result = await runTurn({ ...turn, sessionId: sessionStore.get(conversationKey) });
+        const started = runTurn({ ...turn, sessionId: sessionStore.get(conversationKey) });
+        if (started?.output && started?.completion) {
+          let outputSeen = false;
+          let deliveryError;
+          const trackedOutput = trackOutput(started.output, () => { outputSeen = true; });
+          const delivery = Promise.resolve().then(() => deliver ? deliver(trackedOutput) : drainOutput(trackedOutput)).catch(async (error) => {
+            deliveryError = error;
+            await drainOutput(started.output).catch(() => undefined);
+          });
+          let executionError;
+          result = await Promise.resolve(started.completion).catch((error) => { executionError = error; });
+          let persistenceError;
+          if (result?.sessionId) await Promise.resolve().then(() => sessionStore.set(conversationKey, result.sessionId)).catch((error) => { persistenceError = error; });
+          await delivery;
+          const turnError = executionError ?? persistenceError;
+          if (turnError) {
+            const notify = executionError && outputSeen && deliverIncomplete
+              ? () => deliverIncomplete()
+              : deliverFailure ? () => deliverFailure(turnError) : null;
+            if (!notify) throw turnError;
+            await Promise.resolve().then(notify).catch(() => undefined);
+            return { ...result, error: turnError };
+          }
+          return deliveryError ? { ...result, error: deliveryError } : result;
+        }
+        result = await started;
         if (result.sessionId) await sessionStore.set(conversationKey, result.sessionId);
       } catch (error) {
         if (deliverFailure) {
-          await deliverFailure(error);
+          await Promise.resolve().then(() => deliverFailure(error)).catch(() => undefined);
           return { error };
         }
         throw error;
@@ -549,6 +576,53 @@ async function postInChunks(thread, text) {
   for (let index = 0; index < text.length; index += 3500) {
     await thread.post({ markdown: text.slice(index, index + 3500) });
   }
+}
+
+export async function postInStreams(thread, output) {
+  for await (const segment of boundedStreams(output, 3500)) await thread.post(segment);
+}
+
+async function* boundedStreams(source, limit) {
+  const iterator = source[Symbol.asyncIterator]();
+  let pending = "";
+  while (true) {
+    if (!pending) {
+      const next = await iterator.next();
+      if (next.done) return;
+      pending = String(next.value);
+    }
+    yield {
+      async *[Symbol.asyncIterator]() {
+        let length = 0;
+        while (length < limit) {
+          if (!pending) {
+            const next = await iterator.next();
+            if (next.done) return;
+            pending = String(next.value);
+          }
+          const chunk = pending.slice(0, limit - length);
+          pending = pending.slice(chunk.length);
+          length += chunk.length;
+          if (chunk) yield chunk;
+        }
+      },
+    };
+  }
+}
+
+function trackOutput(source, onOutput) {
+  return {
+    async *[Symbol.asyncIterator]() {
+      for await (const chunk of source) {
+        onOutput();
+        yield chunk;
+      }
+    },
+  };
+}
+
+async function drainOutput(source) {
+  for await (const _ of source) { /* drain */ }
 }
 
 async function react(thread, message, emoji) {

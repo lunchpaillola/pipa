@@ -3,7 +3,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { checkSlackAppToken, checkSlackToken, createConversationRunner, initializePipa, startPipa } from "../src/app.mjs";
+import { checkSlackAppToken, checkSlackToken, createConversationRunner, initializePipa, postInStreams, startPipa } from "../src/app.mjs";
 import { PipaStoppedError } from "../src/opencode.mjs";
 import { createSessionStore, pipaPaths } from "../src/state.mjs";
 
@@ -235,6 +235,132 @@ test("conversation tail preserves Slack delivery order", async () => {
   releaseDelivery();
   await Promise.all([first, second]);
   assert.deepEqual(events, ["run:one", "deliver:one", "run:two", "deliver:two"]);
+});
+
+test("conversation runner streams before completion and persists despite delivery failure", async () => {
+  const events = [];
+  const output = {
+    index: 0,
+    [Symbol.asyncIterator]() { return this; },
+    async next() {
+      if (this.index === 0) { this.index += 1; events.push("output:first"); return { value: "first", done: false }; }
+      if (this.index === 1) { this.index += 1; await new Promise((resolve) => setImmediate(resolve)); events.push("output:second"); return { value: "second", done: false }; }
+      return { done: true };
+    },
+  };
+  const runner = createConversationRunner({
+    sessionStore: { get: () => null, async set(_, sessionId) { events.push(`save:${sessionId}`); } },
+    runTurn: () => ({
+      output,
+      completion: new Promise((resolve) => setTimeout(() => resolve({ text: "firstsecond", sessionId: "ses_1" }), 5)),
+    }),
+  });
+
+  const turn = runner.enqueue("A", {
+    prompt: "one",
+    deliver: async (stream) => {
+      for await (const text of stream) {
+        events.push(`deliver:${text}`);
+        throw new Error("Slack failed");
+      }
+    },
+  });
+  await waitFor(() => events.includes("deliver:first"));
+  const result = await turn;
+  assert.equal(result.sessionId, "ses_1");
+  assert.match(result.error.message, /Slack failed/u);
+  assert.ok(events.indexOf("deliver:first") < events.indexOf("save:ses_1"));
+  assert.ok(events.includes("output:second"), "remaining output should be drained");
+});
+
+test("conversation runner drains delivery before releasing a tail when persistence fails", async () => {
+  const events = [];
+  let releaseDelivery;
+  const runner = createConversationRunner({
+    sessionStore: {
+      get: () => null,
+      async set(_, sessionId) {
+        events.push(`save:${sessionId}`);
+        if (sessionId === "ses_one") throw new Error("save failed");
+      },
+    },
+    runTurn: ({ prompt }) => prompt === "one" ? {
+      output: (async function* () { yield "partial"; })(),
+      completion: Promise.resolve({ text: "partial", sessionId: "ses_one" }),
+    } : Promise.resolve({ text: "two" }),
+  });
+
+  const first = runner.enqueue("A", {
+    prompt: "one",
+    deliver: async (stream) => {
+      for await (const text of stream) events.push(`deliver:${text}`);
+      await new Promise((resolve) => releaseDelivery = resolve);
+      events.push("delivery:settled");
+    },
+    deliverFailure: async () => {
+      events.push("failure:attempted");
+      throw new Error("notification failed");
+    },
+    deliverIncomplete: async () => events.push("incomplete:attempted"),
+  });
+  const second = runner.enqueue("A", { prompt: "two", deliver: async () => events.push("deliver:two") });
+
+  await waitFor(() => events.includes("save:ses_one") && releaseDelivery);
+  assert.equal(events.includes("failure:attempted"), false);
+  assert.equal(events.includes("deliver:two"), false);
+  releaseDelivery();
+  assert.match((await first).error.message, /save failed/u);
+  await second;
+  assert.equal(events.filter((event) => event === "failure:attempted").length, 1);
+  assert.equal(events.includes("incomplete:attempted"), false);
+  assert.ok(events.indexOf("delivery:settled") < events.indexOf("failure:attempted"));
+  assert.ok(events.indexOf("failure:attempted") < events.indexOf("deliver:two"));
+});
+
+test("conversation runner distinguishes failures before and after streamed output", async () => {
+  const failures = [];
+  const incomplete = [];
+  let calls = 0;
+  const runner = createConversationRunner({
+    sessionStore: { get: () => null, set: async () => undefined },
+    runTurn: () => {
+      calls += 1;
+      if (calls === 1) return {
+        output: (async function* () {})(),
+        completion: Promise.reject(new Error("before")),
+      };
+      return {
+        output: (async function* () { yield "partial"; throw new Error("after"); })(),
+        completion: Promise.reject(new Error("after")),
+      };
+    },
+  });
+  const input = {
+    deliver: async (stream) => { for await (const _ of stream) { /* consume */ } },
+    deliverFailure: async (error) => { failures.push(error.message); throw new Error("failure notification rejected"); },
+    deliverIncomplete: async () => { incomplete.push("incomplete"); throw new Error("incomplete notification rejected"); },
+  };
+
+  assert.equal((await runner.enqueue("A", { ...input, prompt: "before" })).error.message, "before");
+  assert.equal((await runner.enqueue("A", { ...input, prompt: "after" })).error.message, "after");
+  assert.deepEqual(failures, ["before"]);
+  assert.deepEqual(incomplete, ["incomplete"]);
+});
+
+test("streaming delivery creates ordered messages bounded to 3500 characters", async () => {
+  const posts = [];
+  await postInStreams({
+    async post(stream) {
+      let text = "";
+      for await (const chunk of stream) text += chunk;
+      posts.push(text);
+    },
+  }, (async function* () {
+    yield "a".repeat(3499);
+    yield "b".repeat(3502);
+  })());
+  assert.deepEqual(posts.map((text) => text.length), [3500, 3500, 1]);
+  assert.equal(posts.join(""), "a".repeat(3499) + "b".repeat(3502));
 });
 
 test("Slack composition subscribes mentions, restores sessions, and ignores unsupported traffic", async () => {

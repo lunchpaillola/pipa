@@ -20,6 +20,8 @@ try {
   const installedRoot = path.join(directory, "install", "node_modules", "@usepipa", "pipa");
   const packedRuntime = await import(pathToFileURL(path.join(installedRoot, "src", "opencode.mjs")).href);
   if (typeof packedRuntime.createOpenCodeExecutor !== "function") throw new Error("Packed OpenCode executor is unavailable.");
+  const packedExecutor = packedRuntime.createOpenCodeExecutor({ baseUrl: "http://localhost:5555" });
+  if (typeof packedExecutor.startTurn !== "function") throw new Error("Packed progressive OpenCode executor is unavailable.");
 
   const home = path.join(directory, "home");
   const workingDirectory = path.join(directory, "work");

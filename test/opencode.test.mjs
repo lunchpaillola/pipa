@@ -193,6 +193,236 @@ test("does not complete until both the session is idle and a new assistant messa
   assert.ok(messageReads >= 3);
 });
 
+test("streams only new assistant text before idle and reconciles missed text", async () => {
+  let idle = false;
+  let prompted = false;
+  const events = [
+    ": connected\r\n\r\n",
+    `data: ${JSON.stringify({ type: "message.updated", properties: { info: { id: "new", sessionID: "ses_1", role: "assistant" } } })}\r\n\r\n`,
+    `data: ${JSON.stringify({ type: "message.updated", properties: { info: { id: "other", sessionID: "ses_2", role: "assistant" } } })}\r\n\r\n`,
+    `data: ${JSON.stringify({ type: "message.part.updated", properties: { part: { id: "reason", messageID: "new", sessionID: "ses_1", type: "reasoning", text: "hidden" } } })}\r\n\r\n`,
+    `data: ${JSON.stringify({ type: "message.part.updated", properties: { part: { id: "text_1", messageID: "new", sessionID: "ses_1", type: "text", text: "Hel" } } })}\r\n\r\n`,
+    `data: ${JSON.stringify({ type: "message.part.updated", properties: { part: { id: "text_1", messageID: "new", sessionID: "ses_1", type: "text", text: "Hel" } } })}\r\n\r\n`,
+    `data: ${JSON.stringify({ type: "message.part.updated", properties: { part: { id: "text_1", messageID: "new", sessionID: "ses_1", type: "text", text: "Hello" } } }).replace(",\"properties\"", ",\r\ndata: \"properties\"")}\r\n\r\n`,
+    `data: ${JSON.stringify({ type: "message.part.updated", properties: { part: { id: "text_2", messageID: "new", sessionID: "ses_1", type: "text" }, delta: "wor" } })}\r\n\r\n`,
+  ];
+  const fetch = async (url, init = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/event") {
+      assert.equal(init.headers.authorization, `Basic ${Buffer.from("pipa:secret").toString("base64")}`);
+      return new Response(new ReadableStream({
+        start(controller) {
+          for (const event of events) {
+            const bytes = new TextEncoder().encode(event);
+            controller.enqueue(bytes.slice(0, 7));
+            controller.enqueue(bytes.slice(7));
+          }
+          controller.close();
+        },
+      }), { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+    if (pathname === "/session/status") return jsonResponse({ ses_1: { type: !prompted || idle ? "idle" : "busy" } });
+    if (pathname === "/session/ses_1/message") return jsonResponse(prompted ? [{
+      info: { id: "new", role: "assistant", time: { completed: 1 } },
+      parts: [{ id: "text_1", type: "text", text: "Hello" }, { id: "text_2", type: "text", text: "world" }],
+    }, {
+      info: { id: "new_2", role: "assistant", time: { completed: 2 } },
+      parts: [{ id: "text_3", type: "text", text: "again" }],
+    }] : [{ info: { id: "old", role: "assistant" }, parts: [{ id: "old_text", type: "text", text: "old" }] }]);
+    if (pathname.endsWith("/prompt_async")) { prompted = true; return new Response(null, { status: 204 }); }
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+  const executor = createOpenCodeExecutor({
+    baseUrl: "http://localhost:5555",
+    environment: { OPENCODE_SERVER_USERNAME: "pipa", OPENCODE_SERVER_PASSWORD: "secret" },
+    fetch,
+    pollIntervalMs: 1,
+  });
+
+  const turn = executor.startTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" });
+  const iterator = turn.output[Symbol.asyncIterator]();
+  assert.equal((await iterator.next()).value, "Hel");
+  assert.equal((await iterator.next()).value, "lo");
+  assert.equal((await iterator.next()).value, "\nwor");
+  let completed = false;
+  void turn.completion.finally(() => { completed = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(completed, false);
+  idle = true;
+  assert.equal((await iterator.next()).value, "ld\nagain");
+  assert.equal((await iterator.next()).done, true);
+  assert.deepEqual(await turn.completion, { text: "Hello\nworld\nagain", sessionId: "ses_1" });
+});
+
+test("suspends progressive output after disconnect and reconciles the missing middle in order", async () => {
+  let prompted = false;
+  let eventConnections = 0;
+  let secondEventDelivered = false;
+  const eventResponse = (items, onStart) => new Response(new ReadableStream({
+    start(controller) {
+      onStart?.();
+      for (const item of items) controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(item)}\n\n`));
+      controller.close();
+    },
+  }), { status: 200 });
+  const fetch = async (url, init = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/event") {
+      eventConnections += 1;
+      return eventConnections === 1 ? eventResponse([
+        { type: "message.updated", properties: { info: { id: "new", sessionID: "ses_1", role: "assistant" } } },
+        { type: "message.part.updated", properties: { part: { id: "first", messageID: "new", sessionID: "ses_1", type: "text", text: "A" } } },
+      ]) : eventResponse([
+        { type: "message.part.updated", properties: { part: { id: "later", messageID: "new", sessionID: "ses_1", type: "text", text: "C" } } },
+      ], () => { secondEventDelivered = true; });
+    }
+    if (pathname === "/session/status") return jsonResponse({ ses_1: { type: !prompted || secondEventDelivered ? "idle" : "busy" } });
+    if (pathname === "/session/ses_1/message") return jsonResponse(prompted && secondEventDelivered ? [{
+      info: { id: "new", role: "assistant", time: { completed: 1 } },
+      parts: [{ id: "first", type: "text", text: "AB" }, { id: "later", type: "text", text: "C" }],
+    }] : []);
+    if (pathname.endsWith("/prompt_async")) { prompted = true; return new Response(null, { status: 204 }); }
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+  const turn = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 }).startTurn({ prompt: "go", sessionId: "ses_1" });
+  const chunks = [];
+  for await (const chunk of turn.output) chunks.push(chunk);
+
+  assert.deepEqual(await turn.completion, { text: "AB\nC", sessionId: "ses_1" });
+  assert.equal(chunks.join(""), "AB\nC");
+  assert.deepEqual(chunks, ["A", "B\nC"]);
+});
+
+test("startTurn closes partial output normally when execution fails", async () => {
+  let prompted = false;
+  let streamCancelled = false;
+  let temporaryFile;
+  const fetch = async (url, init = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/event") return new Response(new ReadableStream({
+      start(controller) {
+        for (const item of [
+          { type: "message.updated", properties: { info: { id: "new", sessionID: "ses_1", role: "assistant" } } },
+          { type: "message.part.updated", properties: { part: { id: "text", messageID: "new", sessionID: "ses_1", type: "text", text: "partial" } } },
+        ]) controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(item)}\n\n`));
+      },
+      async cancel() {
+        streamCancelled = true;
+        await access(temporaryFile);
+      },
+    }), { status: 200 });
+    if (pathname === "/session/status") return jsonResponse({ ses_1: { type: prompted ? "failed" : "idle" } });
+    if (pathname === "/session/ses_1/message") return jsonResponse([]);
+    if (pathname.endsWith("/prompt_async")) {
+      prompted = true;
+      temporaryFile = new URL(JSON.parse(init.body).parts[1].url);
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+  const turn = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 }).startTurn({
+    prompt: "go",
+    sessionId: "ses_1",
+    attachments: [{ name: "notes.txt", fetchData: async () => Buffer.from("notes") }],
+  });
+  let text = "";
+  for await (const chunk of turn.output) text += chunk;
+
+  assert.equal(text, "partial");
+  await assert.rejects(turn.completion, /failed to complete/u);
+  assert.equal(streamCancelled, true, "watcher cancellation must finish before completion rejects");
+  await assert.rejects(access(temporaryFile), "attachment cleanup must finish before completion rejects");
+});
+
+test("startTurn settles output and completion when the initial event subscription fails", async () => {
+  let prompted = false;
+  const turn = createOpenCodeExecutor({
+    baseUrl: "http://localhost:5555",
+    fetch: async (url) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/event") return new Response(null, { status: 503 });
+      if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+      if (pathname === "/session/ses_1/message") return jsonResponse([]);
+      if (pathname.endsWith("/prompt_async")) { prompted = true; return new Response(null, { status: 204 }); }
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  }).startTurn({ prompt: "go", sessionId: "ses_1" });
+
+  await assert.rejects(turn.completion, /status 503/u);
+  for await (const _ of turn.output) { /* drain */ }
+  assert.equal(prompted, false);
+});
+
+test("rejects an oversized unterminated SSE frame and closes output normally", async () => {
+  let prompted = false;
+  const executor = createOpenCodeExecutor({
+    baseUrl: "http://localhost:5555",
+    maxOutputChars: 128,
+    pollIntervalMs: 1,
+    fetch: async (url, init = {}) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/event") return new Response(new ReadableStream({
+        start(controller) { controller.enqueue(new TextEncoder().encode("x".repeat(129))); },
+      }), { status: 200 });
+      if (pathname === "/session/status") return jsonResponse({ ses_1: { type: prompted ? "busy" : "idle" } });
+      if (pathname === "/session/ses_1/message") return jsonResponse([]);
+      if (pathname.endsWith("/prompt_async")) { prompted = true; return new Response(null, { status: 204 }); }
+      throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+    },
+  });
+  const turn = executor.startTurn({ prompt: "go", sessionId: "ses_1" });
+  const outcome = await Promise.race([
+    turn.completion.then(() => "resolved", (error) => error),
+    new Promise((resolve) => setTimeout(() => resolve("timed out"), 100)),
+  ]);
+  if (outcome === "timed out") executor.stopAll();
+
+  assert.notEqual(outcome, "timed out");
+  assert.match(outcome.message, /^OpenCode event stream frame exceeded the size limit\.$/u);
+  let output = "";
+  for await (const chunk of turn.output) output += chunk;
+  assert.equal(output, "");
+});
+
+test("stream overflow and shutdown settle output and completion", async () => {
+  const event = (text) => new Response(new ReadableStream({
+    start(controller) {
+      for (const item of [
+        { type: "message.updated", properties: { info: { id: "new", sessionID: "ses_1", role: "assistant" } } },
+        { type: "message.part.updated", properties: { part: { id: "text_1", messageID: "new", sessionID: "ses_1", type: "text", text } } },
+      ]) controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(item)}\n\n`));
+      controller.close();
+    },
+  }), { status: 200 });
+  const makeExecutor = (text) => {
+    let prompted = false;
+    return createOpenCodeExecutor({
+      baseUrl: "http://localhost:5555",
+      maxOutputChars: 5,
+      pollIntervalMs: 1,
+      fetch: async (url, init = {}) => {
+        const pathname = new URL(url).pathname;
+        if (pathname === "/event") return event(text);
+        if (pathname === "/session/status") return jsonResponse({ ses_1: { type: prompted ? "busy" : "idle" } });
+        if (pathname === "/session/ses_1/message") return jsonResponse([]);
+        if (pathname.endsWith("/prompt_async")) { prompted = true; return new Response(null, { status: 204 }); }
+        throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+      },
+    });
+  };
+
+  const overflow = makeExecutor("123456").startTurn({ prompt: "go", sessionId: "ses_1" });
+  await assert.rejects(overflow.completion, /output exceeded/u);
+  for await (const _ of overflow.output) { /* drain */ }
+
+  const stoppedExecutor = makeExecutor("ok");
+  const stopped = stoppedExecutor.startTurn({ prompt: "go", sessionId: "ses_1" });
+  await new Promise((resolve) => setImmediate(resolve));
+  stoppedExecutor.stopAll();
+  await assert.rejects(stopped.completion, (error) => error instanceof PipaStoppedError);
+  for await (const _ of stopped.output) { /* drain */ }
+});
+
 test("rejects prompt failures and aborts active requests during shutdown", async () => {
   const failed = createOpenCodeExecutor({
     baseUrl: "http://localhost:5555",
@@ -538,13 +768,20 @@ test("reports a rejected permission when OpenCode completes without text", async
     throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
   };
   const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 });
-  const result = await executor.runTurn({
+  const turn = executor.startTurn({
     prompt: "go",
     sessionId: "ses_1",
     workingDirectory: "/work",
     onInteraction: () => ({ type: "reject" }),
   });
+  const streamed = (async () => {
+    let text = "";
+    for await (const chunk of turn.output) text += chunk;
+    return text;
+  })();
+  const result = await turn.completion;
   assert.deepEqual(result, { text: "Stopped after a permission was rejected.", sessionId: "ses_1" });
+  assert.equal(await streamed, result.text);
 });
 
 test("stop rejects active request and aborts session", async () => {
@@ -613,8 +850,7 @@ test("event reading stops when turn completes", async () => {
   const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 });
   const result = await executor.runTurn({ prompt: "go", sessionId: "ses_1", workingDirectory: "/work", onInteraction: () => undefined });
   assert.equal(result.text, "done");
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  assert.ok(sseClosed, "SSE stream should be closed after turn completes");
+  assert.ok(sseClosed, "SSE watcher must terminate before the turn completes");
 });
 
 test("does not report fatal for non-fatal interaction settlement errors", async () => {

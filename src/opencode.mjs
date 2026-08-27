@@ -79,6 +79,7 @@ export function createOpenCodeExecutor(options = {}) {
   const timeoutMs = options.timeoutMs ?? 2.5 * 60 * 60 * 1000;
   const requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
   const pollIntervalMs = options.pollIntervalMs ?? 1_000;
+  const maxOutputChars = options.maxOutputChars ?? 10 * 1024 * 1024;
   const useDataUrls = !isLoopbackUrl(baseUrl);
   const active = new Set();
   let stopReason;
@@ -118,7 +119,23 @@ export function createOpenCodeExecutor(options = {}) {
     }
   }
 
-  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [], onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
+  function startTurn(input) {
+    const output = asyncChannel();
+    const completion = executeTurn(input, output).then((result) => {
+      output.close();
+      return result;
+    }, (error) => {
+      output.close();
+      throw error;
+    });
+    return { output, completion };
+  }
+
+  function runTurn(input) {
+    return executeTurn(input);
+  }
+
+  async function executeTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [], onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }, output) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     if (stopReason) throw stopReason;
     const temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
@@ -130,6 +147,7 @@ export function createOpenCodeExecutor(options = {}) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(new Error(`OpenCode timed out after ${timeoutMs}ms.`)), timeoutMs);
       active.add(controller);
+      let watcher;
 
       try {
         let selectedSessionId = sessionId;
@@ -141,7 +159,7 @@ export function createOpenCodeExecutor(options = {}) {
               if (status !== "busy" && status !== "retry") break;
               await delay(pollIntervalMs, controller.signal);
             }
-            messages = await request(`/session/${encodeURIComponent(selectedSessionId)}/message?limit=1`, { method: "GET" }, workingDirectory, controller);
+            messages = await request(`/session/${encodeURIComponent(selectedSessionId)}/message?limit=100`, { method: "GET" }, workingDirectory, controller);
           } catch (error) {
             if (!(error instanceof OpenCodeRequestError) || error.status !== 404) throw error;
             selectedSessionId = null;
@@ -157,13 +175,15 @@ export function createOpenCodeExecutor(options = {}) {
         await onSession?.(selectedSessionId);
 
         const baseline = new Set(messages.map((message) => message?.info?.id).filter(Boolean));
+        const assistantStream = output && createAssistantStream(selectedSessionId, baseline, output, maxOutputChars, controller);
         let dismissed = false;
         let permissionRejected = false;
-        if (onInteraction) {
-          const watcher = watchInteractions({
+        if (onInteraction || assistantStream) {
+          watcher = watchInteractions({
             baseUrl,
             fetchImpl,
             headers,
+            maxBufferChars: maxOutputChars,
             requestTimeoutMs,
             sessionId: selectedSessionId,
             workingDirectory,
@@ -173,6 +193,8 @@ export function createOpenCodeExecutor(options = {}) {
             onPermissionsReconciled,
             onPermissionRejected: () => { permissionRejected = true; },
             onDismiss: () => { dismissed = true; },
+            onDisconnect: assistantStream?.suspend,
+            onEvent: assistantStream?.accept,
             requestTurn: request,
           });
           await watcher.ready;
@@ -184,23 +206,29 @@ export function createOpenCodeExecutor(options = {}) {
 
         while (true) {
           const [currentMessages, statuses] = await Promise.all([
-            request(`/session/${encodeURIComponent(selectedSessionId)}/message?limit=1`, { method: "GET" }, workingDirectory, controller),
+            request(`/session/${encodeURIComponent(selectedSessionId)}/message?limit=100`, { method: "GET" }, workingDirectory, controller),
             request("/session/status", { method: "GET" }, workingDirectory, controller),
           ]);
-          const finalMessage = latestAssistantMessage(currentMessages, baseline);
+          const transcript = assistantTranscript(currentMessages, baseline);
           const status = statuses?.[selectedSessionId]?.type;
           if (dismissed && status !== "busy" && status !== "retry") return { text: "", sessionId: selectedSessionId };
-          if (["error", "failed", "cancelled"].includes(status) || finalMessage?.error) throw new Error("OpenCode failed to complete the turn.");
-          if (finalMessage && (status === "idle" || (!status && finalMessage.completed))) {
-            if (!finalMessage.text && permissionRejected) return { text: "Stopped after a permission was rejected.", sessionId: selectedSessionId };
-            if (!finalMessage.text) throw new Error("OpenCode completed without assistant text.");
-            return { text: finalMessage.text, sessionId: selectedSessionId };
+          if (["error", "failed", "cancelled"].includes(status) || transcript?.error) throw new Error("OpenCode failed to complete the turn.");
+          if (transcript && (status === "idle" || (!status && transcript.completed))) {
+            if (!transcript.text && permissionRejected) {
+              const text = "Stopped after a permission was rejected.";
+              assistantStream?.reconcile(text);
+              return { text, sessionId: selectedSessionId };
+            }
+            if (!transcript.text) throw new Error("OpenCode completed without assistant text.");
+            assistantStream?.reconcile(transcript.text);
+            return { text: transcript.text, sessionId: selectedSessionId };
           }
           await delay(pollIntervalMs, controller.signal);
         }
       } finally {
         clearTimeout(timer);
         controller.abort(new Error("OpenCode turn completed."));
+        await watcher?.done.catch(() => undefined);
         active.delete(controller);
       }
     } catch (error) {
@@ -221,6 +249,7 @@ export function createOpenCodeExecutor(options = {}) {
 
   return {
     runTurn,
+    startTurn,
     stopAll(reason = new PipaStoppedError()) {
       stopReason ??= reason;
       for (const controller of active) controller.abort(stopReason);
@@ -328,21 +357,71 @@ function promptBody(prompt, files, contextEnvironment) {
   };
 }
 
-function latestAssistantMessage(messages, baseline) {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (!message?.info?.id || baseline.has(message.info.id) || message.info.role !== "assistant") continue;
-    return {
-      completed: typeof message.info.time?.completed === "number",
-      error: message.info.error,
-      text: message.parts
-        .filter((part) => part.type === "text" && typeof part.text === "string" && part.text)
-        .map((part) => part.text)
-        .join("\n")
-        .trim(),
-    };
-  }
-  return null;
+function assistantTranscript(messages, baseline) {
+  const assistantMessages = messages.filter((message) => message?.info?.id && !baseline.has(message.info.id) && message.info.role === "assistant");
+  if (!assistantMessages.length) return null;
+  return {
+    completed: assistantMessages.every((message) => typeof message.info.time?.completed === "number"),
+    error: assistantMessages.find((message) => message.info.error)?.info.error,
+    text: assistantMessages.flatMap((message) => message.parts
+      .filter((part) => part.type === "text" && typeof part.text === "string" && part.text)
+      .map((part) => part.text)).join("\n").trim(),
+  };
+}
+
+function eventProperties(event) {
+  return event.properties && typeof event.properties === "object" ? event.properties : event.data && typeof event.data === "object" ? event.data : event;
+}
+
+function createAssistantStream(sessionId, baseline, output, maxOutputChars, controller) {
+  const messages = new Map();
+  let emitted = "";
+  let suspended = false;
+
+  const emit = (text) => {
+    if (text.length > maxOutputChars) {
+      const error = new Error(`OpenCode output exceeded ${maxOutputChars} characters.`);
+      controller.abort(error);
+      throw error;
+    }
+    if (!text.startsWith(emitted)) return;
+    const suffix = text.slice(emitted.length);
+    emitted = text;
+    if (suffix) output.push(suffix);
+  };
+
+  return {
+    accept(event) {
+      if (suspended) return;
+      const properties = eventProperties(event);
+      if (event.type === "message.updated") {
+        const info = properties?.info ?? properties?.message ?? properties;
+        const messageId = info?.id ?? info?.messageID ?? info?.messageId;
+        const eventSessionId = info?.sessionID ?? info?.sessionId;
+        if (eventSessionId === sessionId && messageId && !baseline.has(messageId) && info.role === "assistant" && !messages.has(messageId)) {
+          messages.set(messageId, new Map());
+        }
+        return;
+      }
+      if (event.type !== "message.part.updated") return;
+      const part = properties?.part ?? properties;
+      const eventSessionId = part?.sessionID ?? part?.sessionId ?? properties?.sessionID ?? properties?.sessionId;
+      const messageId = part?.messageID ?? part?.messageId;
+      const partId = part?.id ?? part?.partID ?? part?.partId;
+      const parts = messages.get(messageId);
+      if (eventSessionId !== sessionId || !parts || !partId || part.type !== "text") return;
+      const previous = parts.get(partId) ?? "";
+      const text = typeof part.text === "string" ? part.text : typeof properties?.delta === "string" ? previous + properties.delta : previous;
+      if (text === previous) return;
+      if (text.startsWith(previous)) parts.set(partId, text);
+      emit([...messages.values()].flatMap((items) => [...items.values()].filter(Boolean)).join("\n").trim());
+    },
+    suspend() { suspended = true; },
+    reconcile(text) {
+      if (!text.startsWith(emitted)) throw new Error("OpenCode streamed text did not match the completed transcript.");
+      emit(text);
+    },
+  };
 }
 
 function ownedServer(baseUrl, child, exit, platform) {
@@ -483,7 +562,7 @@ function delay(delayMs, signal) {
   });
 }
 
-function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sessionId, workingDirectory, controller, onInteraction, onPermissionReplied, onPermissionsReconciled, onPermissionRejected, onDismiss, requestTurn }) {
+function watchInteractions({ baseUrl, fetchImpl, headers, maxBufferChars, requestTimeoutMs, sessionId, workingDirectory, controller, onInteraction, onPermissionReplied, onPermissionsReconciled, onPermissionRejected, onDismiss, onDisconnect, onEvent, requestTurn }) {
   const seenIds = new Set();
   const messages = new Map();
   const parents = new Map();
@@ -496,8 +575,9 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
     rejectReady = reject;
   });
   const dispatch = async (event) => {
+    if (!onInteraction) return;
     const type = event.type === "question.asked" ? "question" : event.type === "permission.asked" ? "permission" : null;
-    const properties = event.properties && typeof event.properties === "object" ? event.properties : event.data && typeof event.data === "object" ? event.data : event;
+    const properties = eventProperties(event);
     const interactionSessionId = properties?.sessionID ?? properties?.sessionId;
     const requestId = properties?.requestID ?? properties?.requestId ?? properties?.id;
     if (!type || (interactionSessionId !== sessionId && !await belongsToSession(interactionSessionId)) || !requestId || seenIds.has(`${type}:${requestId}`)) return;
@@ -534,6 +614,7 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
   };
 
   const reconcile = async () => {
+    if (!onInteraction) return;
     const permissions = await requestTurn("/permission", { method: "GET" }, workingDirectory, controller);
     const pending = (await Promise.all((permissions ?? []).map(async (permission) => {
       return await belongsToSession(permission?.sessionID) ? permission : null;
@@ -545,7 +626,7 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
     }
   };
 
-  void (async () => {
+  const done = (async () => {
     while (!controller.signal.aborted) {
       try {
         const url = serverUrl(baseUrl, "/event", workingDirectory);
@@ -559,9 +640,10 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
           subscribed = true;
           resolveReady();
         }
-        for await (const event of readServerSentEvents(response, controller.signal)) {
+        for await (const event of readServerSentEvents(response, controller.signal, maxBufferChars)) {
           if (controller.signal.aborted) return;
-          const properties = event.properties && typeof event.properties === "object" ? event.properties : event.data && typeof event.data === "object" ? event.data : event;
+          onEvent?.(event);
+          const properties = eventProperties(event);
           const interactionSessionId = properties?.sessionID ?? properties?.sessionId;
           if (event.type === "permission.replied" && (interactionSessionId === sessionId || await belongsToSession(interactionSessionId))) {
             onPermissionReplied?.({ sessionId: interactionSessionId, requestId: properties?.requestID ?? properties?.requestId, reply: properties?.reply });
@@ -570,19 +652,26 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
           }
           await dispatch(event);
         }
+        if (controller.signal.aborted) return;
+        onDisconnect?.();
         await reconcile();
         await delay(250, controller.signal).catch(() => undefined);
       } catch (error) {
         if (controller.signal.aborted) return;
+        if (error instanceof SSEFrameTooLargeError) {
+          controller.abort(error);
+          return;
+        }
         if (!subscribed) {
           rejectReady(error);
           return;
         }
+        onDisconnect?.();
         await delay(250, controller.signal).catch(() => undefined);
       }
     }
   })();
-  return { ready };
+  return { ready, done };
 }
 
 async function settleInteraction({ type, requestId, sessionId, request: interactionRequest, onInteraction, onPermissionRejected, onDismiss, controller, workingDirectory, requestTurn }) {
@@ -618,10 +707,12 @@ async function settleInteraction({ type, requestId, sessionId, request: interact
   }
 }
 
-async function* readServerSentEvents(response, signal) {
+async function* readServerSentEvents(response, signal, maxBufferChars) {
   const reader = response.body?.getReader();
   if (!reader) return;
-  const abort = () => reader.cancel().catch(() => undefined);
+  let cancellation;
+  const cancel = () => cancellation ??= reader.cancel().catch(() => undefined);
+  const abort = () => { void cancel(); };
   signal?.addEventListener("abort", abort, { once: true });
   const decoder = new TextDecoder();
   let buffer = "";
@@ -630,12 +721,12 @@ async function* readServerSentEvents(response, signal) {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-      let boundary = buffer.indexOf("\n\n");
-      while (boundary >= 0) {
-        const chunk = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-        const lines = chunk.split("\n");
-        const data = lines.filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+      let match = /\r?\n\r?\n/u.exec(buffer);
+      while (match) {
+        const chunk = buffer.slice(0, match.index);
+        buffer = buffer.slice(match.index + match[0].length);
+        const lines = chunk.split(/\r?\n/u);
+        const data = lines.filter((line) => line.startsWith("data:")).map((line) => line.slice(5).replace(/^ /u, "")).join("\n");
         const id = lines.find((line) => line.startsWith("id:"))?.slice(3).trim();
         const type = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
         if (data) {
@@ -644,12 +735,47 @@ async function* readServerSentEvents(response, signal) {
             yield type ? { id, type, data: event } : event;
           } catch { /* ponytail: skip non-JSON SSE frames */ }
         }
-        boundary = buffer.indexOf("\n\n");
+        match = /\r?\n\r?\n/u.exec(buffer);
       }
+      if (buffer.length > maxBufferChars) throw new SSEFrameTooLargeError();
     }
   } finally {
     signal?.removeEventListener("abort", abort);
+    await cancel();
   }
+}
+
+function asyncChannel() {
+  const values = [];
+  const waiters = [];
+  let ended = false;
+  let failure;
+  const settle = () => {
+    while (waiters.length && values.length) waiters.shift().resolve({ value: values.shift(), done: false });
+    if (!values.length && failure) while (waiters.length) waiters.shift().reject(failure);
+    else if (!values.length && ended) while (waiters.length) waiters.shift().resolve({ value: undefined, done: true });
+  };
+  return {
+    push(value) {
+      if (!ended && !failure) {
+        if (!waiters.length && typeof value === "string" && typeof values.at(-1) === "string") values[values.length - 1] += value;
+        else values.push(value);
+      }
+      settle();
+    },
+    close() { ended = true; settle(); },
+    fail(error) { failure = error; settle(); },
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          if (values.length) return Promise.resolve({ value: values.shift(), done: false });
+          if (failure) return Promise.reject(failure);
+          if (ended) return Promise.resolve({ value: undefined, done: true });
+          return new Promise((resolve, reject) => waiters.push({ resolve, reject }));
+        },
+      };
+    },
+  };
 }
 
 function abortable(operation, signal) {
@@ -673,6 +799,12 @@ class OpenCodeRequestError extends Error {
   constructor(status) {
     super(`OpenCode request failed with status ${status}.`);
     this.status = status;
+  }
+}
+
+class SSEFrameTooLargeError extends Error {
+  constructor() {
+    super("OpenCode event stream frame exceeded the size limit.");
   }
 }
 
