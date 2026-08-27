@@ -4,5 +4,5 @@ node_modules/
 .DS_Store
 .opencode/.gitignore
 .opencode/goals/
-.opencode/skills/*/results/
+.opencode/skills/
 docs/plans/
