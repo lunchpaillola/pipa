@@ -8,6 +8,7 @@ import {
   cleanChildEnvironment,
   createOpenCodeExecutor,
   MAX_ATTACHMENT_BYTES,
+  PipaStoppedError,
   runOpenCodeVersion,
   startOpenCodeServer,
   startSocketOpenCodeServer,
@@ -212,7 +213,12 @@ test("rejects prompt failures and aborts active requests during shutdown", async
   const turn = hanging.runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" });
   await new Promise((resolve) => setImmediate(resolve));
   hanging.stopAll();
-  await assert.rejects(turn, /shutting down/u);
+  await assert.rejects(turn, (error) => error instanceof PipaStoppedError);
+
+  const failure = new Error("server exited");
+  const stopped = createOpenCodeExecutor({ baseUrl: "http://localhost:5555" });
+  stopped.stopAll(failure);
+  await assert.rejects(stopped.runTurn({ prompt: "hello" }), (error) => error === failure);
 });
 
 test("marks the selected server fatal when a request loses its connection", async () => {

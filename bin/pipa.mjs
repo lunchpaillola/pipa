@@ -108,21 +108,19 @@ function openUrl(url) {
 
 async function start(io) {
   const releaseLock = await acquireInstanceLock();
+  let stop;
+  let stopWithSigint;
+  let stopWithSigterm;
   try {
     const config = await loadConfig();
     if (config.slackMode === "managed") {
       const server = startOpenCodeServer(config);
       io.output.write(`Pipa is starting OpenCode on ${config.openCodeHostname}:${config.openCodePort}.\n`);
-      const stopWithSigint = () => server.stop("SIGINT");
-      const stopWithSigterm = () => server.stop("SIGTERM");
+      stopWithSigint = () => server.stop("SIGINT");
+      stopWithSigterm = () => server.stop("SIGTERM");
       process.on("SIGINT", stopWithSigint);
       process.on("SIGTERM", stopWithSigterm);
-      try {
-        await server.wait();
-      } finally {
-        process.off("SIGINT", stopWithSigint);
-        process.off("SIGTERM", stopWithSigterm);
-      }
+      await server.wait();
       return;
     }
 
@@ -131,22 +129,29 @@ async function start(io) {
       ? `Pipa started a private OpenCode server at ${app.server.baseUrl}.\n`
       : `Pipa is using the configured OpenCode server at ${app.server.baseUrl}.\n`);
     io.output.write("Pipa is connected through Slack Socket Mode.\n");
-    let stop;
-    const signal = new Promise((resolve) => stop = resolve);
-    process.once("SIGINT", stop);
-    process.once("SIGTERM", stop);
+    const { promise: signal, resolve: resolveSignal } = Promise.withResolvers();
+    stop = () => {
+      app.stop();
+      resolveSignal();
+    };
+    process.on("SIGINT", stop);
+    process.on("SIGTERM", stop);
     try {
       await Promise.race([signal, app.wait()]);
     } finally {
-      try {
-        await app.shutdown();
-      } finally {
+      await app.shutdown();
+    }
+  } finally {
+    try {
+      await releaseLock();
+    } finally {
+      if (stop) {
         process.off("SIGINT", stop);
         process.off("SIGTERM", stop);
       }
+      if (stopWithSigint) process.off("SIGINT", stopWithSigint);
+      if (stopWithSigterm) process.off("SIGTERM", stopWithSigterm);
     }
-  } finally {
-    await releaseLock();
   }
 }
 

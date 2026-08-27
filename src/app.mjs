@@ -3,7 +3,7 @@ import { Actions, Button, Card, CardText as Text, Chat, Modal, TextInput } from 
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { canonicalWorkingDirectory, createManifest, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
-import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
+import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
 
 export async function initializePipa(input, options = {}) {
   const paths = options.paths ?? pipaPaths();
@@ -90,9 +90,11 @@ export async function startPipa(options = {}) {
         onPermissionReplied: interactions.onPermissionReplied,
         onPermissionsReconciled: interactions.onPermissionsReconciled,
         deliver: (text) => postInChunks(thread, text),
-        deliverFailure: (error) => thread.post(`Pipa failed: ${safeError(error)}`),
+        deliverFailure: (error) => thread.post(error instanceof PipaStoppedError
+          ? `${config.botName} stopped before finishing this request.`
+          : `${config.botName} failed: ${safeError(error)}`),
       });
-      await finishReaction(thread, message, result.error ? "warning" : "white_check_mark");
+      await finishReaction(thread, message, result.error instanceof PipaStoppedError ? null : result.error ? "warning" : "white_check_mark");
     } catch (error) {
       await finishReaction(thread, message, "warning");
       process.stderr.write("Pipa could not complete or deliver a Slack turn.\n");
@@ -116,14 +118,27 @@ export async function startPipa(options = {}) {
     throw error;
   }
 
+  const stop = (reason = new PipaStoppedError()) => {
+    if (!accepting) return;
+    accepting = false;
+    runner.close(reason);
+    executor.stopAll(reason);
+  };
+
   return {
     server: server ? { baseUrl: server.baseUrl, owned: server.owned } : null,
-    wait: () => server?.wait() ?? new Promise(() => undefined),
+    async wait() {
+      try {
+        return await (server?.wait() ?? new Promise(() => undefined));
+      } catch (error) {
+        stop(error);
+        throw error;
+      }
+    },
+    stop: () => stop(),
     async shutdown() {
-      accepting = false;
-      runner.close();
+      stop();
       await interactions.close();
-      executor.stopAll();
       try {
         await withTimeout((async () => {
           await runner.drain();
@@ -451,15 +466,17 @@ function displayName(value) {
 export function createConversationRunner({ sessionStore, runTurn }) {
   const tails = new Map();
   let closed = false;
+  let closeReason;
 
   function enqueue(conversationKey, input) {
-    if (closed) return Promise.reject(new Error("Pipa is shutting down."));
+    if (closed && input.deliverFailure) return Promise.resolve(input.deliverFailure(closeReason)).then(() => ({ error: closeReason }));
+    if (closed) return Promise.reject(closeReason);
     const previous = tails.get(conversationKey) ?? Promise.resolve();
     const current = previous.catch(() => undefined).then(async () => {
-      if (closed) throw new Error("Pipa is shutting down.");
       const { deliver, deliverFailure, ...turn } = input;
       let result;
       try {
+        if (closed) throw closeReason;
         result = await runTurn({ ...turn, sessionId: sessionStore.get(conversationKey) });
         if (result.sessionId) await sessionStore.set(conversationKey, result.sessionId);
       } catch (error) {
@@ -482,7 +499,7 @@ export function createConversationRunner({ sessionStore, runTurn }) {
 
   return {
     enqueue,
-    close() { closed = true; },
+    close(reason = new PipaStoppedError()) { closed = true; closeReason ??= reason; },
     drain: () => Promise.all([...tails.values()]),
   };
 }
@@ -577,7 +594,7 @@ async function react(thread, message, emoji) {
 async function finishReaction(thread, message, emoji) {
   if (!message.id) return;
   await thread.adapter.removeReaction(thread.id, message.id, "eyes").catch(() => undefined);
-  await react(thread, message, emoji);
+  if (emoji) await react(thread, message, emoji);
 }
 
 async function withTimeout(promise, timeoutMs, message) {

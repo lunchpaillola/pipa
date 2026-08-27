@@ -14,6 +14,12 @@ const LISTENING_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+/u;
 
 export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 
+export class PipaStoppedError extends Error {
+  constructor(message = "Pipa is shutting down.") {
+    super(message);
+  }
+}
+
 export function cleanChildEnvironment(environment = process.env) {
   return Object.fromEntries(Object.entries(environment).filter(([key]) => !SECRET_ENV_KEYS.has(key.toUpperCase())));
 }
@@ -75,7 +81,7 @@ export function createOpenCodeExecutor(options = {}) {
   const pollIntervalMs = options.pollIntervalMs ?? 1_000;
   const useDataUrls = !isLoopbackUrl(baseUrl);
   const active = new Set();
-  let stopped = false;
+  let stopReason;
 
   async function request(pathname, init, workingDirectory, controller, acceptedStatuses = [200], reportFatal = true) {
     const url = serverUrl(baseUrl, pathname, workingDirectory);
@@ -114,13 +120,13 @@ export function createOpenCodeExecutor(options = {}) {
 
   async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [], onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
-    if (stopped) throw new Error("Pipa is shutting down.");
+    if (stopReason) throw stopReason;
     const temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
     let turnError;
 
     try {
       const files = await stageAttachments(attachments, temporaryDirectory, timeoutMs, useDataUrls);
-      if (stopped) throw new Error("Pipa is shutting down.");
+      if (stopReason) throw stopReason;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(new Error(`OpenCode timed out after ${timeoutMs}ms.`)), timeoutMs);
       active.add(controller);
@@ -199,7 +205,7 @@ export function createOpenCodeExecutor(options = {}) {
       }
     } catch (error) {
       turnError = error;
-      if (stopped) throw new Error("Pipa is shutting down.");
+      if (stopReason) throw stopReason;
       throw error;
     } finally {
       if (temporaryDirectory) {
@@ -215,9 +221,9 @@ export function createOpenCodeExecutor(options = {}) {
 
   return {
     runTurn,
-    stopAll() {
-      stopped = true;
-      for (const controller of active) controller.abort(new Error("Pipa is shutting down."));
+    stopAll(reason = new PipaStoppedError()) {
+      stopReason ??= reason;
+      for (const controller of active) controller.abort(stopReason);
     },
   };
 }

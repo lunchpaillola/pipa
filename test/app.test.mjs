@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { checkSlackAppToken, checkSlackToken, createConversationRunner, initializePipa, startPipa } from "../src/app.mjs";
+import { PipaStoppedError } from "../src/opencode.mjs";
 import { createSessionStore, pipaPaths } from "../src/state.mjs";
 
 test("init validates dependencies before replacing config", async () => {
@@ -187,6 +188,7 @@ test("failed replacement turns do not overwrite the persisted session", async ()
 test("closing the runner prevents queued turns from starting", async () => {
   let release;
   const prompts = [];
+  const failures = [];
   const runner = createConversationRunner({
     sessionStore: { get: () => null, set: async () => undefined },
     runTurn: async ({ prompt }) => {
@@ -196,12 +198,17 @@ test("closing the runner prevents queued turns from starting", async () => {
     },
   });
   const active = runner.enqueue("A", { prompt: "active" });
-  const queued = runner.enqueue("A", { prompt: "queued" });
+  const queued = runner.enqueue("A", { prompt: "queued", deliverFailure: async (error) => failures.push(error) });
   await new Promise((resolve) => setImmediate(resolve));
   runner.close();
   release();
   await active;
-  await assert.rejects(queued, /shutting down/u);
+  const result = await queued;
+  assert.equal(result.error, failures[0]);
+  assert.ok(result.error instanceof PipaStoppedError);
+  const late = await runner.enqueue("B", { prompt: "late", deliverFailure: async (error) => failures.push(error) });
+  assert.equal(late.error, failures[1]);
+  assert.ok(late.error instanceof PipaStoppedError);
   assert.deepEqual(prompts, ["active"]);
 });
 
@@ -267,7 +274,7 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
     executor,
     sessionStore,
     checkSlackToken: async () => ({ ok: true }),
-    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+    config: { botName: "Piper", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
   });
   assert.deepEqual(restored, ["slack:C1:1.0", "initialized"]);
 
@@ -321,9 +328,9 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   assert.deepEqual(posts.slice(2, 4), [{ markdown: "summarize:ses_1" }, { markdown: "compare this:ses_1" }]);
   assert.equal(posts[4], "Pipa can read files up to 100 MB each.");
   assert.deepEqual(posts[5], { markdown: "no declared size:ses_1" });
-  assert.equal(posts[6], "Pipa failed: Could not read one of the attached files. Please try uploading it again.");
+  assert.equal(posts[6], "Piper failed: Could not read one of the attached files. Please try uploading it again.");
   assert.deepEqual(posts.slice(7, 10).map((part) => part.markdown.length), [3500, 3500, 1]);
-  assert.equal(posts.at(-2), "Pipa failed: bad [redacted] and [redacted]");
+  assert.equal(posts.at(-2), "Piper failed: bad [redacted] and [redacted]");
   assert.deepEqual(posts.at(-1), { markdown: "Try **[Inventing on Principle](<https://example.com>)**." });
   assert.deepEqual(calls.find(({ prompt }) => prompt.startsWith("ask ")).contextEnvironment, {
     PIPA_MESSAGE_CHANNEL: "slack",
@@ -348,6 +355,46 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   ].sort());
   await app.shutdown();
   assert.deepEqual(restored.slice(-2), ["stopped", "shutdown"]);
+});
+
+test("reports an intentional stop for an active Slack turn", async () => {
+  const handlers = {};
+  const posts = [];
+  const reactions = [];
+  let rejectTurn;
+  const app = await startPipa({
+    chat: {
+      onNewMention(handler) { handlers.mention = handler; },
+      onSubscribedMessage() {},
+      async initialize() {},
+      async shutdown() {},
+    },
+    executor: {
+      runTurn: async () => new Promise((_, reject) => rejectTurn = reject),
+      stopAll(reason) { rejectTurn?.(reason); },
+    },
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    config: { botName: "Piper", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+  });
+  const thread = {
+    id: "slack:C1:1.0",
+    adapter: {
+      addReaction: async (_, __, emoji) => reactions.push(`add:${emoji}`),
+      removeReaction: async (_, __, emoji) => reactions.push(`remove:${emoji}`),
+    },
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async (text) => posts.push(text),
+  };
+
+  await handlers.mention(thread, { id: "1", text: "@U1 keep working", author: { userId: "U1" }, raw: {} });
+  await waitFor(() => rejectTurn);
+  app.stop();
+  await app.shutdown();
+
+  assert.deepEqual(posts, ["Piper stopped before finishing this request."]);
+  assert.deepEqual(reactions, ["add:eyes", "remove:eyes"]);
 });
 
 test("ignores mentions from unauthorized users or channels", async () => {
@@ -435,6 +482,8 @@ test("surfaces an unexpected owned-server exit and still shuts Slack down", asyn
   let serverStopped = false;
   const serverWait = new Promise((_, reject) => failServer = reject);
   const events = [];
+  let stopReason;
+  const failure = new Error("server exited");
   const app = await startPipa({
     chat: {
       onNewMention() {},
@@ -444,7 +493,7 @@ test("surfaces an unexpected owned-server exit and still shuts Slack down", asyn
     },
     state: { connect: async () => undefined },
     checkSlackToken: async () => ({ ok: true }),
-    executor: { runTurn: async () => undefined, stopAll: () => events.push("executor:stop") },
+    executor: { runTurn: async () => undefined, stopAll: (reason) => { stopReason = reason; events.push("executor:stop"); } },
     server: {
       baseUrl: "http://127.0.0.1:54321",
       owned: true,
@@ -454,9 +503,10 @@ test("surfaces an unexpected owned-server exit and still shuts Slack down", asyn
     sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
     config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
   });
-  failServer(new Error("server exited"));
+  failServer(failure);
   await assert.rejects(app.wait(), /server exited/u);
-  await assert.rejects(app.shutdown(), /server exited/u);
+  await assert.rejects(app.shutdown(), (error) => error === failure);
+  assert.equal(stopReason, failure);
   assert.deepEqual(events, ["executor:stop", "slack:stop", "server:stop"]);
 });
 
