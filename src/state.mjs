@@ -127,6 +127,12 @@ export async function loadConfig(file = pipaPaths().config) {
   if (slackMode === "managed" && (!Number.isInteger(config.openCodePort) || config.openCodePort < 1 || config.openCodePort > 65535)) {
     throw new Error("Invalid Pipa config: openCodePort must be an integer from 1 to 65535.");
   }
+  for (const key of ["allowedSlackChannelIds", "allowedSlackUserIds"]) {
+    const value = config[key];
+    if (value !== undefined && (!Array.isArray(value) || !value.every((item) => typeof item === "string" && item.trim()))) {
+      throw new Error(`Invalid Pipa config: ${key} must be a list of non-empty Slack IDs.`);
+    }
+  }
   return { ...config, slackMode };
 }
 

@@ -67,8 +67,12 @@ async function init(io) {
     };
     const slackAppToken = process.env.PIPA_SLACK_APP_TOKEN || await askSecret("Slack app token (xapp-, input hidden): ", "App token");
     const slackBotToken = process.env.PIPA_SLACK_BOT_TOKEN || await askSecret("Slack bot token (xoxb-, input hidden): ", "Bot token");
+    const allowedSlackChannelIds = process.env.PIPA_ALLOWED_CHANNEL_IDS
+      ?? (await prompt.question("Allowed Slack channel IDs (comma-separated, e.g. C0BSE2JTYPR; leave empty to allow any channel): ")).trim();
+    const allowedSlackUserIds = process.env.PIPA_ALLOWED_USER_IDS
+      ?? (await prompt.question("Allowed Slack user IDs (comma-separated, e.g. UFWBSCZ54; leave empty to allow any user): ")).trim();
     io.output.write("\nChecking OpenCode and Slack credentials...\n");
-    const result = await initializePipa({ botName, workingDirectory, slackAppToken, slackBotToken });
+    const result = await initializePipa({ botName, workingDirectory, slackAppToken, slackBotToken, allowedSlackChannelIds, allowedSlackUserIds });
     io.output.write(`✓ Credentials validated.\n\nSaved config to ${result.paths.config}. Run \`pipa start\`.\n`);
   } finally {
     prompt.close();

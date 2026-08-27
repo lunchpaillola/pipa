@@ -350,6 +350,46 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   assert.deepEqual(restored.slice(-2), ["stopped", "shutdown"]);
 });
 
+test("ignores mentions from unauthorized users or channels", async () => {
+  const handlers = {};
+  const posts = [];
+  const chat = {
+    onNewMention(handler) { handlers.mention = handler; },
+    onSubscribedMessage(handler) { handlers.subscribed = handler; },
+    async initialize() {},
+    async shutdown() {},
+  };
+  const calls = [];
+  const executor = {
+    runTurn: async ({ prompt }) => { calls.push(prompt); return { text: prompt, sessionId: "ses_1" }; },
+    stopAll() {},
+  };
+  const config = {
+    botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work",
+    allowedSlackChannelIds: ["C1"], allowedSlackUserIds: ["U1"],
+  };
+  const app = await startPipa({
+    chat, executor,
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    config,
+  });
+
+  const human = { id: "U1", userId: "U1", isMe: false, isBot: false };
+  const stranger = { id: "U2", userId: "U2", isMe: false, isBot: false };
+  const thread = (id) => ({ id, channel: { isDM: false, channelVisibility: "private" }, subscribe: async () => undefined, adapter: { addReaction: async () => undefined, removeReaction: async () => undefined }, post: async (text) => posts.push(text) });
+
+  await handlers.mention(thread("slack:C1:1"), { id: "1", text: "@U1 hi", author: human, raw: {} });
+  await handlers.mention(thread("slack:C2:2"), { id: "2", text: "@U1 hi", author: human, raw: {} });
+  await handlers.mention(thread("slack:C1:3"), { id: "3", text: "@U1 hi", author: stranger, raw: {} });
+  await handlers.mention(thread("slack:C2:4"), { id: "4", text: "@U1 hi", author: stranger, raw: {} });
+
+  await waitFor(() => posts.length === 1);
+  assert.deepEqual(calls, ["hi"]);
+  assert.deepEqual(posts, [{ markdown: "hi" }]);
+  await app.shutdown();
+});
+
 test("startup cleans up Chat when restored subscription setup fails", async () => {
   const events = [];
   const chat = {
