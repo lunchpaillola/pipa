@@ -385,7 +385,6 @@ async function readArtifacts(directory, paths, onOpened) {
         current = path.join(current, part);
         if ((await lstat(current)).isSymbolicLink()) throw new Error("Artifact path contains a symbolic link.");
       }
-      if (await realpath(filename) !== filename) throw new Error("Artifact path is not private.");
       const handle = await open(filename, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
       try {
         const before = await handle.stat({ bigint: true });
