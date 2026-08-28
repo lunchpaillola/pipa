@@ -641,12 +641,13 @@ function splitSlackMarkdown(text, limit = 3500) {
     } else {
       chunk += separator + line;
     }
-    const marker = line.match(/^(```+|~~~+)/u)?.[1];
+    const marker = line.match(/^ {0,3}(```+|~~~+)/u)?.[0];
     if (marker) fence = fence ? "" : marker;
   };
   for (const inputLine of text.split("\n")) {
     let line = inputLine;
-    if (line.length <= limit) {
+    const emptyChunkLimit = limit - (fence ? (2 * fence.length) + 2 : 0);
+    if (line.length <= emptyChunkLimit) {
       append(line);
       continue;
     }

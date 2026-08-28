@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { access, mkdir, readFile, rename, symlink, truncate, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rename, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
@@ -219,6 +219,18 @@ test("rejects prompt failures and aborts active requests during shutdown", async
   const stopped = createOpenCodeExecutor({ baseUrl: "http://localhost:5555" });
   stopped.stopAll(failure);
   await assert.rejects(stopped.runTurn({ prompt: "hello" }), (error) => error === failure);
+
+  let attachmentStarted = false;
+  const staging = createOpenCodeExecutor({ baseUrl: "http://localhost:5555" });
+  const stagingTurn = staging.runTurn({
+    prompt: "summarize",
+    workingDirectory: "/work",
+    contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" },
+    attachments: [{ name: "pending.txt", fetchData: () => { attachmentStarted = true; return new Promise(() => undefined); } }],
+  });
+  await waitForValue(() => attachmentStarted);
+  staging.stopAll();
+  await assert.rejects(stagingTurn, (error) => error instanceof PipaStoppedError);
 });
 
 test("marks the selected server fatal when a request loses its connection", async () => {
@@ -662,11 +674,10 @@ test("Slack turns request concise delivery and return declared binary artifacts"
     response: async (body) => {
       system = body.system;
       artifactDirectory = artifactPath(system);
-      await mkdir(path.join(artifactDirectory, "reports"));
-      await writeFile(path.join(artifactDirectory, "reports", "totals.csv"), csv);
+      await writeFile(path.join(artifactDirectory, "totals.csv"), csv);
       await writeFile(path.join(artifactDirectory, "brief.pdf"), pdf);
       await writeFile(path.join(artifactDirectory, "image.png"), image);
-      return 'Ready for review.\nPIPA_ARTIFACTS: ["reports/totals.csv","brief.pdf","image.png"]';
+      return 'Ready for review.\nPIPA_ARTIFACTS: ["totals.csv","brief.pdf","image.png"]';
     },
   });
 
@@ -674,7 +685,8 @@ test("Slack turns request concise delivery and return declared binary artifacts"
   assert.match(system, /Keep naturally short answers inline/u);
   assert.match(system, /choose the most suitable artifact format/u);
   assert.match(system, new RegExp(artifactDirectory.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
-  assert.match(system, /PIPA_ARTIFACTS: \["relative\/path\.ext"\]/u);
+  assert.match(system, /Continue normal work in the configured workspace/u);
+  assert.match(system, /PIPA_ARTIFACTS: \["report\.csv","brief\.pdf"\]/u);
   assert.match(system, /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
   assert.equal(result.text, "Ready for review.");
   assert.deepEqual(result.files.map(({ filename, data }) => [filename, data]), [
@@ -705,8 +717,9 @@ test("short Slack answers stay inline and remote attached servers get no local a
   assert.deepEqual(remote, { text: "Summary.", sessionId: "ses_1", files: [] });
 
   let plainSystem;
-  await artifactTurn({ contextEnvironment: { PIPA_MESSAGE_CHANNEL: "web" }, response: async (body) => { plainSystem = body.system; return "Hello."; } });
+  const plain = await artifactTurn({ contextEnvironment: { PIPA_MESSAGE_CHANNEL: "web" }, response: async (body) => { plainSystem = body.system; return 'Hello.\nPIPA_ARTIFACTS: ["ordinary.txt"]'; } });
   assert.doesNotMatch(plainSystem, /executive summary|TL;DR|PIPA_ARTIFACTS/u);
+  assert.equal(plain.text, 'Hello.\nPIPA_ARTIFACTS: ["ordinary.txt"]');
 });
 
 test("malformed or non-private artifact declarations are stripped and upload nothing", async () => {
@@ -719,6 +732,7 @@ test("malformed or non-private artifact declarations are stripped and upload not
     `PIPA_ARTIFACTS: ["${"x".repeat(8192)}"]`,
     'PIPA_ARTIFACTS: ["same.txt","same.txt"]',
     'PIPA_ARTIFACTS: ["../escape.txt"]',
+    'PIPA_ARTIFACTS: ["nested/file.txt"]',
     'PIPA_ARTIFACTS: ["/absolute.txt"]',
   ];
   for (const declaration of cases) {
@@ -819,6 +833,25 @@ test("artifact directories are cleaned after OpenCode failure, timeout, and canc
   }
 });
 
+test("artifact cleanup failure does not replace a completed turn", async () => {
+  let directory;
+  const executor = createOpenCodeExecutor({
+    baseUrl: "http://localhost:5555",
+    fetch: artifactFetch(async (body) => {
+      directory = artifactPath(body.system);
+      return "Completed.";
+    }),
+    pollIntervalMs: 1,
+    rm: async (target, options) => {
+      if (target === directory) throw new Error(`could not remove ${target}`);
+      await rm(target, options);
+    },
+  });
+  const result = await executor.runTurn({ prompt: "work", sessionId: "ses_1", workingDirectory: "/work", contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" } });
+  assert.equal(result.text, "Completed.");
+  await rm(directory, { recursive: true, force: true });
+});
+
 async function artifactTurn({ baseUrl = "http://localhost:5555", contextEnvironment = { PIPA_MESSAGE_CHANNEL: "slack" }, response }) {
   return createOpenCodeExecutor({ baseUrl, fetch: artifactFetch(response), pollIntervalMs: 1 })
     .runTurn({ prompt: "do the work", sessionId: "ses_1", workingDirectory: "/work", contextEnvironment });
@@ -843,7 +876,7 @@ function artifactFetch(response) {
 }
 
 function artifactPath(system) {
-  const match = system.match(/private artifact directory for this turn: (.+)\n/u);
+  const match = system.match(/private artifact directory: (.+)\n/u);
   assert.ok(match, `missing artifact directory in system instruction: ${system}`);
   return match[1];
 }

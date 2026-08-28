@@ -328,6 +328,26 @@ test("failed turns release the conversation tail", async () => {
   assert.equal(calls, 2);
 });
 
+test("failed delivery stops typing and releases the conversation tail", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const typing = [];
+  const runner = createConversationRunner({
+    sessionStore: { get: () => null, set: async () => undefined },
+    runTurn: async ({ prompt }) => ({ text: prompt, sessionId: `ses_${prompt}` }),
+  });
+  const first = runner.enqueue("A", {
+    prompt: "one",
+    startTyping: (status) => typing.push(`one:${status}`),
+    deliver: async () => { throw new Error("delivery failed"); },
+  });
+  const second = runner.enqueue("A", { prompt: "two", startTyping: (status) => typing.push(`two:${status}`) });
+  await assert.rejects(first, /delivery failed/u);
+  await second;
+  const settledCount = typing.length;
+  t.mock.timers.tick(150_000);
+  assert.equal(typing.length, settledCount);
+});
+
 test("failed replacement turns do not overwrite the persisted session", async () => {
   let saved;
   const runner = createConversationRunner({
@@ -556,14 +576,14 @@ test("failed artifact post retries declaration-free text once without files", as
 test("inline fallback prefers paragraphs and lines and preserves fenced code across chunks", async () => {
   const paragraph = "ordinary words ".repeat(240).trim();
   const codeLine = `const value = "${"x".repeat(3400)}";`;
-  const text = `${paragraph}\n\n\`\`\`js\n${codeLine}\nconsole.log(value);\n\`\`\`\n\nFinal paragraph.`;
+  const text = `${paragraph}\n\n\`\`\`js\n${codeLine}\nconsole.log(value);\n\`\`\`\n\n   ~~~js\n${"y".repeat(3490)}\n   ~~~\n\nFinal paragraph.`;
   const delivery = await deliveryApp({ text, files: [] });
   await delivery.mention();
   await waitFor(() => delivery.posts.length > 1);
   const chunks = delivery.posts.map((post) => post.markdown);
   assert.ok(chunks.every((chunk) => chunk.length <= 3500));
   assert.equal(chunks.join(" ").split("```js")[0].replace(/\s+/gu, " ").trim(), paragraph);
-  for (const chunk of chunks) assert.equal((chunk.match(/^```/gmu) ?? []).length % 2, 0, `unbalanced fence: ${chunk}`);
+  for (const chunk of chunks) assert.equal((chunk.match(/^ {0,3}(?:```|~~~)/gmu) ?? []).length % 2, 0, `unbalanced fence: ${chunk}`);
   assert.match(chunks.join("\n"), /Final paragraph\./u);
   await delivery.app.shutdown();
 });

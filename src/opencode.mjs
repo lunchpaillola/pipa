@@ -86,6 +86,7 @@ export function createOpenCodeExecutor(options = {}) {
   const requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
   const pollIntervalMs = options.pollIntervalMs ?? 1_000;
   const useDataUrls = !isLoopbackUrl(baseUrl);
+  const remove = options.rm ?? rm;
   const active = new Set();
   let stopReason;
 
@@ -129,19 +130,17 @@ export function createOpenCodeExecutor(options = {}) {
     if (stopReason) throw stopReason;
     const temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
     const slackTurn = contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack";
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error(`OpenCode timed out after ${timeoutMs}ms.`)), timeoutMs);
+    active.add(controller);
     let artifactDirectory;
-    let turnError;
 
     try {
-      artifactDirectory = slackTurn && !useDataUrls ? await mkdtemp(path.join(os.tmpdir(), "pipa-artifacts-")) : null;
-      if (artifactDirectory) await chmod(artifactDirectory, 0o700);
-      const files = await stageAttachments(attachments, temporaryDirectory, timeoutMs, useDataUrls);
-      if (stopReason) throw stopReason;
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(new Error(`OpenCode timed out after ${timeoutMs}ms.`)), timeoutMs);
-      active.add(controller);
-
       try {
+        artifactDirectory = slackTurn && !useDataUrls ? await mkdtemp(path.join(os.tmpdir(), "pipa-artifacts-")) : null;
+        if (artifactDirectory) await chmod(artifactDirectory, 0o700);
+        const files = await stageAttachments(attachments, temporaryDirectory, timeoutMs, useDataUrls, controller.signal);
+        if (stopReason) throw stopReason;
         let selectedSessionId = sessionId;
         let messages;
         if (selectedSessionId) {
@@ -204,7 +203,7 @@ export function createOpenCodeExecutor(options = {}) {
           if (finalMessage && (status === "idle" || (!status && finalMessage.completed))) {
             if (!finalMessage.text && permissionRejected) return { text: "Stopped after a permission was rejected.", sessionId: selectedSessionId, files: EMPTY_FILES };
             if (!finalMessage.text) throw new Error("OpenCode completed without assistant text.");
-            const parsed = parseArtifactDeclaration(finalMessage.text);
+            const parsed = slackTurn ? parseArtifactDeclaration(finalMessage.text) : { text: finalMessage.text };
             return {
               text: parsed.text,
               sessionId: selectedSessionId,
@@ -219,28 +218,23 @@ export function createOpenCodeExecutor(options = {}) {
         active.delete(controller);
       }
     } catch (error) {
-      turnError = error;
       if (stopReason) throw stopReason;
       throw error;
     } finally {
-      let cleanupError;
       if (temporaryDirectory) {
         try {
-          await rm(temporaryDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
-        } catch (error) {
-          if (!turnError) cleanupError = error;
-          else process.stderr.write("Pipa could not remove temporary attachment files.\n");
+          await remove(temporaryDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        } catch {
+          process.stderr.write("Pipa could not remove temporary attachment files.\n");
         }
       }
       if (artifactDirectory) {
         try {
-          await rm(artifactDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
-        } catch (error) {
-          if (!turnError) cleanupError ??= error;
-          else process.stderr.write("Pipa could not remove temporary artifact files.\n");
+          await remove(artifactDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        } catch {
+          process.stderr.write("Pipa could not remove temporary artifact files.\n");
         }
       }
-      if (cleanupError) throw cleanupError;
     }
   }
 
@@ -311,12 +305,12 @@ export async function runOpenCodeVersion(options = {}) {
   }
 }
 
-async function stageAttachments(attachments, temporaryDirectory, timeoutMs, useDataUrls) {
+async function stageAttachments(attachments, temporaryDirectory, timeoutMs, useDataUrls, signal) {
   const files = [];
   for (const [index, attachment] of attachments.entries()) {
     let data;
     try {
-      data = await fetchAttachment(attachment, timeoutMs);
+      data = await fetchAttachment(attachment, timeoutMs, signal);
     } catch {
       throw new Error("Could not read one of the attached files. Please try uploading it again.");
     }
@@ -345,7 +339,7 @@ function promptBody(prompt, files, contextEnvironment, artifactDirectory) {
   if (context.length) instructions.push(`Slack context for this turn (provided here, not as shell environment variables):\n${context.map(([key, value]) => `${key}=${value}`).join("\n")}`);
   if (contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack") {
     instructions.push("For Slack delivery, lead with a concise executive summary or TL;DR. Keep naturally short answers inline. For deeper work, choose the most suitable artifact format rather than defaulting to Markdown.");
-    if (artifactDirectory) instructions.push(`You may write files only inside this private artifact directory for this turn: ${artifactDirectory}\nIf you created artifacts, end with exactly one final nonblank terminal line in this form: ${ARTIFACT_MARKER} [\"relative/path.ext\"]`);
+    if (artifactDirectory) instructions.push(`Place copies of files intended for Slack delivery in this private artifact directory: ${artifactDirectory}\nContinue normal work in the configured workspace. Use at most ten unique top-level filenames, each no larger than 100 MB and no more than 100 MB total. End with exactly one final nonblank terminal line in this form: ${ARTIFACT_MARKER} [\"report.csv\",\"brief.pdf\"]`);
   }
   return {
     parts,
@@ -375,7 +369,7 @@ function parseArtifactDeclaration(text) {
 function validArtifactPath(value) {
   if (!value || Buffer.byteLength(value) > MAX_ARTIFACT_PATH_BYTES || value.includes("\0") || value.includes("\\") || path.isAbsolute(value)) return false;
   const parts = value.split("/");
-  return parts.every((part) => part && part !== "." && part !== "..");
+  return parts.length === 1 && parts[0] !== "." && parts[0] !== "..";
 }
 
 async function readArtifacts(directory, paths, onOpened) {
@@ -559,12 +553,11 @@ function serverUrl(baseUrl, pathname, workingDirectory) {
   return url;
 }
 
-function fetchAttachment(attachment, timeoutMs) {
-  let timer;
+function fetchAttachment(attachment, timeoutMs, signal) {
   return Promise.race([
     attachment.fetchData(),
-    new Promise((_, reject) => timer = setTimeout(() => reject(new Error(`Attachment download timed out after ${timeoutMs}ms.`)), timeoutMs)),
-  ]).finally(() => clearTimeout(timer));
+    delay(timeoutMs, signal).then(() => { throw new Error(`Attachment download timed out after ${timeoutMs}ms.`); }),
+  ]);
 }
 
 function delay(delayMs, signal) {
