@@ -156,8 +156,9 @@ test("starts and health-checks OpenCode before Slack, then stops only the owned 
     checkSlackToken: async () => ({ ok: true }),
     config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
     startServer: async () => { events.push("server:ready"); return server; },
-    createExecutor: ({ baseUrl, onFatal }) => {
+    createExecutor: ({ artifactRoot, baseUrl, onFatal }) => {
       events.push(`executor:${baseUrl}`);
+      assert.equal(artifactRoot, path.join("/work", ".pipa", "artifacts"));
       assert.equal(onFatal, server.fail);
       return { runTurn: async () => undefined, stopAll: () => events.push("executor:stop") };
     },

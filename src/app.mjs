@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import { Chat, Modal, TextInput } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
@@ -53,7 +54,7 @@ export async function startPipa(options = {}) {
   let executor;
   try {
     executor = options.executor ?? (options.createExecutor ?? createOpenCodeExecutor)({
-      artifactRoot: paths.artifacts,
+      artifactRoot: path.join(config.workingDirectory, ".pipa", "artifacts"),
       baseUrl: server.baseUrl,
       onFatal: server.fail,
     });
