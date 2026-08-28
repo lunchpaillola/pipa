@@ -515,6 +515,91 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   assert.deepEqual(restored.slice(-2), ["stopped", "shutdown"]);
 });
 
+test("Slack posts short text once and artifacts once with immutable bytes", async () => {
+  const files = Object.freeze([
+    Object.freeze({ filename: "report.csv", data: Buffer.from("a,b\n1,2\n") }),
+    Object.freeze({ filename: "brief.pdf", data: Buffer.from([0x25, 0x50, 0x44, 0x46]) }),
+  ]);
+  const { app, mention, posts, reactions } = await deliveryApp({ text: "Executive summary.", files });
+  await mention();
+  await waitFor(() => posts.length === 1);
+  assert.deepEqual(posts, [{ markdown: "Executive summary.", files }]);
+  assert.deepEqual(reactions, ["add:eyes", "remove:eyes", "add:white_check_mark"]);
+  await app.shutdown();
+
+  const inline = await deliveryApp({ text: "Short answer.", files: [] });
+  await inline.mention();
+  await waitFor(() => inline.posts.length === 1);
+  assert.deepEqual(inline.posts, [{ markdown: "Short answer." }]);
+  await inline.app.shutdown();
+});
+
+test("failed artifact post retries declaration-free text once without files", async () => {
+  const files = [Object.freeze({ filename: "image.png", data: Buffer.from([1, 2, 3]) })];
+  const delivery = await deliveryApp({ text: "Summary.", files }, { failFiles: true });
+  await delivery.mention();
+  await waitFor(() => delivery.posts.length === 2);
+  assert.deepEqual(delivery.posts, [
+    { markdown: "Summary.", files },
+    { markdown: "Summary." },
+  ]);
+  assert.deepEqual(delivery.reactions, ["add:eyes", "remove:eyes", "add:white_check_mark"]);
+  await delivery.app.shutdown();
+});
+
+test("inline fallback prefers paragraphs and lines and preserves fenced code across chunks", async () => {
+  const paragraph = "ordinary words ".repeat(240).trim();
+  const codeLine = `const value = "${"x".repeat(3400)}";`;
+  const text = `${paragraph}\n\n\`\`\`js\n${codeLine}\nconsole.log(value);\n\`\`\`\n\nFinal paragraph.`;
+  const delivery = await deliveryApp({ text, files: [] });
+  await delivery.mention();
+  await waitFor(() => delivery.posts.length > 1);
+  const chunks = delivery.posts.map((post) => post.markdown);
+  assert.ok(chunks.every((chunk) => chunk.length <= 3500));
+  assert.equal(chunks.join(" ").split("```js")[0].replace(/\s+/gu, " ").trim(), paragraph);
+  for (const chunk of chunks) assert.equal((chunk.match(/^```/gmu) ?? []).length % 2, 0, `unbalanced fence: ${chunk}`);
+  assert.match(chunks.join("\n"), /Final paragraph\./u);
+  await delivery.app.shutdown();
+});
+
+async function deliveryApp(result, { failFiles = false } = {}) {
+  const handlers = {};
+  const posts = [];
+  const reactions = [];
+  const chat = {
+    onNewMention(handler) { handlers.mention = handler; },
+    onSubscribedMessage() {},
+    async initialize() {},
+    async shutdown() {},
+  };
+  const app = await startPipa({
+    chat,
+    executor: { runTurn: async () => ({ ...result, sessionId: "ses_1" }), stopAll() {} },
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+  });
+  const thread = {
+    id: "slack:C1:1.0",
+    adapter: {
+      addReaction: async (_, __, emoji) => reactions.push(`add:${emoji}`),
+      removeReaction: async (_, __, emoji) => reactions.push(`remove:${emoji}`),
+    },
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async (payload) => {
+      posts.push(payload);
+      if (failFiles && payload.files) throw new Error("adapter rejected files");
+    },
+  };
+  return {
+    app,
+    posts,
+    reactions,
+    mention: () => handlers.mention(thread, { id: "1", text: "@Pipa work", author: { userId: "U1" }, raw: {} }),
+  };
+}
+
 test("reports an intentional stop for an active Slack turn", async () => {
   const handlers = {};
   const posts = [];

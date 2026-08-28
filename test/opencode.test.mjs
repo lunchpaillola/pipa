@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { access, readFile } from "node:fs/promises";
+import { access, mkdir, readFile, rename, symlink, truncate, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
@@ -143,7 +143,7 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
     attachments: [attachment],
   });
 
-  assert.deepEqual(result, { text: "first\nsecond", sessionId: "ses_1" });
+  assert.deepEqual(result, { text: "first\nsecond", sessionId: "ses_1", files: [] });
   assert.deepEqual(promptBody.parts[0], { type: "text", text: "summarize" });
   assert.deepEqual(promptBody.parts[1], { type: "file", mime: "text/plain", filename: "notes.txt", url: temporaryFile.href });
   assert.match(promptBody.system, /not as shell environment variables/u);
@@ -171,7 +171,7 @@ test("replaces a stale persisted session only after a successful turn", async ()
 
   const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 })
     .runTurn({ prompt: "continue", sessionId: "ses_stale", workingDirectory: "/work" });
-  assert.deepEqual(result, { text: "recovered", sessionId: "ses_new" });
+  assert.deepEqual(result, { text: "recovered", sessionId: "ses_new", files: [] });
 });
 
 test("does not complete until both the session is idle and a new assistant message exists", async () => {
@@ -544,7 +544,7 @@ test("reports a rejected permission when OpenCode completes without text", async
     workingDirectory: "/work",
     onInteraction: () => ({ type: "reject" }),
   });
-  assert.deepEqual(result, { text: "Stopped after a permission was rejected.", sessionId: "ses_1" });
+  assert.deepEqual(result, { text: "Stopped after a permission was rejected.", sessionId: "ses_1", files: [] });
 });
 
 test("stop rejects active request and aborts session", async () => {
@@ -650,6 +650,211 @@ test("does not report fatal for non-fatal interaction settlement errors", async 
   });
   assert.equal(fatal, undefined, "settlement errors should not trigger onFatal");
 });
+
+test("Slack turns request concise delivery and return declared binary artifacts", async () => {
+  const csv = Buffer.from("name,total\nPipa,3\n");
+  const pdf = Buffer.from([0x25, 0x50, 0x44, 0x46, 0x00, 0xff]);
+  const image = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]);
+  let system;
+  let artifactDirectory;
+  const result = await artifactTurn({
+    contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack", PIPA_CURRENT_SLACK_CHANNEL_ID: "C1" },
+    response: async (body) => {
+      system = body.system;
+      artifactDirectory = artifactPath(system);
+      await mkdir(path.join(artifactDirectory, "reports"));
+      await writeFile(path.join(artifactDirectory, "reports", "totals.csv"), csv);
+      await writeFile(path.join(artifactDirectory, "brief.pdf"), pdf);
+      await writeFile(path.join(artifactDirectory, "image.png"), image);
+      return 'Ready for review.\nPIPA_ARTIFACTS: ["reports/totals.csv","brief.pdf","image.png"]';
+    },
+  });
+
+  assert.match(system, /concise executive summary or TL;DR/u);
+  assert.match(system, /Keep naturally short answers inline/u);
+  assert.match(system, /choose the most suitable artifact format/u);
+  assert.match(system, new RegExp(artifactDirectory.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+  assert.match(system, /PIPA_ARTIFACTS: \["relative\/path\.ext"\]/u);
+  assert.match(system, /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
+  assert.equal(result.text, "Ready for review.");
+  assert.deepEqual(result.files.map(({ filename, data }) => [filename, data]), [
+    ["totals.csv", csv], ["brief.pdf", pdf], ["image.png", image],
+  ]);
+  assert.ok(Object.isFrozen(result.files));
+  assert.ok(result.files.every(Object.isFrozen));
+  await assert.rejects(access(artifactDirectory));
+});
+
+test("short Slack answers stay inline and remote attached servers get no local artifact contract", async () => {
+  let localSystem;
+  const local = await artifactTurn({
+    contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" },
+    response: async (body) => { localSystem = body.system; return "Short answer."; },
+  });
+  assert.deepEqual(local, { text: "Short answer.", sessionId: "ses_1", files: [] });
+  assert.match(localSystem, /Keep naturally short answers inline/u);
+
+  let remoteSystem;
+  const remote = await artifactTurn({
+    baseUrl: "https://opencode.example",
+    contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" },
+    response: async (body) => { remoteSystem = body.system; return 'Summary.\nPIPA_ARTIFACTS: ["private.pdf"]'; },
+  });
+  assert.match(remoteSystem, /concise executive summary or TL;DR/u);
+  assert.doesNotMatch(remoteSystem, /PIPA_ARTIFACTS|artifact director|pipa-artifacts-/u);
+  assert.deepEqual(remote, { text: "Summary.", sessionId: "ses_1", files: [] });
+
+  let plainSystem;
+  await artifactTurn({ contextEnvironment: { PIPA_MESSAGE_CHANNEL: "web" }, response: async (body) => { plainSystem = body.system; return "Hello."; } });
+  assert.doesNotMatch(plainSystem, /executive summary|TL;DR|PIPA_ARTIFACTS/u);
+});
+
+test("malformed or non-private artifact declarations are stripped and upload nothing", async () => {
+  const cases = [
+    'Before.\nPIPA_ARTIFACTS: ["ok.txt"]\nAfter.',
+    'PIPA_ARTIFACTS: ["ok.txt"]\nPIPA_ARTIFACTS: ["ok.txt"]',
+    "PIPA_ARTIFACTS: nope",
+    `PIPA_ARTIFACTS: ${JSON.stringify(["x".repeat(1025)])}`,
+    `PIPA_ARTIFACTS: ${JSON.stringify(Array.from({ length: 11 }, (_, index) => `${index}.txt`))}`,
+    `PIPA_ARTIFACTS: ["${"x".repeat(8192)}"]`,
+    'PIPA_ARTIFACTS: ["same.txt","same.txt"]',
+    'PIPA_ARTIFACTS: ["../escape.txt"]',
+    'PIPA_ARTIFACTS: ["/absolute.txt"]',
+  ];
+  for (const declaration of cases) {
+    const result = await artifactTurn({ response: async (body) => {
+      const directory = artifactPath(body.system);
+      await writeFile(path.join(directory, "ok.txt"), "ok");
+      await writeFile(path.join(directory, "same.txt"), "same");
+      return `Summary.\n${declaration}`;
+    } });
+    assert.doesNotMatch(result.text, /^PIPA_ARTIFACTS:/mu);
+    assert.deepEqual(result.files, []);
+  }
+});
+
+test("artifact reads reject symlinks, directories, missing files, and clean their private directory", async () => {
+  for (const setup of [
+    async (directory) => symlink(path.join(directory, "target.txt"), path.join(directory, "file.txt")),
+    async (directory) => mkdir(path.join(directory, "file.txt")),
+    async () => undefined,
+  ]) {
+    let directory;
+    const result = await artifactTurn({ response: async (body) => {
+      directory = artifactPath(body.system);
+      await writeFile(path.join(directory, "target.txt"), "secret");
+      await setup(directory);
+      return 'Summary.\nPIPA_ARTIFACTS: ["file.txt"]';
+    } });
+    assert.deepEqual(result.files, []);
+    await assert.rejects(access(directory));
+  }
+});
+
+test("artifact reads enforce per-file and aggregate 100 MB limits", async () => {
+  for (const sizes of [[MAX_ATTACHMENT_BYTES + 1], [60 * 1024 * 1024, 41 * 1024 * 1024]]) {
+    const result = await artifactTurn({ response: async (body) => {
+      const directory = artifactPath(body.system);
+      const names = [];
+      for (const [index, size] of sizes.entries()) {
+        const name = `${index}.bin`;
+        names.push(name);
+        const filename = path.join(directory, name);
+        await writeFile(filename, "");
+        await truncate(filename, size);
+      }
+      return `Summary.\nPIPA_ARTIFACTS: ${JSON.stringify(names)}`;
+    } });
+    assert.deepEqual(result.files, []);
+  }
+});
+
+test("artifact reads reject a file replaced after opening and sanitize delivered filenames", async () => {
+  let replaced = false;
+  const executor = createOpenCodeExecutor({
+    baseUrl: "http://localhost:5555",
+    fetch: artifactFetch(async (body) => {
+      const directory = artifactPath(body.system);
+      await writeFile(path.join(directory, "replace.txt"), "original");
+      await writeFile(path.join(directory, 'bad:name?.csv'), "safe");
+      return 'Summary.\nPIPA_ARTIFACTS: ["replace.txt","bad:name?.csv"]';
+    }),
+    pollIntervalMs: 1,
+    onArtifactOpened: async (filename) => {
+      if (!filename.endsWith("replace.txt")) return;
+      await writeFile(`${filename}.new`, "replacement");
+      await rename(`${filename}.new`, filename);
+      replaced = true;
+    },
+  });
+  const rejected = await executor.runTurn({ prompt: "work", sessionId: "ses_1", workingDirectory: "/work", contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" } });
+  assert.equal(replaced, true);
+  assert.deepEqual(rejected.files, []);
+
+  const sanitized = await artifactTurn({ response: async (body) => {
+    const directory = artifactPath(body.system);
+    await writeFile(path.join(directory, 'bad:name?.csv'), "safe");
+    return 'Summary.\nPIPA_ARTIFACTS: ["bad:name?.csv"]';
+  } });
+  assert.equal(sanitized.files[0].filename, "bad_name_.csv");
+});
+
+test("artifact directories are cleaned after OpenCode failure, timeout, and cancellation", async () => {
+  for (const mode of ["failure", "timeout", "cancel"]) {
+    let directory;
+    let executor;
+    const fetch = artifactFetch(async (body, init) => {
+      directory = artifactPath(body.system);
+      if (mode === "failure") throw new Error("prompt failed");
+      return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+    });
+    executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, requestTimeoutMs: mode === "timeout" ? 5 : 30_000 });
+    const turn = executor.runTurn({ prompt: "work", sessionId: "ses_1", workingDirectory: "/work", contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" } });
+    if (mode === "cancel") {
+      await waitForValue(() => directory);
+      executor.stopAll();
+    }
+    await assert.rejects(turn);
+    await assert.rejects(access(directory));
+  }
+});
+
+async function artifactTurn({ baseUrl = "http://localhost:5555", contextEnvironment = { PIPA_MESSAGE_CHANNEL: "slack" }, response }) {
+  return createOpenCodeExecutor({ baseUrl, fetch: artifactFetch(response), pollIntervalMs: 1 })
+    .runTurn({ prompt: "do the work", sessionId: "ses_1", workingDirectory: "/work", contextEnvironment });
+}
+
+function artifactFetch(response) {
+  let prompted = false;
+  let assistantText;
+  return async (url, init = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/session/status") return jsonResponse({ ses_1: { type: prompted ? "idle" : "idle" } });
+    if (pathname === "/session/ses_1/message") return jsonResponse(prompted && assistantText !== undefined
+      ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: assistantText }] }]
+      : []);
+    if (pathname === "/session/ses_1/prompt_async") {
+      assistantText = await response(JSON.parse(init.body), init);
+      prompted = true;
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+}
+
+function artifactPath(system) {
+  const match = system.match(/private artifact directory for this turn: (.+)\n/u);
+  assert.ok(match, `missing artifact directory in system instruction: ${system}`);
+  return match[1];
+}
+
+async function waitForValue(predicate) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  throw new Error("Timed out waiting for value.");
+}
 
 function childProcess() {
   const child = new EventEmitter();

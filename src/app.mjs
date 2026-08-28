@@ -100,7 +100,7 @@ export async function startPipa(options = {}) {
         onPermissionReplied: interactions.onPermissionReplied,
         onPermissionsReconciled: interactions.onPermissionsReconciled,
         startTyping: (status) => thread.startTyping(status),
-        deliver: (text) => postInChunks(thread, text),
+        deliver: (result) => postResult(thread, result),
         deliverFailure: (error) => thread.post(error instanceof PipaStoppedError
           ? `${config.botName} stopped before finishing this request.`
           : `${config.botName} failed: ${safeError(error)}`),
@@ -467,7 +467,7 @@ export function createConversationRunner({ sessionStore, runTurn }) {
           }
           throw error;
         }
-        if (deliver) await deliver(result.text);
+        if (deliver) await deliver(result);
         return result;
       } finally {
         stopTyping?.();
@@ -617,10 +617,57 @@ function slackContext(thread, message) {
   };
 }
 
-async function postInChunks(thread, text) {
-  for (let index = 0; index < text.length; index += 3500) {
-    await thread.post({ markdown: text.slice(index, index + 3500) });
+async function postResult(thread, { text, files = [] }) {
+  if (files.length) {
+    try {
+      await thread.post({ markdown: text, files });
+      return;
+    } catch {
+      // A failed adapter call may still have uploaded files, so retry text only.
+    }
   }
+  for (const markdown of splitSlackMarkdown(text)) await thread.post({ markdown });
+}
+
+function splitSlackMarkdown(text, limit = 3500) {
+  if (text.length <= limit) return [text];
+  const chunks = [];
+  let chunk = "";
+  let fence = "";
+  const append = (line) => {
+    const separator = chunk ? "\n" : "";
+    const closing = fence ? `\n${fence}` : "";
+    if (chunk && chunk.length + separator.length + line.length + closing.length > limit) {
+      chunks.push(chunk + closing);
+      chunk = fence ? `${fence}\n${line}` : line;
+    } else {
+      chunk += separator + line;
+    }
+    const marker = line.match(/^(```+|~~~+)/u)?.[1];
+    if (marker) fence = fence ? "" : marker;
+  };
+  for (const inputLine of text.split("\n")) {
+    let line = inputLine;
+    if (line.length <= limit) {
+      append(line);
+      continue;
+    }
+    if (chunk) {
+      chunks.push(chunk + (fence ? `\n${fence}` : ""));
+      chunk = fence ? `${fence}\n` : "";
+    }
+    const room = Math.max(1, limit - chunk.length - (fence ? fence.length + 1 : 0));
+    while (line.length > room) {
+      const boundary = line.slice(0, room + 1).search(/\s+\S*$/u);
+      const splitAt = boundary > 0 ? boundary : room;
+      chunks.push(chunk + line.slice(0, splitAt) + (fence ? `\n${fence}` : ""));
+      line = line.slice(splitAt).replace(/^\s+/u, "");
+      chunk = fence ? `${fence}\n` : "";
+    }
+    chunk += line;
+  }
+  if (chunk) chunks.push(chunk + (fence ? `\n${fence}` : ""));
+  return chunks;
 }
 
 async function react(thread, message, emoji) {
