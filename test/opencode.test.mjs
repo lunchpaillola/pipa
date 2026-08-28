@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { access, mkdir, readFile, rename, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
@@ -684,6 +685,7 @@ test("Slack turns request concise delivery and return declared binary artifacts"
   assert.match(system, /For deeper work or larger deliverables/u);
   assert.match(system, /Keep naturally short answers inline/u);
   assert.match(system, /use the most suitable artifact format/u);
+  assert.equal(path.dirname(artifactDirectory), path.resolve(os.tmpdir()));
   assert.match(system, new RegExp(artifactDirectory.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
   assert.match(system, /copy up to 10 top-level files \(100 MB total\)/u);
   assert.match(system, /PIPA_ARTIFACTS: \["report\.csv","brief\.pdf"\]/u);
@@ -799,7 +801,7 @@ test("artifact reads reject a file replaced after opening and sanitize delivered
       await rename(`${filename}.new`, filename);
     },
   });
-  const rejected = await executor.runTurn({ prompt: "work", sessionId: "ses_1", workingDirectory: "/work", contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" } });
+  const rejected = await executor.runTurn({ prompt: "work", sessionId: "ses_1", workingDirectory: os.tmpdir(), contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" } });
   assert.equal(replacementAttempted, true);
   assert.equal(rejected.files, undefined);
 
@@ -821,7 +823,7 @@ test("artifact directories are cleaned after OpenCode failure, timeout, and canc
       return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
     });
     executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, requestTimeoutMs: mode === "timeout" ? 5 : 30_000 });
-    const turn = executor.runTurn({ prompt: "work", sessionId: "ses_1", workingDirectory: "/work", contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" } });
+    const turn = executor.runTurn({ prompt: "work", sessionId: "ses_1", workingDirectory: os.tmpdir(), contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" } });
     if (mode === "cancel") {
       await waitForValue(() => directory);
       executor.stopAll();
@@ -845,14 +847,14 @@ test("artifact cleanup failure does not replace a completed turn", async () => {
       await rm(target, options);
     },
   });
-  const result = await executor.runTurn({ prompt: "work", sessionId: "ses_1", workingDirectory: "/work", contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" } });
+  const result = await executor.runTurn({ prompt: "work", sessionId: "ses_1", workingDirectory: os.tmpdir(), contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" } });
   assert.equal(result.text, "Completed.");
   await rm(directory, { recursive: true, force: true });
 });
 
 async function artifactTurn({ baseUrl = "http://localhost:5555", contextEnvironment = { PIPA_MESSAGE_CHANNEL: "slack" }, response }) {
   return createOpenCodeExecutor({ baseUrl, fetch: artifactFetch(response), pollIntervalMs: 1 })
-    .runTurn({ prompt: "do the work", sessionId: "ses_1", workingDirectory: "/work", contextEnvironment });
+    .runTurn({ prompt: "do the work", sessionId: "ses_1", workingDirectory: os.tmpdir(), contextEnvironment });
 }
 
 function artifactFetch(response) {

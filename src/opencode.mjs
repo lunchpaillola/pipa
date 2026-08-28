@@ -136,7 +136,11 @@ export function createOpenCodeExecutor(options = {}) {
 
     try {
       try {
-        artifactDirectory = slackTurn && !useDataUrls ? await mkdtemp(path.join(os.tmpdir(), "pipa-artifacts-")) : null;
+        if (slackTurn && !useDataUrls) {
+          try {
+            artifactDirectory = await mkdtemp(path.join(workingDirectory, ".pipa-artifacts-"));
+          } catch {}
+        }
         if (artifactDirectory) await chmod(artifactDirectory, 0o700);
         const files = await stageAttachments(attachments, temporaryDirectory, timeoutMs, useDataUrls, controller.signal);
         if (stopReason) throw stopReason;
