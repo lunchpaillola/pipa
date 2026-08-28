@@ -189,7 +189,7 @@ export function createOpenCodeExecutor(options = {}) {
         }
         await request(`/session/${encodeURIComponent(selectedSessionId)}/prompt_async`, {
           method: "POST",
-          body: JSON.stringify(promptBody(prompt.trim(), files, contextEnvironment, slackTurn, artifactDirectory)),
+          body: JSON.stringify(promptBody(prompt.trim(), files, contextEnvironment, artifactDirectory)),
         }, workingDirectory, controller, [204]);
 
         while (true) {
@@ -322,13 +322,7 @@ async function stageAttachments(attachments, temporaryDirectory, timeoutMs, useD
     }
     if (data.byteLength > MAX_ATTACHMENT_BYTES) throw new Error("Attached files must be 100 MB or smaller.");
     try {
-      const sanitizedName = path.basename(attachment.name || "attachment")
-        .replace(/[<>:"/\\|?*\u0000-\u001f]/gu, "_")
-        .replace(/[. ]+$/u, "");
-      const filename = Array.from(sanitizedName).reduce(
-        (result, character) => Buffer.byteLength(result + character) <= 200 ? result + character : result,
-        "",
-      ) || "attachment";
+      const filename = sanitizeFilename(path.basename(attachment.name || "attachment"), "attachment");
       const file = path.join(temporaryDirectory, `${index + 1}-${filename}`);
       await writeFile(file, data);
       const mime = attachment.mimeType || "application/octet-stream";
@@ -344,14 +338,14 @@ async function stageAttachments(attachments, temporaryDirectory, timeoutMs, useD
   return files;
 }
 
-function promptBody(prompt, files, contextEnvironment, slackTurn, artifactDirectory) {
+function promptBody(prompt, files, contextEnvironment, artifactDirectory) {
   const parts = [{ type: "text", text: prompt }, ...files.map((file) => ({ type: "file", ...file }))];
   const context = Object.entries(contextEnvironment).filter(([, value]) => value !== undefined && value !== null && String(value));
   const instructions = [];
   if (context.length) instructions.push(`Slack context for this turn (provided here, not as shell environment variables):\n${context.map(([key, value]) => `${key}=${value}`).join("\n")}`);
-  if (slackTurn) {
+  if (contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack") {
     instructions.push("For Slack delivery, lead with a concise executive summary or TL;DR. Keep naturally short answers inline. For deeper work, choose the most suitable artifact format rather than defaulting to Markdown.");
-    if (artifactDirectory) instructions.push(`You may write files only inside this private artifact directory for this turn: ${artifactDirectory}\nIf you created artifacts, end with exactly one final nonblank terminal line in this form: PIPA_ARTIFACTS: [\"relative/path.ext\"]`);
+    if (artifactDirectory) instructions.push(`You may write files only inside this private artifact directory for this turn: ${artifactDirectory}\nIf you created artifacts, end with exactly one final nonblank terminal line in this form: ${ARTIFACT_MARKER} [\"relative/path.ext\"]`);
   }
   return {
     parts,
@@ -430,9 +424,9 @@ function changedFile(before, after) {
   return before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs;
 }
 
-function sanitizeFilename(value) {
+function sanitizeFilename(value, fallback = "artifact") {
   const sanitized = value.replace(/[<>:"/\\|?*\u0000-\u001f]/gu, "_").replace(/[. ]+$/u, "");
-  return Array.from(sanitized).reduce((result, character) => Buffer.byteLength(result + character) <= 200 ? result + character : result, "") || "artifact";
+  return Array.from(sanitized).reduce((result, character) => Buffer.byteLength(result + character) <= 200 ? result + character : result, "") || fallback;
 }
 
 function latestAssistantMessage(messages, baseline) {

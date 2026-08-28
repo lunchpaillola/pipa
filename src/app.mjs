@@ -528,8 +528,9 @@ export async function checkSlackToken(token, fetchImpl = fetch) {
   });
   const result = await response.json();
   if (!response.ok || !result.ok) throw new Error("Slack rejected the bot token.");
-  const grantedScopes = normalizeGrantedScopes(response.headers?.get?.("x-oauth-scopes"), true)
-    ?? normalizeGrantedScopes(result.response_metadata?.scopes, false);
+  const headerScopes = response.headers?.get?.("x-oauth-scopes");
+  const grantedScopes = normalizeGrantedScopes(typeof headerScopes === "string" ? headerScopes.split(",") : undefined)
+    ?? normalizeGrantedScopes(result.response_metadata?.scopes);
   return grantedScopes === undefined ? result : { ...result, grantedScopes };
 }
 
@@ -582,12 +583,8 @@ function requireToken(value, label, prefix) {
   return token;
 }
 
-function normalizeGrantedScopes(value, stringValue) {
-  if (stringValue && typeof value === "string") {
-    const scopes = value.split(",").map((scope) => scope.trim());
-    return scopes.length && scopes.every(Boolean) ? [...new Set(scopes)] : undefined;
-  }
-  if (!stringValue && Array.isArray(value) && value.every((scope) => typeof scope === "string" && scope.trim())) {
+function normalizeGrantedScopes(value) {
+  if (Array.isArray(value) && value.every((scope) => typeof scope === "string" && scope.trim())) {
     return [...new Set(value.map((scope) => scope.trim()))];
   }
 }
@@ -626,6 +623,7 @@ async function postResult(thread, { text, files = [] }) {
       // A failed adapter call may still have uploaded files, so retry text only.
     }
   }
+  if (!text) return;
   for (const markdown of splitSlackMarkdown(text)) await thread.post({ markdown });
 }
 

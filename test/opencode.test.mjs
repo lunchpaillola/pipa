@@ -829,7 +829,7 @@ function artifactFetch(response) {
   let assistantText;
   return async (url, init = {}) => {
     const pathname = new URL(url).pathname;
-    if (pathname === "/session/status") return jsonResponse({ ses_1: { type: prompted ? "idle" : "idle" } });
+    if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
     if (pathname === "/session/ses_1/message") return jsonResponse(prompted && assistantText !== undefined
       ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: assistantText }] }]
       : []);

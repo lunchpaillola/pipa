@@ -515,7 +515,7 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   assert.deepEqual(restored.slice(-2), ["stopped", "shutdown"]);
 });
 
-test("Slack posts short text once and artifacts once with immutable bytes", async () => {
+test("Slack posts short text once and artifacts once with frozen descriptors", async () => {
   const files = Object.freeze([
     Object.freeze({ filename: "report.csv", data: Buffer.from("a,b\n1,2\n") }),
     Object.freeze({ filename: "brief.pdf", data: Buffer.from([0x25, 0x50, 0x44, 0x46]) }),
@@ -532,6 +532,12 @@ test("Slack posts short text once and artifacts once with immutable bytes", asyn
   await waitFor(() => inline.posts.length === 1);
   assert.deepEqual(inline.posts, [{ markdown: "Short answer." }]);
   await inline.app.shutdown();
+
+  const empty = await deliveryApp({ text: "", files: [] });
+  await empty.mention();
+  await waitFor(() => empty.reactions.includes("add:white_check_mark"));
+  assert.deepEqual(empty.posts, []);
+  await empty.app.shutdown();
 });
 
 test("failed artifact post retries declaration-free text once without files", async () => {
