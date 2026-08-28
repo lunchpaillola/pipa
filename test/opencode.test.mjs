@@ -143,7 +143,7 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
     attachments: [attachment],
   });
 
-  assert.deepEqual(result, { text: "first\nsecond", sessionId: "ses_1", files: [] });
+  assert.deepEqual(result, { text: "first\nsecond", sessionId: "ses_1" });
   assert.deepEqual(promptBody.parts[0], { type: "text", text: "summarize" });
   assert.deepEqual(promptBody.parts[1], { type: "file", mime: "text/plain", filename: "notes.txt", url: temporaryFile.href });
   assert.match(promptBody.system, /not as shell environment variables/u);
@@ -171,7 +171,7 @@ test("replaces a stale persisted session only after a successful turn", async ()
 
   const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 })
     .runTurn({ prompt: "continue", sessionId: "ses_stale", workingDirectory: "/work" });
-  assert.deepEqual(result, { text: "recovered", sessionId: "ses_new", files: [] });
+  assert.deepEqual(result, { text: "recovered", sessionId: "ses_new" });
 });
 
 test("does not complete until both the session is idle and a new assistant message exists", async () => {
@@ -556,7 +556,7 @@ test("reports a rejected permission when OpenCode completes without text", async
     workingDirectory: "/work",
     onInteraction: () => ({ type: "reject" }),
   });
-  assert.deepEqual(result, { text: "Stopped after a permission was rejected.", sessionId: "ses_1", files: [] });
+  assert.deepEqual(result, { text: "Stopped after a permission was rejected.", sessionId: "ses_1" });
 });
 
 test("stop rejects active request and aborts session", async () => {
@@ -692,8 +692,6 @@ test("Slack turns request concise delivery and return declared binary artifacts"
   assert.deepEqual(result.files.map(({ filename, data }) => [filename, data]), [
     ["totals.csv", csv], ["brief.pdf", pdf], ["image.png", image],
   ]);
-  assert.ok(Object.isFrozen(result.files));
-  assert.ok(result.files.every(Object.isFrozen));
   await assert.rejects(access(artifactDirectory));
 });
 
@@ -703,7 +701,7 @@ test("short Slack answers stay inline and remote attached servers get no local a
     contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" },
     response: async (body) => { localSystem = body.system; return "Short answer."; },
   });
-  assert.deepEqual(local, { text: "Short answer.", sessionId: "ses_1", files: [] });
+  assert.deepEqual(local, { text: "Short answer.", sessionId: "ses_1" });
   assert.match(localSystem, /Keep naturally short answers inline/u);
 
   let remoteSystem;
@@ -714,7 +712,7 @@ test("short Slack answers stay inline and remote attached servers get no local a
   });
   assert.match(remoteSystem, /concise executive summary or TL;DR/u);
   assert.doesNotMatch(remoteSystem, /PIPA_ARTIFACTS|artifact director|pipa-artifacts-/u);
-  assert.deepEqual(remote, { text: "Summary.", sessionId: "ses_1", files: [] });
+  assert.deepEqual(remote, { text: "Summary.", sessionId: "ses_1" });
 
   let plainSystem;
   const plain = await artifactTurn({ contextEnvironment: { PIPA_MESSAGE_CHANNEL: "web" }, response: async (body) => { plainSystem = body.system; return 'Hello.\nPIPA_ARTIFACTS: ["ordinary.txt"]'; } });
@@ -743,7 +741,7 @@ test("malformed or non-private artifact declarations are stripped and upload not
       return `Summary.\n${declaration}`;
     } });
     assert.doesNotMatch(result.text, /^PIPA_ARTIFACTS:/mu);
-    assert.deepEqual(result.files, []);
+    assert.equal(result.files, undefined);
   }
 });
 
@@ -760,7 +758,7 @@ test("artifact reads reject symlinks, directories, missing files, and clean thei
       await setup(directory);
       return 'Summary.\nPIPA_ARTIFACTS: ["file.txt"]';
     } });
-    assert.deepEqual(result.files, []);
+    assert.equal(result.files, undefined);
     await assert.rejects(access(directory));
   }
 });
@@ -779,7 +777,7 @@ test("artifact reads enforce per-file and aggregate 100 MB limits", async () => 
       }
       return `Summary.\nPIPA_ARTIFACTS: ${JSON.stringify(names)}`;
     } });
-    assert.deepEqual(result.files, []);
+    assert.equal(result.files, undefined);
   }
 });
 
@@ -803,7 +801,7 @@ test("artifact reads reject a file replaced after opening and sanitize delivered
   });
   const rejected = await executor.runTurn({ prompt: "work", sessionId: "ses_1", workingDirectory: "/work", contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" } });
   assert.equal(replacementAttempted, true);
-  assert.deepEqual(rejected.files, []);
+  assert.equal(rejected.files, undefined);
 
   const sanitized = await artifactTurn({ response: async (body) => {
     const directory = artifactPath(body.system);

@@ -241,76 +241,16 @@ test("conversation runner serializes one thread, overlaps threads, and persists 
   await second;
 });
 
-test("conversation runner refreshes typing only for active turns and stops it on settlement or close", async (t) => {
-  t.mock.timers.enable({ apis: ["setInterval"] });
-  const events = [];
-  let finishFirst;
-  let finishDelivery;
-  let finishThird;
-  const finishRefresh = new Map();
+test("conversation runner starts typing once for active turns and ignores typing failures", async () => {
+  const typing = [];
   const runner = createConversationRunner({
     sessionStore: { get: () => null, set: async () => undefined },
-    runTurn: async ({ prompt }) => {
-      events.push(`run:${prompt}`);
-      if (prompt === "one") await new Promise((resolve) => finishFirst = resolve);
-      if (prompt === "three") await new Promise((resolve) => finishThird = resolve);
-      return { text: prompt, sessionId: `ses_${prompt}` };
-    },
+    runTurn: async ({ prompt }) => ({ text: prompt, sessionId: `ses_${prompt}` }),
   });
-  const typing = (prompt) => (status) => {
-    events.push(`typing:${prompt}:${status}`);
-    if (status === "Digging into the work...") return new Promise((resolve) => finishRefresh.set(prompt, resolve));
-    if (status === "Making progress...") return Promise.reject(new Error("typing refresh unavailable"));
-    if (prompt === "two") throw new Error("typing unavailable");
-  };
-
-  const first = runner.enqueue("A", {
-    prompt: "one",
-    startTyping: typing("one"),
-    deliver: async () => {
-      events.push("deliver:one");
-      await new Promise((resolve) => finishDelivery = resolve);
-    },
-  });
-  const second = runner.enqueue("A", { prompt: "two", startTyping: typing("two") });
-  const third = runner.enqueue("B", { prompt: "three", startTyping: typing("three") });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(events, [
-    "typing:one:Getting oriented...", "run:one",
-    "typing:three:Getting oriented...", "run:three",
-  ]);
-
-  t.mock.timers.tick(75_000);
-  await Promise.resolve();
-  assert.deepEqual(events.slice(-2), ["typing:one:Digging into the work...", "typing:three:Digging into the work..."]);
-  t.mock.timers.tick(75_000);
-  assert.equal(events.filter((event) => event.startsWith("typing:")).length, 4, "refreshes must not overlap");
-  for (const finish of finishRefresh.values()) finish();
-  await Promise.resolve();
-
-  finishFirst();
-  await waitFor(() => events.includes("deliver:one"));
-  t.mock.timers.tick(75_000);
-  await Promise.resolve();
-  assert.ok(events.includes("typing:one:Making progress..."));
-  assert.ok(events.includes("typing:three:Making progress..."));
-  finishDelivery();
-  await first;
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(events.slice(-2), ["typing:two:Getting oriented...", "run:two"]);
-  await second;
-  const settledCount = events.filter((event) => /^typing:(?:one|two):/u.test(event)).length;
-  const activeCount = events.filter((event) => event.startsWith("typing:three:")).length;
-  t.mock.timers.tick(300_000);
-  assert.equal(events.filter((event) => /^typing:(?:one|two):/u.test(event)).length, settledCount);
-  assert.ok(events.filter((event) => event.startsWith("typing:three:")).length > activeCount);
-
-  runner.close();
-  const closedCount = events.filter((event) => event.startsWith("typing:")).length;
-  t.mock.timers.tick(75_000);
-  assert.equal(events.filter((event) => event.startsWith("typing:")).length, closedCount);
-  finishThird();
-  await third;
+  await runner.enqueue("A", { prompt: "one", startTyping: () => typing.push("one") });
+  await runner.enqueue("A", { prompt: "two", startTyping: () => { throw new Error("typing unavailable"); } });
+  await runner.enqueue("B", { prompt: "three", startTyping: async () => { throw new Error("typing unavailable"); } });
+  assert.deepEqual(typing, ["one"]);
 });
 
 test("failed turns release the conversation tail", async () => {
@@ -328,24 +268,18 @@ test("failed turns release the conversation tail", async () => {
   assert.equal(calls, 2);
 });
 
-test("failed delivery stops typing and releases the conversation tail", async (t) => {
-  t.mock.timers.enable({ apis: ["setInterval"] });
-  const typing = [];
+test("failed delivery releases the conversation tail", async () => {
   const runner = createConversationRunner({
     sessionStore: { get: () => null, set: async () => undefined },
     runTurn: async ({ prompt }) => ({ text: prompt, sessionId: `ses_${prompt}` }),
   });
   const first = runner.enqueue("A", {
     prompt: "one",
-    startTyping: (status) => typing.push(`one:${status}`),
     deliver: async () => { throw new Error("delivery failed"); },
   });
-  const second = runner.enqueue("A", { prompt: "two", startTyping: (status) => typing.push(`two:${status}`) });
+  const second = runner.enqueue("A", { prompt: "two" });
   await assert.rejects(first, /delivery failed/u);
   await second;
-  const settledCount = typing.length;
-  t.mock.timers.tick(150_000);
-  assert.equal(typing.length, settledCount);
 });
 
 test("failed replacement turns do not overwrite the persisted session", async () => {
@@ -535,11 +469,11 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   assert.deepEqual(restored.slice(-2), ["stopped", "shutdown"]);
 });
 
-test("Slack posts short text once and artifacts once with frozen descriptors", async () => {
-  const files = Object.freeze([
-    Object.freeze({ filename: "report.csv", data: Buffer.from("a,b\n1,2\n") }),
-    Object.freeze({ filename: "brief.pdf", data: Buffer.from([0x25, 0x50, 0x44, 0x46]) }),
-  ]);
+test("Slack posts short text and artifacts once", async () => {
+  const files = [
+    { filename: "report.csv", data: Buffer.from("a,b\n1,2\n") },
+    { filename: "brief.pdf", data: Buffer.from([0x25, 0x50, 0x44, 0x46]) },
+  ];
   const { app, mention, posts, reactions } = await deliveryApp({ text: "Executive summary.", files });
   await mention();
   await waitFor(() => posts.length === 1);
@@ -561,7 +495,7 @@ test("Slack posts short text once and artifacts once with frozen descriptors", a
 });
 
 test("failed artifact post retries declaration-free text once without files", async () => {
-  const files = [Object.freeze({ filename: "image.png", data: Buffer.from([1, 2, 3]) })];
+  const files = [{ filename: "image.png", data: Buffer.from([1, 2, 3]) }];
   const delivery = await deliveryApp({ text: "Summary.", files }, { failFiles: true });
   await delivery.mention();
   await waitFor(() => delivery.posts.length === 2);

@@ -41,7 +41,7 @@ pipa init
 pipa start
 ```
 
-Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. Pipa starts one OpenCode server bound to `127.0.0.1` on an operating-system-assigned port and reuses it for every Slack turn. Port `0` asks the operating system for an available port; no port configuration is required. Pipa replies in a thread, and follow-up messages in that thread reuse the same OpenCode session without another mention. While a queued turn is active, Pipa shows a periodically refreshed status in its Slack thread.
+Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. Pipa starts one OpenCode server bound to `127.0.0.1` on an operating-system-assigned port and reuses it for every Slack turn. Port `0` asks the operating system for an available port; no port configuration is required. Pipa replies in a thread, and follow-up messages in that thread reuse the same OpenCode session without another mention. While a queued turn is active, Pipa shows a typing status in its Slack thread.
 
 Pipa keeps naturally short answers inline. For deeper work, OpenCode can return a concise summary with suitable generated files, such as documents, spreadsheets, PDFs, or images. Files are read only from a private per-turn directory, validated, limited to 10 files and 100 MB per file or response, and deleted locally after delivery. If file delivery fails, Pipa retries the declaration-free summary without the files. Attached OpenCode servers on non-loopback hosts use inline text fallback instead of local artifact delivery.
 

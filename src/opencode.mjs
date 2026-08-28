@@ -18,7 +18,6 @@ const ARTIFACT_MARKER = "PIPA_ARTIFACTS:";
 const MAX_ARTIFACT_DECLARATION_BYTES = 8 * 1024;
 const MAX_ARTIFACT_PATH_BYTES = 1024;
 const MAX_ARTIFACT_FILES = 10;
-const EMPTY_FILES = Object.freeze([]);
 
 export class PipaStoppedError extends Error {
   constructor(message = "Pipa is shutting down.") {
@@ -198,16 +197,17 @@ export function createOpenCodeExecutor(options = {}) {
           ]);
           const finalMessage = latestAssistantMessage(currentMessages, baseline);
           const status = statuses?.[selectedSessionId]?.type;
-          if (dismissed && status !== "busy" && status !== "retry") return { text: "", sessionId: selectedSessionId, files: EMPTY_FILES };
+          if (dismissed && status !== "busy" && status !== "retry") return { text: "", sessionId: selectedSessionId };
           if (["error", "failed", "cancelled"].includes(status) || finalMessage?.error) throw new Error("OpenCode failed to complete the turn.");
           if (finalMessage && (status === "idle" || (!status && finalMessage.completed))) {
-            if (!finalMessage.text && permissionRejected) return { text: "Stopped after a permission was rejected.", sessionId: selectedSessionId, files: EMPTY_FILES };
+            if (!finalMessage.text && permissionRejected) return { text: "Stopped after a permission was rejected.", sessionId: selectedSessionId };
             if (!finalMessage.text) throw new Error("OpenCode completed without assistant text.");
             const parsed = slackTurn ? parseArtifactDeclaration(finalMessage.text) : { text: finalMessage.text };
+            const artifacts = artifactDirectory && parsed.paths ? await readArtifacts(artifactDirectory, parsed.paths, options.onArtifactOpened) : [];
             return {
               text: parsed.text,
               sessionId: selectedSessionId,
-              files: artifactDirectory && parsed.paths ? await readArtifacts(artifactDirectory, parsed.paths, options.onArtifactOpened) : EMPTY_FILES,
+              ...(artifacts.length ? { files: artifacts } : {}),
             };
           }
           await delay(pollIntervalMs, controller.signal);
@@ -402,14 +402,14 @@ async function readArtifacts(directory, paths, onOpened) {
         const current = await lstat(filename, { bigint: true });
         if (bytesRead !== size || changedFile(before, after) || current.isSymbolicLink() || current.dev !== before.dev || current.ino !== before.ino) throw new Error("Artifact changed while being read.");
         total += size;
-        files.push(Object.freeze({ data: data.subarray(0, size), filename: sanitizeFilename(path.basename(relativePath)) }));
+        files.push({ data: data.subarray(0, size), filename: sanitizeFilename(path.basename(relativePath)) });
       } finally {
         await handle.close();
       }
     }
-    return Object.freeze(files);
+    return files;
   } catch {
-    return Object.freeze([]);
+    return [];
   }
 }
 
