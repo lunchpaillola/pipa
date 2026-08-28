@@ -5,6 +5,14 @@ import { createMemoryState } from "@chat-adapter/state-memory";
 import { canonicalWorkingDirectory, createManifest, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
 import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
 
+const TYPING_REFRESH_MS = 75_000;
+const TYPING_REFRESH_MESSAGES = [
+  "Digging into the work...",
+  "Making progress...",
+  "Checking the details...",
+  "Pulling this together...",
+];
+
 export async function initializePipa(input, options = {}) {
   const paths = options.paths ?? pipaPaths();
   const manifest = createManifest(input.botName);
@@ -91,6 +99,7 @@ export async function startPipa(options = {}) {
         onInteraction: (interaction) => interactions.onInteraction(interactionContext, interaction),
         onPermissionReplied: interactions.onPermissionReplied,
         onPermissionsReconciled: interactions.onPermissionsReconciled,
+        startTyping: (status) => thread.startTyping(status),
         deliver: (text) => postInChunks(thread, text),
         deliverFailure: (error) => thread.post(error instanceof PipaStoppedError
           ? `${config.botName} stopped before finishing this request.`
@@ -432,6 +441,7 @@ function displayName(value) {
 
 export function createConversationRunner({ sessionStore, runTurn }) {
   const tails = new Map();
+  const activeTyping = new Set();
   let closed = false;
   let closeReason;
 
@@ -440,21 +450,29 @@ export function createConversationRunner({ sessionStore, runTurn }) {
     if (closed) return Promise.reject(closeReason);
     const previous = tails.get(conversationKey) ?? Promise.resolve();
     const current = previous.catch(() => undefined).then(async () => {
-      const { deliver, deliverFailure, ...turn } = input;
-      let result;
+      const { deliver, deliverFailure, startTyping, ...turn } = input;
+      let stopTyping;
       try {
-        if (closed) throw closeReason;
-        result = await runTurn({ ...turn, sessionId: sessionStore.get(conversationKey) });
-        if (result.sessionId) await sessionStore.set(conversationKey, result.sessionId);
-      } catch (error) {
-        if (deliverFailure) {
-          await deliverFailure(error);
-          return { error };
+        let result;
+        try {
+          if (closed) throw closeReason;
+          stopTyping = createTypingLifecycle(startTyping);
+          if (stopTyping) activeTyping.add(stopTyping);
+          result = await runTurn({ ...turn, sessionId: sessionStore.get(conversationKey) });
+          if (result.sessionId) await sessionStore.set(conversationKey, result.sessionId);
+        } catch (error) {
+          if (deliverFailure) {
+            await deliverFailure(error);
+            return { error };
+          }
+          throw error;
         }
-        throw error;
+        if (deliver) await deliver(result.text);
+        return result;
+      } finally {
+        stopTyping?.();
+        activeTyping.delete(stopTyping);
       }
-      if (deliver) await deliver(result.text);
-      return result;
     });
     const tail = current.then(() => undefined, () => undefined);
     tails.set(conversationKey, tail);
@@ -466,8 +484,38 @@ export function createConversationRunner({ sessionStore, runTurn }) {
 
   return {
     enqueue,
-    close(reason = new PipaStoppedError()) { closed = true; closeReason ??= reason; },
+    close(reason = new PipaStoppedError()) {
+      closed = true;
+      closeReason ??= reason;
+      for (const stopTyping of activeTyping) stopTyping();
+      activeTyping.clear();
+    },
     drain: () => Promise.all([...tails.values()]),
+  };
+}
+
+function createTypingLifecycle(startTyping) {
+  if (!startTyping) return;
+  let stopped = false;
+  let refreshing = false;
+  let messageIndex = 0;
+  const refresh = (status) => {
+    if (stopped || refreshing) return;
+    refreshing = true;
+    try {
+      Promise.resolve(startTyping(status)).catch(() => undefined).finally(() => refreshing = false);
+    } catch {
+      refreshing = false;
+    }
+  };
+  refresh("Getting oriented...");
+  const timer = setInterval(() => {
+    if (!stopped && !refreshing) refresh(TYPING_REFRESH_MESSAGES[messageIndex++ % TYPING_REFRESH_MESSAGES.length]);
+  }, TYPING_REFRESH_MS);
+  timer.unref?.();
+  return () => {
+    stopped = true;
+    clearInterval(timer);
   };
 }
 

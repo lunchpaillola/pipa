@@ -241,6 +241,78 @@ test("conversation runner serializes one thread, overlaps threads, and persists 
   await second;
 });
 
+test("conversation runner refreshes typing only for active turns and stops it on settlement or close", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const events = [];
+  let finishFirst;
+  let finishDelivery;
+  let finishThird;
+  const finishRefresh = new Map();
+  const runner = createConversationRunner({
+    sessionStore: { get: () => null, set: async () => undefined },
+    runTurn: async ({ prompt }) => {
+      events.push(`run:${prompt}`);
+      if (prompt === "one") await new Promise((resolve) => finishFirst = resolve);
+      if (prompt === "three") await new Promise((resolve) => finishThird = resolve);
+      return { text: prompt, sessionId: `ses_${prompt}` };
+    },
+  });
+  const typing = (prompt) => (status) => {
+    events.push(`typing:${prompt}:${status}`);
+    if (status === "Digging into the work...") return new Promise((resolve) => finishRefresh.set(prompt, resolve));
+    if (status === "Making progress...") return Promise.reject(new Error("typing refresh unavailable"));
+    if (prompt === "two") throw new Error("typing unavailable");
+  };
+
+  const first = runner.enqueue("A", {
+    prompt: "one",
+    startTyping: typing("one"),
+    deliver: async () => {
+      events.push("deliver:one");
+      await new Promise((resolve) => finishDelivery = resolve);
+    },
+  });
+  const second = runner.enqueue("A", { prompt: "two", startTyping: typing("two") });
+  const third = runner.enqueue("B", { prompt: "three", startTyping: typing("three") });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [
+    "typing:one:Getting oriented...", "run:one",
+    "typing:three:Getting oriented...", "run:three",
+  ]);
+
+  t.mock.timers.tick(75_000);
+  await Promise.resolve();
+  assert.deepEqual(events.slice(-2), ["typing:one:Digging into the work...", "typing:three:Digging into the work..."]);
+  t.mock.timers.tick(75_000);
+  assert.equal(events.filter((event) => event.startsWith("typing:")).length, 4, "refreshes must not overlap");
+  for (const finish of finishRefresh.values()) finish();
+  await Promise.resolve();
+
+  finishFirst();
+  await waitFor(() => events.includes("deliver:one"));
+  t.mock.timers.tick(75_000);
+  await Promise.resolve();
+  assert.ok(events.includes("typing:one:Making progress..."));
+  assert.ok(events.includes("typing:three:Making progress..."));
+  finishDelivery();
+  await first;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events.slice(-2), ["typing:two:Getting oriented...", "run:two"]);
+  await second;
+  const settledCount = events.filter((event) => /^typing:(?:one|two):/u.test(event)).length;
+  const activeCount = events.filter((event) => event.startsWith("typing:three:")).length;
+  t.mock.timers.tick(300_000);
+  assert.equal(events.filter((event) => /^typing:(?:one|two):/u.test(event)).length, settledCount);
+  assert.ok(events.filter((event) => event.startsWith("typing:three:")).length > activeCount);
+
+  runner.close();
+  const closedCount = events.filter((event) => event.startsWith("typing:")).length;
+  t.mock.timers.tick(75_000);
+  assert.equal(events.filter((event) => event.startsWith("typing:")).length, closedCount);
+  finishThird();
+  await third;
+});
+
 test("failed turns release the conversation tail", async () => {
   let calls = 0;
   const runner = createConversationRunner({
@@ -273,6 +345,7 @@ test("closing the runner prevents queued turns from starting", async () => {
   let release;
   const prompts = [];
   const failures = [];
+  const typing = [];
   const runner = createConversationRunner({
     sessionStore: { get: () => null, set: async () => undefined },
     runTurn: async ({ prompt }) => {
@@ -282,7 +355,7 @@ test("closing the runner prevents queued turns from starting", async () => {
     },
   });
   const active = runner.enqueue("A", { prompt: "active" });
-  const queued = runner.enqueue("A", { prompt: "queued", deliverFailure: async (error) => failures.push(error) });
+  const queued = runner.enqueue("A", { prompt: "queued", startTyping: (status) => typing.push(status), deliverFailure: async (error) => failures.push(error) });
   await new Promise((resolve) => setImmediate(resolve));
   runner.close();
   release();
@@ -290,10 +363,11 @@ test("closing the runner prevents queued turns from starting", async () => {
   const result = await queued;
   assert.equal(result.error, failures[0]);
   assert.ok(result.error instanceof PipaStoppedError);
-  const late = await runner.enqueue("B", { prompt: "late", deliverFailure: async (error) => failures.push(error) });
+  const late = await runner.enqueue("B", { prompt: "late", startTyping: (status) => typing.push(status), deliverFailure: async (error) => failures.push(error) });
   assert.equal(late.error, failures[1]);
   assert.ok(late.error instanceof PipaStoppedError);
   assert.deepEqual(prompts, ["active"]);
+  assert.deepEqual(typing, []);
 });
 
 test("conversation tail preserves Slack delivery order", async () => {
