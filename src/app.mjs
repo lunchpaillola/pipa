@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import { Chat, Modal, TextInput } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
@@ -19,7 +20,8 @@ export async function initializePipa(input, options = {}) {
   const openCodeVersion = await (options.checkOpenCode ?? runOpenCodeVersion)();
   if (!/^v?1(?:\.|$)/u.test(openCodeVersion)) throw new Error(`Pipa requires OpenCode v1; found ${openCodeVersion || "an unknown version"}.`);
   await (options.checkSlackAppToken ?? checkSlackAppToken)(config.slackAppToken);
-  await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
+  const slackAuth = await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
+  warnMissingSlackScopes(slackAuth, options.warn);
 
   await saveConfig(config, paths, manifest);
   return { config, manifest, paths };
@@ -28,7 +30,8 @@ export async function initializePipa(input, options = {}) {
 export async function startPipa(options = {}) {
   const paths = options.paths ?? pipaPaths();
   const config = options.config ?? await loadConfig(paths.config);
-  await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
+  const slackAuth = await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
+  warnMissingSlackScopes(slackAuth, options.warn);
   const sessionStore = options.sessionStore ?? await createSessionStore(paths.sessions);
   const state = options.state ?? createMemoryState();
   const chat = options.chat ?? new Chat({
@@ -51,6 +54,7 @@ export async function startPipa(options = {}) {
   let executor;
   try {
     executor = options.executor ?? (options.createExecutor ?? createOpenCodeExecutor)({
+      artifactRoot: path.join(config.workingDirectory, ".pipa", "artifacts"),
       baseUrl: server.baseUrl,
       onFatal: server.fail,
     });
@@ -89,7 +93,8 @@ export async function startPipa(options = {}) {
         onInteraction: (interaction) => interactions.onInteraction(interactionContext, interaction),
         onPermissionReplied: interactions.onPermissionReplied,
         onPermissionsReconciled: interactions.onPermissionsReconciled,
-        deliver: (text) => postInChunks(thread, text),
+        startTyping: () => thread.startTyping("Working on it..."),
+        deliver: (result) => postResult(thread, result),
         deliverFailure: (error) => thread.post(error instanceof PipaStoppedError
           ? `${config.botName} stopped before finishing this request.`
           : `${config.botName} failed: ${safeError(error)}`),
@@ -438,10 +443,13 @@ export function createConversationRunner({ sessionStore, runTurn }) {
     if (closed) return Promise.reject(closeReason);
     const previous = tails.get(conversationKey) ?? Promise.resolve();
     const current = previous.catch(() => undefined).then(async () => {
-      const { deliver, deliverFailure, ...turn } = input;
+      const { deliver, deliverFailure, startTyping, ...turn } = input;
       let result;
       try {
         if (closed) throw closeReason;
+        try {
+          Promise.resolve(startTyping?.()).catch(() => undefined);
+        } catch {}
         result = await runTurn({ ...turn, sessionId: sessionStore.get(conversationKey) });
         if (result.sessionId) await sessionStore.set(conversationKey, result.sessionId);
       } catch (error) {
@@ -451,7 +459,7 @@ export function createConversationRunner({ sessionStore, runTurn }) {
         }
         throw error;
       }
-      if (deliver) await deliver(result.text);
+      if (deliver) await deliver(result);
       return result;
     });
     const tail = current.then(() => undefined, () => undefined);
@@ -478,7 +486,10 @@ export async function checkSlackToken(token, fetchImpl = fetch) {
   });
   const result = await response.json();
   if (!response.ok || !result.ok) throw new Error("Slack rejected the bot token.");
-  return result;
+  const headerScopes = response.headers?.get?.("x-oauth-scopes");
+  const grantedScopes = normalizeGrantedScopes(typeof headerScopes === "string" ? headerScopes.split(",") : undefined)
+    ?? normalizeGrantedScopes(result.response_metadata?.scopes);
+  return grantedScopes === undefined ? result : { ...result, grantedScopes };
 }
 
 export async function checkSlackAppToken(token, fetchImpl = fetch) {
@@ -530,6 +541,22 @@ function requireToken(value, label, prefix) {
   return token;
 }
 
+function normalizeGrantedScopes(value) {
+  if (Array.isArray(value) && value.every((scope) => typeof scope === "string" && scope.trim())) {
+    return [...new Set(value.map((scope) => scope.trim()))];
+  }
+}
+
+function warnMissingSlackScopes(auth, warn = (message) => process.stderr.write(`${message}\n`)) {
+  if (!Array.isArray(auth?.grantedScopes)) return;
+  const missing = ["channels:read", "assistant:write"].filter((scope) => !auth.grantedScopes.includes(scope));
+  if (!missing.length) return;
+  const scopes = missing.join(", ");
+  try {
+    warn(`Pipa warning: Slack bot token is missing recommended ${missing.length === 1 ? "scope" : "scopes"} ${scopes}. Add ${missing.length === 1 ? "it" : "them"} and reinstall or reauthorize the Slack app.`);
+  } catch {}
+}
+
 function safeError(error) {
   const message = error instanceof Error ? error.message : String(error);
   return message.replace(/xox[baprs]-[^\s]+|xapp-[^\s]+/gu, "[redacted]");
@@ -545,10 +572,59 @@ function slackContext(thread, message) {
   };
 }
 
-async function postInChunks(thread, text) {
-  for (let index = 0; index < text.length; index += 3500) {
-    await thread.post({ markdown: text.slice(index, index + 3500) });
+async function postResult(thread, { text, files = [] }) {
+  if (files.length) {
+    try {
+      await thread.post({ markdown: text, files });
+      return;
+    } catch {
+      // A failed adapter call may still have uploaded files, so retry text only.
+    }
   }
+  if (!text) return;
+  for (const markdown of splitSlackMarkdown(text)) await thread.post({ markdown });
+}
+
+function splitSlackMarkdown(text, limit = 3500) {
+  if (text.length <= limit) return [text];
+  const chunks = [];
+  let chunk = "";
+  let fence = "";
+  const append = (line) => {
+    const separator = chunk ? "\n" : "";
+    const closing = fence ? `\n${fence}` : "";
+    if (chunk && chunk.length + separator.length + line.length + closing.length > limit) {
+      chunks.push(chunk + closing);
+      chunk = fence ? `${fence}\n${line}` : line;
+    } else {
+      chunk += separator + line;
+    }
+    const marker = line.match(/^ {0,3}(```+|~~~+)/u)?.[0];
+    if (marker) fence = fence ? "" : marker;
+  };
+  for (const inputLine of text.split("\n")) {
+    let line = inputLine;
+    const emptyChunkLimit = limit - (fence ? (2 * fence.length) + 2 : 0);
+    if (line.length <= emptyChunkLimit) {
+      append(line);
+      continue;
+    }
+    if (chunk) {
+      chunks.push(chunk + (fence ? `\n${fence}` : ""));
+      chunk = fence ? `${fence}\n` : "";
+    }
+    const room = Math.max(1, limit - chunk.length - (fence ? fence.length + 1 : 0));
+    while (line.length > room) {
+      const boundary = line.slice(0, room + 1).search(/\s+\S*$/u);
+      const splitAt = boundary > 0 ? boundary : room;
+      chunks.push(chunk + line.slice(0, splitAt) + (fence ? `\n${fence}` : ""));
+      line = line.slice(splitAt).replace(/^\s+/u, "");
+      chunk = fence ? `${fence}\n` : "";
+    }
+    chunk += line;
+  }
+  if (chunk) chunks.push(chunk + (fence ? `\n${fence}` : ""));
+  return chunks;
 }
 
 async function react(thread, message, emoji) {

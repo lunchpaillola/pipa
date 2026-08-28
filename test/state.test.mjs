@@ -14,6 +14,7 @@ test("manifest preserves approved capabilities and substitutes the bot name", ()
   assert.doesNotMatch(`${manifest.display_information.description} ${manifest.display_information.long_description}`, /Pippette/u);
   assert.deepEqual(manifest.oauth_config.scopes.user, ["files:read", "files:write"]);
   assert.ok(manifest.oauth_config.scopes.bot.includes("channels:read"));
+  assert.ok(manifest.oauth_config.scopes.bot.includes("assistant:write"));
   assert.ok(manifest.oauth_config.scopes.bot.includes("users:read"));
   assert.deepEqual(manifest.settings.event_subscriptions.bot_events, ["app_mention", "message.channels", "message.groups"]);
   assert.equal(manifest.settings.interactivity.is_enabled, true);

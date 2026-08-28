@@ -23,6 +23,7 @@ const MANIFEST = {
       bot: [
         "files:read",
         "app_mentions:read",
+        "assistant:write",
         "channels:history",
         "channels:read",
         "chat:write",

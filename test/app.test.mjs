@@ -43,6 +43,90 @@ test("Slack auth errors never include the token", async () => {
   );
 });
 
+test("Slack bot checks normalize granted scopes from headers and response metadata", async () => {
+  const fromHeader = await checkSlackToken("xoxb-test", async () => ({
+    ok: true,
+    headers: { get: (name) => name === "x-oauth-scopes" ? " channels:read,assistant:write, channels:read " : null },
+    json: async () => ({ ok: true }),
+  }));
+  assert.deepEqual(fromHeader.grantedScopes, ["channels:read", "assistant:write"]);
+
+  const fromMetadata = await checkSlackToken("xoxb-test", async () => ({
+    ok: true,
+    headers: { get: () => null },
+    json: async () => ({ ok: true, response_metadata: { scopes: ["assistant:write", " channels:read "] } }),
+  }));
+  assert.deepEqual(fromMetadata.grantedScopes, ["assistant:write", "channels:read"]);
+
+  for (const responseMetadata of [undefined, { scopes: "not-a-list" }, { scopes: ["channels:read", 42] }]) {
+    const result = await checkSlackToken("xoxb-test", async () => ({
+      ok: true,
+      headers: { get: () => null },
+      json: async () => ({ ok: true, response_metadata: responseMetadata }),
+    }));
+    assert.equal(result.grantedScopes, undefined);
+  }
+});
+
+test("init and start warn about known missing Slack scopes without blocking", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-scopes-"));
+  const paths = pipaPaths(home);
+  const warnings = [];
+  let checks = 0;
+  const checkSlackToken = async () => ({ ok: true, grantedScopes: checks++ === 0 ? ["assistant:write"] : ["channels:read"] });
+  await initializePipa({
+    botName: "Pipa",
+    slackAppToken: "xapp-test",
+    slackBotToken: "xoxb-test",
+    workingDirectory: home,
+  }, {
+    paths,
+    checkOpenCode: async () => "1.0.0",
+    checkSlackAppToken: async () => ({ ok: true }),
+    checkSlackToken,
+    warn: (message) => warnings.push(message),
+  });
+  assert.equal(JSON.parse(await readFile(paths.config, "utf8")).botName, "Pipa");
+
+  const app = await startPipa({
+    chat: { onNewMention() {}, onSubscribedMessage() {}, async initialize() {}, async shutdown() {} },
+    executor: { runTurn: async () => undefined, stopAll() {} },
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    checkSlackToken,
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: home },
+    warn: (message) => warnings.push(message),
+  });
+  await app.shutdown();
+
+  assert.equal(warnings.length, 2);
+  assert.match(warnings[0], /channels:read/u);
+  assert.match(warnings[1], /assistant:write/u);
+  for (const warning of warnings) {
+    assert.match(warning, /Add it/u);
+    assert.match(warning, /reinstall or reauthorize/u);
+  }
+});
+
+test("complete or unknown Slack scope metadata does not warn", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-scopes-"));
+  for (const grantedScopes of [["channels:read", "assistant:write"], undefined]) {
+    const warnings = [];
+    await initializePipa({
+      botName: "Pipa",
+      slackAppToken: "xapp-test",
+      slackBotToken: "xoxb-test",
+      workingDirectory: home,
+    }, {
+      paths: pipaPaths(home),
+      checkOpenCode: async () => "1.0.0",
+      checkSlackAppToken: async () => ({ ok: true }),
+      checkSlackToken: async () => ({ ok: true, grantedScopes }),
+      warn: (message) => warnings.push(message),
+    });
+    assert.deepEqual(warnings, []);
+  }
+});
+
 test("starts and health-checks OpenCode before Slack, then stops only the owned server", async () => {
   const events = [];
   let stopServer;
@@ -72,8 +156,9 @@ test("starts and health-checks OpenCode before Slack, then stops only the owned 
     checkSlackToken: async () => ({ ok: true }),
     config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
     startServer: async () => { events.push("server:ready"); return server; },
-    createExecutor: ({ baseUrl, onFatal }) => {
+    createExecutor: ({ artifactRoot, baseUrl, onFatal }) => {
       events.push(`executor:${baseUrl}`);
+      assert.equal(artifactRoot, path.join("/work", ".pipa", "artifacts"));
       assert.equal(onFatal, server.fail);
       return { runTurn: async () => undefined, stopAll: () => events.push("executor:stop") };
     },
@@ -157,6 +242,18 @@ test("conversation runner serializes one thread, overlaps threads, and persists 
   await second;
 });
 
+test("conversation runner starts typing once for active turns and ignores typing failures", async () => {
+  const typing = [];
+  const runner = createConversationRunner({
+    sessionStore: { get: () => null, set: async () => undefined },
+    runTurn: async ({ prompt }) => ({ text: prompt, sessionId: `ses_${prompt}` }),
+  });
+  await runner.enqueue("A", { prompt: "one", startTyping: () => typing.push("one") });
+  await runner.enqueue("A", { prompt: "two", startTyping: () => { throw new Error("typing unavailable"); } });
+  await runner.enqueue("B", { prompt: "three", startTyping: async () => { throw new Error("typing unavailable"); } });
+  assert.deepEqual(typing, ["one"]);
+});
+
 test("failed turns release the conversation tail", async () => {
   let calls = 0;
   const runner = createConversationRunner({
@@ -170,6 +267,20 @@ test("failed turns release the conversation tail", async () => {
   await assert.rejects(runner.enqueue("A", { prompt: "one" }), /failed/u);
   assert.equal((await runner.enqueue("A", { prompt: "two" })).text, "recovered");
   assert.equal(calls, 2);
+});
+
+test("failed delivery releases the conversation tail", async () => {
+  const runner = createConversationRunner({
+    sessionStore: { get: () => null, set: async () => undefined },
+    runTurn: async ({ prompt }) => ({ text: prompt, sessionId: `ses_${prompt}` }),
+  });
+  const first = runner.enqueue("A", {
+    prompt: "one",
+    deliver: async () => { throw new Error("delivery failed"); },
+  });
+  const second = runner.enqueue("A", { prompt: "two" });
+  await assert.rejects(first, /delivery failed/u);
+  await second;
 });
 
 test("failed replacement turns do not overwrite the persisted session", async () => {
@@ -189,6 +300,7 @@ test("closing the runner prevents queued turns from starting", async () => {
   let release;
   const prompts = [];
   const failures = [];
+  const typing = [];
   const runner = createConversationRunner({
     sessionStore: { get: () => null, set: async () => undefined },
     runTurn: async ({ prompt }) => {
@@ -198,7 +310,7 @@ test("closing the runner prevents queued turns from starting", async () => {
     },
   });
   const active = runner.enqueue("A", { prompt: "active" });
-  const queued = runner.enqueue("A", { prompt: "queued", deliverFailure: async (error) => failures.push(error) });
+  const queued = runner.enqueue("A", { prompt: "queued", startTyping: (status) => typing.push(status), deliverFailure: async (error) => failures.push(error) });
   await new Promise((resolve) => setImmediate(resolve));
   runner.close();
   release();
@@ -206,10 +318,11 @@ test("closing the runner prevents queued turns from starting", async () => {
   const result = await queued;
   assert.equal(result.error, failures[0]);
   assert.ok(result.error instanceof PipaStoppedError);
-  const late = await runner.enqueue("B", { prompt: "late", deliverFailure: async (error) => failures.push(error) });
+  const late = await runner.enqueue("B", { prompt: "late", startTyping: (status) => typing.push(status), deliverFailure: async (error) => failures.push(error) });
   assert.equal(late.error, failures[1]);
   assert.ok(late.error instanceof PipaStoppedError);
   assert.deepEqual(prompts, ["active"]);
+  assert.deepEqual(typing, []);
 });
 
 test("conversation tail preserves Slack delivery order", async () => {
@@ -356,6 +469,97 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   await app.shutdown();
   assert.deepEqual(restored.slice(-2), ["stopped", "shutdown"]);
 });
+
+test("Slack posts short text and artifacts once", async () => {
+  const files = [
+    { filename: "report.csv", data: Buffer.from("a,b\n1,2\n") },
+    { filename: "brief.pdf", data: Buffer.from([0x25, 0x50, 0x44, 0x46]) },
+  ];
+  const { app, mention, posts, reactions } = await deliveryApp({ text: "Executive summary.", files });
+  await mention();
+  await waitFor(() => posts.length === 1);
+  assert.deepEqual(posts, [{ markdown: "Executive summary.", files }]);
+  assert.deepEqual(reactions, ["add:eyes", "remove:eyes", "add:white_check_mark"]);
+  await app.shutdown();
+
+  const inline = await deliveryApp({ text: "Short answer.", files: [] });
+  await inline.mention();
+  await waitFor(() => inline.posts.length === 1);
+  assert.deepEqual(inline.posts, [{ markdown: "Short answer." }]);
+  await inline.app.shutdown();
+
+  const empty = await deliveryApp({ text: "", files: [] });
+  await empty.mention();
+  await waitFor(() => empty.reactions.includes("add:white_check_mark"));
+  assert.deepEqual(empty.posts, []);
+  await empty.app.shutdown();
+});
+
+test("failed artifact post retries declaration-free text once without files", async () => {
+  const files = [{ filename: "image.png", data: Buffer.from([1, 2, 3]) }];
+  const delivery = await deliveryApp({ text: "Summary.", files }, { failFiles: true });
+  await delivery.mention();
+  await waitFor(() => delivery.posts.length === 2);
+  assert.deepEqual(delivery.posts, [
+    { markdown: "Summary.", files },
+    { markdown: "Summary." },
+  ]);
+  assert.deepEqual(delivery.reactions, ["add:eyes", "remove:eyes", "add:white_check_mark"]);
+  await delivery.app.shutdown();
+});
+
+test("inline fallback prefers paragraphs and lines and preserves fenced code across chunks", async () => {
+  const paragraph = "ordinary words ".repeat(240).trim();
+  const codeLine = `const value = "${"x".repeat(3400)}";`;
+  const text = `${paragraph}\n\n\`\`\`js\n${codeLine}\nconsole.log(value);\n\`\`\`\n\n   ~~~js\n${"y".repeat(3490)}\n   ~~~\n\nFinal paragraph.`;
+  const delivery = await deliveryApp({ text, files: [] });
+  await delivery.mention();
+  await waitFor(() => delivery.posts.length > 1);
+  const chunks = delivery.posts.map((post) => post.markdown);
+  assert.ok(chunks.every((chunk) => chunk.length <= 3500));
+  assert.equal(chunks.join(" ").split("```js")[0].replace(/\s+/gu, " ").trim(), paragraph);
+  for (const chunk of chunks) assert.equal((chunk.match(/^ {0,3}(?:```|~~~)/gmu) ?? []).length % 2, 0, `unbalanced fence: ${chunk}`);
+  assert.match(chunks.join("\n"), /Final paragraph\./u);
+  await delivery.app.shutdown();
+});
+
+async function deliveryApp(result, { failFiles = false } = {}) {
+  const handlers = {};
+  const posts = [];
+  const reactions = [];
+  const chat = {
+    onNewMention(handler) { handlers.mention = handler; },
+    onSubscribedMessage() {},
+    async initialize() {},
+    async shutdown() {},
+  };
+  const app = await startPipa({
+    chat,
+    executor: { runTurn: async () => ({ ...result, sessionId: "ses_1" }), stopAll() {} },
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+  });
+  const thread = {
+    id: "slack:C1:1.0",
+    adapter: {
+      addReaction: async (_, __, emoji) => reactions.push(`add:${emoji}`),
+      removeReaction: async (_, __, emoji) => reactions.push(`remove:${emoji}`),
+    },
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async (payload) => {
+      posts.push(payload);
+      if (failFiles && payload.files) throw new Error("adapter rejected files");
+    },
+  };
+  return {
+    app,
+    posts,
+    reactions,
+    mention: () => handlers.mention(thread, { id: "1", text: "@Pipa work", author: { userId: "U1" }, raw: {} }),
+  };
+}
 
 test("reports an intentional stop for an active Slack turn", async () => {
   const handlers = {};

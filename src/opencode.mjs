@@ -1,5 +1,6 @@
 import crossSpawn from "cross-spawn";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -13,6 +14,10 @@ const SECRET_ENV_KEYS = new Set([
 const LISTENING_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+/u;
 
 export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+const ARTIFACT_MARKER = "PIPA_ARTIFACTS:";
+const MAX_ARTIFACT_DECLARATION_BYTES = 8 * 1024;
+const MAX_ARTIFACT_PATH_BYTES = 1024;
+const MAX_ARTIFACT_FILES = 10;
 
 export class PipaStoppedError extends Error {
   constructor(message = "Pipa is shutting down.") {
@@ -80,6 +85,8 @@ export function createOpenCodeExecutor(options = {}) {
   const requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
   const pollIntervalMs = options.pollIntervalMs ?? 1_000;
   const useDataUrls = !isLoopbackUrl(baseUrl);
+  const remove = options.rm ?? rm;
+  const artifactRoot = options.artifactRoot;
   const active = new Set();
   let stopReason;
 
@@ -122,16 +129,23 @@ export function createOpenCodeExecutor(options = {}) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     if (stopReason) throw stopReason;
     const temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
-    let turnError;
+    const slackTurn = contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack";
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error(`OpenCode timed out after ${timeoutMs}ms.`)), timeoutMs);
+    active.add(controller);
+    let artifactDirectory;
 
     try {
-      const files = await stageAttachments(attachments, temporaryDirectory, timeoutMs, useDataUrls);
-      if (stopReason) throw stopReason;
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(new Error(`OpenCode timed out after ${timeoutMs}ms.`)), timeoutMs);
-      active.add(controller);
-
       try {
+        if (slackTurn && !useDataUrls && artifactRoot) {
+          try {
+            await mkdir(artifactRoot, { recursive: true, mode: 0o700 });
+            artifactDirectory = await mkdtemp(path.join(artifactRoot, "turn-"));
+          } catch {}
+        }
+        if (artifactDirectory) await chmod(artifactDirectory, 0o700);
+        const files = await stageAttachments(attachments, temporaryDirectory, timeoutMs, useDataUrls, controller.signal);
+        if (stopReason) throw stopReason;
         let selectedSessionId = sessionId;
         let messages;
         if (selectedSessionId) {
@@ -179,7 +193,7 @@ export function createOpenCodeExecutor(options = {}) {
         }
         await request(`/session/${encodeURIComponent(selectedSessionId)}/prompt_async`, {
           method: "POST",
-          body: JSON.stringify(promptBody(prompt.trim(), files, contextEnvironment)),
+          body: JSON.stringify(promptBody(prompt.trim(), files, contextEnvironment, artifactDirectory)),
         }, workingDirectory, controller, [204]);
 
         while (true) {
@@ -194,7 +208,13 @@ export function createOpenCodeExecutor(options = {}) {
           if (finalMessage && (status === "idle" || (!status && finalMessage.completed))) {
             if (!finalMessage.text && permissionRejected) return { text: "Stopped after a permission was rejected.", sessionId: selectedSessionId };
             if (!finalMessage.text) throw new Error("OpenCode completed without assistant text.");
-            return { text: finalMessage.text, sessionId: selectedSessionId };
+            const parsed = slackTurn ? parseArtifactDeclaration(finalMessage.text) : { text: finalMessage.text };
+            const artifacts = artifactDirectory && parsed.paths ? await readArtifacts(artifactDirectory, parsed.paths, options.onArtifactOpened) : [];
+            return {
+              text: parsed.text,
+              sessionId: selectedSessionId,
+              ...(artifacts.length ? { files: artifacts } : {}),
+            };
           }
           await delay(pollIntervalMs, controller.signal);
         }
@@ -204,16 +224,21 @@ export function createOpenCodeExecutor(options = {}) {
         active.delete(controller);
       }
     } catch (error) {
-      turnError = error;
       if (stopReason) throw stopReason;
       throw error;
     } finally {
       if (temporaryDirectory) {
         try {
-          await rm(temporaryDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
-        } catch (error) {
-          if (!turnError) throw error;
+          await remove(temporaryDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        } catch {
           process.stderr.write("Pipa could not remove temporary attachment files.\n");
+        }
+      }
+      if (artifactDirectory) {
+        try {
+          await remove(artifactDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        } catch {
+          process.stderr.write("Pipa could not remove temporary artifact files.\n");
         }
       }
     }
@@ -286,24 +311,18 @@ export async function runOpenCodeVersion(options = {}) {
   }
 }
 
-async function stageAttachments(attachments, temporaryDirectory, timeoutMs, useDataUrls) {
+async function stageAttachments(attachments, temporaryDirectory, timeoutMs, useDataUrls, signal) {
   const files = [];
   for (const [index, attachment] of attachments.entries()) {
     let data;
     try {
-      data = await fetchAttachment(attachment, timeoutMs);
+      data = await fetchAttachment(attachment, timeoutMs, signal);
     } catch {
       throw new Error("Could not read one of the attached files. Please try uploading it again.");
     }
     if (data.byteLength > MAX_ATTACHMENT_BYTES) throw new Error("Attached files must be 100 MB or smaller.");
     try {
-      const sanitizedName = path.basename(attachment.name || "attachment")
-        .replace(/[<>:"/\\|?*\u0000-\u001f]/gu, "_")
-        .replace(/[. ]+$/u, "");
-      const filename = Array.from(sanitizedName).reduce(
-        (result, character) => Buffer.byteLength(result + character) <= 200 ? result + character : result,
-        "",
-      ) || "attachment";
+      const filename = sanitizeFilename(path.basename(attachment.name || "attachment"), "attachment");
       const file = path.join(temporaryDirectory, `${index + 1}-${filename}`);
       await writeFile(file, data);
       const mime = attachment.mimeType || "application/octet-stream";
@@ -319,13 +338,94 @@ async function stageAttachments(attachments, temporaryDirectory, timeoutMs, useD
   return files;
 }
 
-function promptBody(prompt, files, contextEnvironment) {
+function promptBody(prompt, files, contextEnvironment, artifactDirectory) {
   const parts = [{ type: "text", text: prompt }, ...files.map((file) => ({ type: "file", ...file }))];
   const context = Object.entries(contextEnvironment).filter(([, value]) => value !== undefined && value !== null && String(value));
+  const instructions = [];
+  if (context.length) instructions.push(`Slack context for this turn (provided here, not as shell environment variables):\n${context.map(([key, value]) => `${key}=${value}`).join("\n")}`);
+  if (contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack") {
+    instructions.push("Keep naturally short answers inline. For deeper work or larger deliverables, keep the Slack response concise and use the most suitable artifact format.");
+    if (artifactDirectory) instructions.push(`To attach files, copy up to 10 top-level files (100 MB total) to this private artifact directory: ${artifactDirectory}\nEnd with exactly one final line: ${ARTIFACT_MARKER} [\"report.csv\",\"brief.pdf\"]`);
+  }
   return {
     parts,
-    ...(context.length ? { system: `Slack context for this turn (provided here, not as shell environment variables):\n${context.map(([key, value]) => `${key}=${value}`).join("\n")}` } : {}),
+    ...(instructions.length ? { system: instructions.join("\n\n") } : {}),
   };
+}
+
+function parseArtifactDeclaration(text) {
+  const lines = text.split(/\r?\n/u);
+  const declarations = lines.map((line, index) => line.startsWith(ARTIFACT_MARKER) ? { line, index } : null).filter(Boolean);
+  const cleanText = lines.filter((line) => !line.startsWith(ARTIFACT_MARKER)).join("\n").trim();
+  const lastNonblank = lines.findLastIndex((line) => line.trim());
+  if (declarations.length !== 1 || declarations[0].index !== lastNonblank) return { text: cleanText };
+  const declaration = declarations[0].line;
+  if (!declaration.startsWith(`${ARTIFACT_MARKER} `) || Buffer.byteLength(declaration) > MAX_ARTIFACT_DECLARATION_BYTES) return { text: cleanText };
+  let paths;
+  try {
+    paths = JSON.parse(declaration.slice(ARTIFACT_MARKER.length + 1));
+  } catch {
+    return { text: cleanText };
+  }
+  if (!Array.isArray(paths) || !paths.length || paths.length > MAX_ARTIFACT_FILES || paths.some((item) => typeof item !== "string")) return { text: cleanText };
+  if (new Set(paths).size !== paths.length || paths.some((item) => !validArtifactPath(item))) return { text: cleanText };
+  return { text: cleanText, paths };
+}
+
+function validArtifactPath(value) {
+  if (!value || Buffer.byteLength(value) > MAX_ARTIFACT_PATH_BYTES || value.includes("\0") || value.includes("\\") || path.isAbsolute(value)) return false;
+  const parts = value.split("/");
+  return parts.length === 1 && parts[0] !== "." && parts[0] !== "..";
+}
+
+async function readArtifacts(directory, paths, onOpened) {
+  const files = [];
+  let total = 0;
+  try {
+    const root = await realpath(directory);
+    for (const relativePath of paths) {
+      const filename = path.resolve(root, relativePath);
+      if (!filename.startsWith(`${root}${path.sep}`)) throw new Error("Artifact path escaped its directory.");
+      let current = root;
+      for (const part of relativePath.split("/")) {
+        current = path.join(current, part);
+        if ((await lstat(current)).isSymbolicLink()) throw new Error("Artifact path contains a symbolic link.");
+      }
+      const handle = await open(filename, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      try {
+        const before = await handle.stat({ bigint: true });
+        await onOpened?.(filename);
+        const size = Number(before.size);
+        if (!before.isFile() || size > MAX_ATTACHMENT_BYTES || total + size > MAX_ATTACHMENT_BYTES) throw new Error("Artifact exceeds delivery limits.");
+        const data = Buffer.alloc(size + 1);
+        let bytesRead = 0;
+        while (bytesRead < data.length) {
+          const read = await handle.read(data, bytesRead, data.length - bytesRead, bytesRead);
+          if (!read.bytesRead) break;
+          bytesRead += read.bytesRead;
+        }
+        const after = await handle.stat({ bigint: true });
+        const current = await lstat(filename, { bigint: true });
+        if (bytesRead !== size || changedFile(before, after) || current.isSymbolicLink() || current.dev !== before.dev || current.ino !== before.ino) throw new Error("Artifact changed while being read.");
+        total += size;
+        files.push({ data: data.subarray(0, size), filename: sanitizeFilename(path.basename(relativePath)) });
+      } finally {
+        await handle.close();
+      }
+    }
+    return files;
+  } catch {
+    return [];
+  }
+}
+
+function changedFile(before, after) {
+  return before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs;
+}
+
+function sanitizeFilename(value, fallback = "artifact") {
+  const sanitized = value.replace(/[<>:"/\\|?*\u0000-\u001f]/gu, "_").replace(/[. ]+$/u, "");
+  return Array.from(sanitized).reduce((result, character) => Buffer.byteLength(result + character) <= 200 ? result + character : result, "") || fallback;
 }
 
 function latestAssistantMessage(messages, baseline) {
@@ -458,12 +558,11 @@ function serverUrl(baseUrl, pathname, workingDirectory) {
   return url;
 }
 
-function fetchAttachment(attachment, timeoutMs) {
-  let timer;
+function fetchAttachment(attachment, timeoutMs, signal) {
   return Promise.race([
     attachment.fetchData(),
-    new Promise((_, reject) => timer = setTimeout(() => reject(new Error(`Attachment download timed out after ${timeoutMs}ms.`)), timeoutMs)),
-  ]).finally(() => clearTimeout(timer));
+    delay(timeoutMs, signal).then(() => { throw new Error(`Attachment download timed out after ${timeoutMs}ms.`); }),
+  ]);
 }
 
 function delay(delayMs, signal) {
