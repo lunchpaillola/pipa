@@ -43,6 +43,90 @@ test("Slack auth errors never include the token", async () => {
   );
 });
 
+test("Slack bot checks normalize granted scopes from headers and response metadata", async () => {
+  const fromHeader = await checkSlackToken("xoxb-test", async () => ({
+    ok: true,
+    headers: { get: (name) => name === "x-oauth-scopes" ? " channels:read,assistant:write, channels:read " : null },
+    json: async () => ({ ok: true }),
+  }));
+  assert.deepEqual(fromHeader.grantedScopes, ["channels:read", "assistant:write"]);
+
+  const fromMetadata = await checkSlackToken("xoxb-test", async () => ({
+    ok: true,
+    headers: { get: () => null },
+    json: async () => ({ ok: true, response_metadata: { scopes: ["assistant:write", " channels:read "] } }),
+  }));
+  assert.deepEqual(fromMetadata.grantedScopes, ["assistant:write", "channels:read"]);
+
+  for (const responseMetadata of [undefined, { scopes: "not-a-list" }, { scopes: ["channels:read", 42] }]) {
+    const result = await checkSlackToken("xoxb-test", async () => ({
+      ok: true,
+      headers: { get: () => null },
+      json: async () => ({ ok: true, response_metadata: responseMetadata }),
+    }));
+    assert.equal(result.grantedScopes, undefined);
+  }
+});
+
+test("init and start warn about known missing Slack scopes without blocking", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-scopes-"));
+  const paths = pipaPaths(home);
+  const warnings = [];
+  let checks = 0;
+  const checkSlackToken = async () => ({ ok: true, grantedScopes: checks++ === 0 ? ["assistant:write"] : ["channels:read"] });
+  await initializePipa({
+    botName: "Pipa",
+    slackAppToken: "xapp-test",
+    slackBotToken: "xoxb-test",
+    workingDirectory: home,
+  }, {
+    paths,
+    checkOpenCode: async () => "1.0.0",
+    checkSlackAppToken: async () => ({ ok: true }),
+    checkSlackToken,
+    warn: (message) => warnings.push(message),
+  });
+  assert.equal(JSON.parse(await readFile(paths.config, "utf8")).botName, "Pipa");
+
+  const app = await startPipa({
+    chat: { onNewMention() {}, onSubscribedMessage() {}, async initialize() {}, async shutdown() {} },
+    executor: { runTurn: async () => undefined, stopAll() {} },
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    checkSlackToken,
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: home },
+    warn: (message) => warnings.push(message),
+  });
+  await app.shutdown();
+
+  assert.equal(warnings.length, 2);
+  assert.match(warnings[0], /channels:read/u);
+  assert.match(warnings[1], /assistant:write/u);
+  for (const warning of warnings) {
+    assert.match(warning, /Add it/u);
+    assert.match(warning, /reinstall or reauthorize/u);
+  }
+});
+
+test("complete or unknown Slack scope metadata does not warn", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-scopes-"));
+  for (const grantedScopes of [["channels:read", "assistant:write"], undefined]) {
+    const warnings = [];
+    await initializePipa({
+      botName: "Pipa",
+      slackAppToken: "xapp-test",
+      slackBotToken: "xoxb-test",
+      workingDirectory: home,
+    }, {
+      paths: pipaPaths(home),
+      checkOpenCode: async () => "1.0.0",
+      checkSlackAppToken: async () => ({ ok: true }),
+      checkSlackToken: async () => ({ ok: true, grantedScopes }),
+      warn: (message) => warnings.push(message),
+    });
+    assert.deepEqual(warnings, []);
+  }
+});
+
 test("starts and health-checks OpenCode before Slack, then stops only the owned server", async () => {
   const events = [];
   let stopServer;

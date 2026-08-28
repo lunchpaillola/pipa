@@ -74,6 +74,7 @@ if (process.argv[2] === "--version") {
   const manifest = JSON.parse(await readFile(path.join(home, ".pipa", "slack-manifest.json"), "utf8"));
   if (config.botName !== "Pack Bot" || config.workingDirectory !== await realpath(workingDirectory)) throw new Error("Packed init wrote invalid config.");
   if (manifest.display_information.name !== "Pack Bot") throw new Error("Packed init wrote invalid manifest.");
+  if (!["channels:read", "assistant:write"].every((scope) => manifest.oauth_config.scopes.bot.includes(scope))) throw new Error("Packed init wrote incomplete Slack bot scopes.");
 
   const cancelledHome = path.join(directory, "cancelled-home");
   await mkdir(cancelledHome);

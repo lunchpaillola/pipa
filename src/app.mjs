@@ -19,7 +19,8 @@ export async function initializePipa(input, options = {}) {
   const openCodeVersion = await (options.checkOpenCode ?? runOpenCodeVersion)();
   if (!/^v?1(?:\.|$)/u.test(openCodeVersion)) throw new Error(`Pipa requires OpenCode v1; found ${openCodeVersion || "an unknown version"}.`);
   await (options.checkSlackAppToken ?? checkSlackAppToken)(config.slackAppToken);
-  await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
+  const slackAuth = await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
+  warnMissingSlackScopes(slackAuth, options.warn);
 
   await saveConfig(config, paths, manifest);
   return { config, manifest, paths };
@@ -28,7 +29,8 @@ export async function initializePipa(input, options = {}) {
 export async function startPipa(options = {}) {
   const paths = options.paths ?? pipaPaths();
   const config = options.config ?? await loadConfig(paths.config);
-  await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
+  const slackAuth = await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
+  warnMissingSlackScopes(slackAuth, options.warn);
   const sessionStore = options.sessionStore ?? await createSessionStore(paths.sessions);
   const state = options.state ?? createMemoryState();
   const chat = options.chat ?? new Chat({
@@ -478,7 +480,9 @@ export async function checkSlackToken(token, fetchImpl = fetch) {
   });
   const result = await response.json();
   if (!response.ok || !result.ok) throw new Error("Slack rejected the bot token.");
-  return result;
+  const grantedScopes = normalizeGrantedScopes(response.headers?.get?.("x-oauth-scopes"), true)
+    ?? normalizeGrantedScopes(result.response_metadata?.scopes, false);
+  return grantedScopes === undefined ? result : { ...result, grantedScopes };
 }
 
 export async function checkSlackAppToken(token, fetchImpl = fetch) {
@@ -528,6 +532,26 @@ function requireToken(value, label, prefix) {
   const token = String(value ?? "").trim();
   if (!token.startsWith(prefix)) throw new Error(`${label} must start with ${prefix}`);
   return token;
+}
+
+function normalizeGrantedScopes(value, stringValue) {
+  if (stringValue && typeof value === "string") {
+    const scopes = value.split(",").map((scope) => scope.trim());
+    return scopes.length && scopes.every(Boolean) ? [...new Set(scopes)] : undefined;
+  }
+  if (!stringValue && Array.isArray(value) && value.every((scope) => typeof scope === "string" && scope.trim())) {
+    return [...new Set(value.map((scope) => scope.trim()))];
+  }
+}
+
+function warnMissingSlackScopes(auth, warn = (message) => process.stderr.write(`${message}\n`)) {
+  if (!Array.isArray(auth?.grantedScopes)) return;
+  const missing = ["channels:read", "assistant:write"].filter((scope) => !auth.grantedScopes.includes(scope));
+  if (!missing.length) return;
+  const scopes = missing.join(", ");
+  try {
+    warn(`Pipa warning: Slack bot token is missing recommended ${missing.length === 1 ? "scope" : "scopes"} ${scopes}. Add ${missing.length === 1 ? "it" : "them"} and reinstall or reauthorize the Slack app.`);
+  } catch {}
 }
 
 function safeError(error) {
