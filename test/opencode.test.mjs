@@ -784,7 +784,7 @@ test("artifact reads enforce per-file and aggregate 100 MB limits", async () => 
 });
 
 test("artifact reads reject a file replaced after opening and sanitize delivered filenames", async () => {
-  let replaced = false;
+  let replacementAttempted = false;
   const executor = createOpenCodeExecutor({
     baseUrl: "http://localhost:5555",
     fetch: artifactFetch(async (body) => {
@@ -796,13 +796,13 @@ test("artifact reads reject a file replaced after opening and sanitize delivered
     pollIntervalMs: 1,
     onArtifactOpened: async (filename) => {
       if (!filename.endsWith("replace.txt")) return;
+      replacementAttempted = true;
       await writeFile(`${filename}.new`, "replacement");
       await rename(`${filename}.new`, filename);
-      replaced = true;
     },
   });
   const rejected = await executor.runTurn({ prompt: "work", sessionId: "ses_1", workingDirectory: "/work", contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" } });
-  assert.equal(replaced, true);
+  assert.equal(replacementAttempted, true);
   assert.deepEqual(rejected.files, []);
 
   const sanitized = await artifactTurn({ response: async (body) => {
