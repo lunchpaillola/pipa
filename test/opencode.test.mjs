@@ -681,11 +681,11 @@ test("Slack turns request concise delivery and return declared binary artifacts"
     },
   });
 
-  assert.match(system, /concise executive summary or TL;DR/u);
+  assert.match(system, /For deeper work or larger deliverables/u);
   assert.match(system, /Keep naturally short answers inline/u);
-  assert.match(system, /choose the most suitable artifact format/u);
+  assert.match(system, /use the most suitable artifact format/u);
   assert.match(system, new RegExp(artifactDirectory.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
-  assert.match(system, /Continue normal work in the configured workspace/u);
+  assert.match(system, /copy up to 10 top-level files \(100 MB total\)/u);
   assert.match(system, /PIPA_ARTIFACTS: \["report\.csv","brief\.pdf"\]/u);
   assert.match(system, /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
   assert.equal(result.text, "Ready for review.");
@@ -710,7 +710,7 @@ test("short Slack answers stay inline and remote attached servers get no local a
     contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" },
     response: async (body) => { remoteSystem = body.system; return 'Summary.\nPIPA_ARTIFACTS: ["private.pdf"]'; },
   });
-  assert.match(remoteSystem, /concise executive summary or TL;DR/u);
+  assert.match(remoteSystem, /For deeper work or larger deliverables/u);
   assert.doesNotMatch(remoteSystem, /PIPA_ARTIFACTS|artifact director|pipa-artifacts-/u);
   assert.deepEqual(remote, { text: "Summary.", sessionId: "ses_1" });
 

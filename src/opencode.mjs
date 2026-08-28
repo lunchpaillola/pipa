@@ -338,8 +338,8 @@ function promptBody(prompt, files, contextEnvironment, artifactDirectory) {
   const instructions = [];
   if (context.length) instructions.push(`Slack context for this turn (provided here, not as shell environment variables):\n${context.map(([key, value]) => `${key}=${value}`).join("\n")}`);
   if (contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack") {
-    instructions.push("For Slack delivery, lead with a concise executive summary or TL;DR. Keep naturally short answers inline. For deeper work, choose the most suitable artifact format rather than defaulting to Markdown.");
-    if (artifactDirectory) instructions.push(`Place copies of files intended for Slack delivery in this private artifact directory: ${artifactDirectory}\nContinue normal work in the configured workspace. Use at most ten unique top-level filenames, each no larger than 100 MB and no more than 100 MB total. End with exactly one final nonblank terminal line in this form: ${ARTIFACT_MARKER} [\"report.csv\",\"brief.pdf\"]`);
+    instructions.push("Keep naturally short answers inline. For deeper work or larger deliverables, keep the Slack response concise and use the most suitable artifact format.");
+    if (artifactDirectory) instructions.push(`To attach files, copy up to 10 top-level files (100 MB total) to this private artifact directory: ${artifactDirectory}\nEnd with exactly one final line: ${ARTIFACT_MARKER} [\"report.csv\",\"brief.pdf\"]`);
   }
   return {
     parts,
