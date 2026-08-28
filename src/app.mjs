@@ -53,6 +53,7 @@ export async function startPipa(options = {}) {
   let executor;
   try {
     executor = options.executor ?? (options.createExecutor ?? createOpenCodeExecutor)({
+      artifactRoot: paths.artifacts,
       baseUrl: server.baseUrl,
       onFatal: server.fail,
     });

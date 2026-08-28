@@ -786,6 +786,7 @@ test("artifact reads enforce per-file and aggregate 100 MB limits", async () => 
 test("artifact reads reject a file replaced after opening and sanitize delivered filenames", async () => {
   let replacementAttempted = false;
   const executor = createOpenCodeExecutor({
+    artifactRoot: os.tmpdir(),
     baseUrl: "http://localhost:5555",
     fetch: artifactFetch(async (body) => {
       const directory = artifactPath(body.system);
@@ -822,7 +823,7 @@ test("artifact directories are cleaned after OpenCode failure, timeout, and canc
       if (mode === "failure") throw new Error("prompt failed");
       return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
     });
-    executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, requestTimeoutMs: mode === "timeout" ? 5 : 30_000 });
+    executor = createOpenCodeExecutor({ artifactRoot: os.tmpdir(), baseUrl: "http://localhost:5555", fetch, requestTimeoutMs: mode === "timeout" ? 5 : 30_000 });
     const turn = executor.runTurn({ prompt: "work", sessionId: "ses_1", workingDirectory: os.tmpdir(), contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" } });
     if (mode === "cancel") {
       await waitForValue(() => directory);
@@ -836,6 +837,7 @@ test("artifact directories are cleaned after OpenCode failure, timeout, and canc
 test("artifact cleanup failure does not replace a completed turn", async () => {
   let directory;
   const executor = createOpenCodeExecutor({
+    artifactRoot: os.tmpdir(),
     baseUrl: "http://localhost:5555",
     fetch: artifactFetch(async (body) => {
       directory = artifactPath(body.system);
@@ -853,7 +855,7 @@ test("artifact cleanup failure does not replace a completed turn", async () => {
 });
 
 async function artifactTurn({ baseUrl = "http://localhost:5555", contextEnvironment = { PIPA_MESSAGE_CHANNEL: "slack" }, response }) {
-  return createOpenCodeExecutor({ baseUrl, fetch: artifactFetch(response), pollIntervalMs: 1 })
+  return createOpenCodeExecutor({ artifactRoot: os.tmpdir(), baseUrl, fetch: artifactFetch(response), pollIntervalMs: 1 })
     .runTurn({ prompt: "do the work", sessionId: "ses_1", workingDirectory: os.tmpdir(), contextEnvironment });
 }
 

@@ -52,6 +52,7 @@ export function pipaPaths(home = process.env.PIPA_HOME || os.homedir()) {
   const directory = path.join(home, ".pipa");
   return {
     directory,
+    artifacts: path.join(directory, "artifacts"),
     config: path.join(directory, "config.json"),
     manifest: path.join(directory, "slack-manifest.json"),
     lock: path.join(directory, "pipa.lock"),

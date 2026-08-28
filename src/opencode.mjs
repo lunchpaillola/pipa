@@ -1,6 +1,6 @@
 import crossSpawn from "cross-spawn";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdtemp, open, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -86,6 +86,7 @@ export function createOpenCodeExecutor(options = {}) {
   const pollIntervalMs = options.pollIntervalMs ?? 1_000;
   const useDataUrls = !isLoopbackUrl(baseUrl);
   const remove = options.rm ?? rm;
+  const artifactRoot = options.artifactRoot;
   const active = new Set();
   let stopReason;
 
@@ -136,9 +137,10 @@ export function createOpenCodeExecutor(options = {}) {
 
     try {
       try {
-        if (slackTurn && !useDataUrls) {
+        if (slackTurn && !useDataUrls && artifactRoot) {
           try {
-            artifactDirectory = await mkdtemp(path.join(workingDirectory, ".pipa-artifacts-"));
+            await mkdir(artifactRoot, { recursive: true, mode: 0o700 });
+            artifactDirectory = await mkdtemp(path.join(artifactRoot, "turn-"));
           } catch {}
         }
         if (artifactDirectory) await chmod(artifactDirectory, 0o700);
