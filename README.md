@@ -9,7 +9,7 @@ Pipa runs Slack through one persistent private OpenCode server with no hosted re
 
 ## Pipa Managed
 
-[Pipa Managed](https://usepipa.com/managed) is the hosted version of this repo, configured and run for you as a Slack-native operations agent. It costs $1,000 per month plus a one-time $2,500 setup fee.
+Want someone to configure, run, and manage agent workflows for your company? Check out [Pipa Managed](https://usepipa.com/managed). Lunch Pail Labs sets up a Slack-native operations agent around how your team works, then keeps its workflows running and improving over time.
 
 ## Local Socket Mode
 
