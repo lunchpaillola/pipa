@@ -686,10 +686,18 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
     while (!controller.signal.aborted) {
       try {
         const url = serverUrl(baseUrl, "/event", workingDirectory);
-        const response = await fetchImpl(url, {
-          headers: { ...headers, accept: "text/event-stream" },
-          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(requestTimeoutMs)]),
-        });
+        const connection = new AbortController();
+        const connectionTimer = setTimeout(() => connection.abort(new Error("OpenCode event connection timed out.")), requestTimeoutMs);
+        connectionTimer.unref?.();
+        let response;
+        try {
+          response = await fetchImpl(url, {
+            headers: { ...headers, accept: "text/event-stream" },
+            signal: AbortSignal.any([controller.signal, connection.signal]),
+          });
+        } finally {
+          clearTimeout(connectionTimer);
+        }
         if (!response.ok) throw new OpenCodeRequestError(response.status);
         await reconcile();
         if (!subscribed) {

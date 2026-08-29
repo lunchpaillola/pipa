@@ -472,6 +472,45 @@ test("subscribes to interaction events before prompt_async", async () => {
   assert.deepEqual(settledBody, { answers: [["Red"]] });
 });
 
+test("keeps an established event stream open beyond the request timeout", async () => {
+  let eventConnections = 0;
+  let prompted = false;
+  let statusRead = false;
+  const fetch = async (url, init = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/event") {
+      eventConnections += 1;
+      return new Response(new ReadableStream({
+        start(stream) {
+          init.signal.addEventListener("abort", () => stream.error(init.signal.reason), { once: true });
+        },
+      }), { status: 200 });
+    }
+    if (pathname === "/permission") return jsonResponse([]);
+    if (pathname === "/session/status") {
+      if (prompted && !statusRead) {
+        statusRead = true;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
+      return jsonResponse({ ses_1: { type: "idle" } });
+    }
+    if (pathname === "/session/ses_1/message") {
+      return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
+    }
+    if (pathname.endsWith("/prompt_async")) {
+      prompted = true;
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+
+  const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1, requestTimeoutMs: 5 })
+    .runTurn({ prompt: "go", sessionId: "ses_1", workingDirectory: "/work", onInteraction: () => undefined });
+
+  assert.equal(result.text, "done");
+  assert.equal(eventConnections, 1);
+});
+
 test("routes a subagent permission through its parent session", async () => {
   let prompted = false;
   const event = `data: ${JSON.stringify({ type: "permission.asked", properties: { sessionID: "ses_child", id: "perm_1", permission: "external_directory", patterns: ["/outside"] } })}\n\n`;
