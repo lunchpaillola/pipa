@@ -4,7 +4,7 @@ import { Chat, Modal, TextInput } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { canonicalWorkingDirectory, createManifest, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
-import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaStoppedError, PipaSupersededError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
+import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
 
 export async function initializePipa(input, options = {}) {
   const paths = options.paths ?? pipaPaths();
@@ -94,7 +94,7 @@ export async function startPipa(options = {}) {
         onPermissionReplied: interactions.onPermissionReplied,
         onPermissionsReconciled: interactions.onPermissionsReconciled,
         startTyping: () => thread.startTyping("Working on it..."),
-        deliver: (result) => postResult(thread, result),
+        deliver: (result, signal) => postResult(thread, result, signal),
         deliverFailure: (error) => thread.post(error instanceof PipaStoppedError
           ? `${config.botName} stopped before finishing this request.`
           : `${config.botName} failed: ${safeError(error)}`),
@@ -434,113 +434,97 @@ function displayName(value) {
 }
 
 export function createConversationRunner({ sessionStore, runTurn, abortTurn = async () => undefined }) {
-  const conversations = new Map();
-  const inflight = new Set();
+  const latest = new Map();
   let closed = false;
   let closeReason;
+  let closing = Promise.resolve();
 
   function enqueue(conversationKey, input) {
     if (closed && input.deliverFailure) return Promise.resolve(input.deliverFailure(closeReason)).then(() => ({ error: closeReason }));
     if (closed) return Promise.reject(closeReason);
-    const state = conversations.get(conversationKey) ?? {
-      active: null,
-      pending: null,
-      sessionId: sessionStore.get(conversationKey),
+    const previous = latest.get(conversationKey);
+    const reason = new Error("Pipa replaced this turn with a newer message.");
+    previous?.controller.abort(reason);
+    const turn = {
+      controller: new AbortController(),
+      generation: (previous?.generation ?? 0) + 1,
+      sessionId: previous?.sessionId ?? sessionStore.get(conversationKey),
     };
-    conversations.set(conversationKey, state);
-    let resolve;
-    let reject;
-    const promise = new Promise((resolvePromise, rejectPromise) => {
-      resolve = resolvePromise;
-      reject = rejectPromise;
-    });
-    const job = { input, promise, reject, resolve, sessionId: null, superseded: false, aborting: null, controller: new AbortController(), phase: "running" };
-    if (!state.active) start(conversationKey, state, job);
-    else {
-      if (state.pending) state.pending.resolve({ superseded: true });
-      state.pending = job;
-      if (state.active.phase === "running") {
-        state.active.superseded = true;
-        requestAbort(state.active);
-      }
-    }
-    return promise;
+    latest.set(conversationKey, turn);
+    turn.done = execute(conversationKey, turn, previous, input, reason);
+    void turn.done.then(
+      () => { if (latest.get(conversationKey) === turn) latest.delete(conversationKey); },
+      () => { if (latest.get(conversationKey) === turn) latest.delete(conversationKey); },
+    );
+    return turn.done;
   }
 
-  function requestAbort(job) {
-    const reason = new PipaSupersededError();
-    job.controller.abort(reason);
-    if (!job.sessionId || job.aborting) return;
-    job.aborting = Promise.resolve(abortTurn(job.sessionId, reason)).catch(() => undefined);
-  }
-
-  function start(conversationKey, state, job) {
-    state.active = job;
-    const execution = execute(conversationKey, state, job).finally(() => {
-      state.active = null;
-      const next = state.pending;
-      state.pending = null;
-      if (next) start(conversationKey, state, next);
-      else conversations.delete(conversationKey);
-    });
-    inflight.add(execution);
-    void execution.then(() => inflight.delete(execution), () => inflight.delete(execution));
-  }
-
-  async function execute(conversationKey, state, job) {
-    const { deliver, deliverFailure, startTyping, onSession, ...turn } = job.input;
+  async function execute(conversationKey, current, previous, input, abortReason) {
+    const { deliver, deliverFailure, startTyping, onSession, ...turn } = input;
+    const isLatest = () => latest.get(conversationKey)?.generation === current.generation;
+    const stopped = async () => {
+      const error = closeReason ?? current.controller.signal.reason;
+      if (!deliverFailure) throw error;
+      await deliverFailure(error);
+      return { error };
+    };
+    let result;
     try {
+      if (previous) {
+        if (previous.sessionId) await Promise.resolve(abortTurn(previous.sessionId, abortReason)).catch(() => undefined);
+        await previous.done.catch(() => undefined);
+        current.sessionId = previous.sessionId ?? current.sessionId;
+      }
+      if (!isLatest()) return { superseded: true };
       if (closed) throw closeReason;
       try {
         Promise.resolve(startTyping?.()).catch(() => undefined);
       } catch {}
-      const result = await runTurn({
+      result = await runTurn({
         ...turn,
-        signal: job.controller.signal,
-        sessionId: state.sessionId,
+        signal: current.controller.signal,
+        sessionId: current.sessionId,
         onSession: async (sessionId) => {
-          job.sessionId = sessionId;
+          current.sessionId = sessionId;
           await onSession?.(sessionId);
-          if (job.superseded) requestAbort(job);
-          await job.aborting;
         },
       });
-      if (job.superseded) {
-        await job.aborting;
-        state.sessionId = job.sessionId ?? state.sessionId;
-        job.resolve({ superseded: true });
-        return;
-      }
-      job.phase = "delivering";
-      if (result.sessionId) {
-        state.sessionId = result.sessionId;
-        await sessionStore.set(conversationKey, result.sessionId);
-      }
-      if (deliver) await deliver(result);
-      job.resolve(result);
     } catch (error) {
-      if (job.superseded || error instanceof PipaSupersededError) {
-        await job.aborting;
-        state.sessionId = job.sessionId ?? state.sessionId;
-        job.resolve({ superseded: true });
-      } else if (deliverFailure) {
-        try {
-          await deliverFailure(error);
-          job.resolve({ error });
-        } catch (deliveryError) {
-          job.reject(deliveryError);
-        }
-      } else {
-        job.reject(error);
-      }
+      if (!isLatest()) return { superseded: true };
+      error = closed ? closeReason : error;
+      if (!deliverFailure) throw error;
+      await deliverFailure(error);
+      return { error };
     }
+    if (!isLatest()) return { superseded: true };
+    if (current.controller.signal.aborted) return stopped();
+    if (result.sessionId) {
+      current.sessionId = result.sessionId;
+      await sessionStore.set(conversationKey, result.sessionId);
+    }
+    if (!isLatest()) return { superseded: true };
+    if (current.controller.signal.aborted) return stopped();
+    if (deliver) await deliver(result, current.controller.signal);
+    if (!isLatest()) return { superseded: true };
+    if (current.controller.signal.aborted) return stopped();
+    return result;
   }
 
   return {
     enqueue,
-    close(reason = new PipaStoppedError()) { closed = true; closeReason ??= reason; },
+    close(reason = new PipaStoppedError()) {
+      closed = true;
+      closeReason ??= reason;
+      const aborts = [];
+      for (const turn of latest.values()) {
+        turn.controller.abort(closeReason);
+        if (turn.sessionId) aborts.push(Promise.resolve(abortTurn(turn.sessionId, closeReason)).catch(() => undefined));
+      }
+      closing = Promise.allSettled(aborts);
+    },
     async drain() {
-      while (inflight.size) await Promise.allSettled([...inflight]);
+      await closing;
+      while (latest.size) await Promise.allSettled([...latest.values()].map((turn) => turn.done));
     },
   };
 }
@@ -640,7 +624,8 @@ function slackContext(thread, message) {
   };
 }
 
-async function postResult(thread, { text, files = [] }) {
+async function postResult(thread, { text, files = [] }, signal) {
+  if (signal?.aborted) return;
   if (files.length) {
     try {
       await thread.post({ markdown: text, files });
@@ -649,8 +634,11 @@ async function postResult(thread, { text, files = [] }) {
       // A failed adapter call may still have uploaded files, so retry text only.
     }
   }
-  if (!text) return;
-  for (const markdown of splitSlackMarkdown(text)) await thread.post({ markdown });
+  if (!text || signal?.aborted) return;
+  for (const markdown of splitSlackMarkdown(text)) {
+    if (signal?.aborted) return;
+    await thread.post({ markdown });
+  }
 }
 
 function splitSlackMarkdown(text, limit = 3500) {

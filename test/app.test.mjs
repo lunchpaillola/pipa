@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { checkSlackAppToken, checkSlackToken, createConversationRunner, initializePipa, startPipa } from "../src/app.mjs";
-import { PipaStoppedError, PipaSupersededError } from "../src/opencode.mjs";
+import { PipaStoppedError } from "../src/opencode.mjs";
 import { createSessionStore, pipaPaths } from "../src/state.mjs";
 
 test("init validates dependencies before replacing config", async () => {
@@ -219,16 +219,16 @@ test("conversation runner interrupts one thread, reuses its session, and overlap
   };
   const runner = createConversationRunner({
     sessionStore,
-    abortTurn: async (sessionId) => {
-      events.push(`abort:${sessionId}`);
-      active.get(sessionId)?.reject(new PipaSupersededError());
-    },
-    runTurn: async ({ prompt, sessionId, onSession }) => {
+    abortTurn: async (sessionId) => events.push(`abort:${sessionId}`),
+    runTurn: async ({ prompt, sessionId, onSession, signal }) => {
       const selectedSessionId = sessionId ?? `ses_${prompt === "other" ? "other" : "A"}`;
       events.push(`start:${prompt}:${sessionId}`);
       await onSession(selectedSessionId);
       if (prompt === "one" || prompt === "other") {
-        await new Promise((resolve, reject) => active.set(selectedSessionId, { resolve, reject }));
+        await new Promise((resolve, reject) => {
+          active.set(selectedSessionId, { resolve, reject });
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
       }
       events.push(`end:${prompt}`);
       return { text: prompt, sessionId: selectedSessionId };
@@ -265,6 +265,36 @@ test("conversation runner interrupts before OpenCode selects a session", async (
   const second = runner.enqueue("A", { prompt: "two" });
   assert.equal((await first).superseded, true);
   assert.equal((await second).text, "two");
+});
+
+test("conversation runner skips an intermediate turn when aborts finish out of order", async () => {
+  let finishFirstAbort;
+  let aborts = 0;
+  const prompts = [];
+  const runner = createConversationRunner({
+    sessionStore: { get: () => null, set: async () => undefined },
+    abortTurn: async () => {
+      aborts += 1;
+      if (aborts === 1) await new Promise((resolve) => finishFirstAbort = resolve);
+    },
+    runTurn: async ({ prompt, signal, onSession }) => {
+      prompts.push(prompt);
+      await onSession("ses_1");
+      if (prompt === "A") await new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      return { text: prompt, sessionId: "ses_1" };
+    },
+  });
+
+  const first = runner.enqueue("thread", { prompt: "A" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = runner.enqueue("thread", { prompt: "B" });
+  const third = runner.enqueue("thread", { prompt: "C" });
+  finishFirstAbort();
+
+  assert.equal((await first).superseded, true);
+  assert.equal((await second).superseded, true);
+  assert.equal((await third).text, "C");
+  assert.deepEqual(prompts, ["A", "C"]);
 });
 
 test("conversation runner starts typing once for active turns and ignores typing failures", async () => {
@@ -327,6 +357,59 @@ test("failed replacement turns do not overwrite the persisted session", async ()
   assert.equal(saved, undefined);
 });
 
+test("replacement during session persistence suppresses stale delivery", async () => {
+  let finishSave;
+  let saveStarted;
+  let saves = 0;
+  const saving = new Promise((resolve) => saveStarted = resolve);
+  const delivered = [];
+  const runner = createConversationRunner({
+    sessionStore: {
+      get: () => null,
+      set: async () => {
+        saves += 1;
+        if (saves > 1) return;
+        saveStarted();
+        await new Promise((resolve) => finishSave = resolve);
+      },
+    },
+    runTurn: async ({ prompt }) => ({ text: prompt, sessionId: "ses_1" }),
+  });
+  const first = runner.enqueue("A", { prompt: "one", deliver: ({ text }) => delivered.push(text) });
+  await saving;
+  const second = runner.enqueue("A", { prompt: "two", deliver: ({ text }) => delivered.push(text) });
+  finishSave();
+
+  assert.equal((await first).superseded, true);
+  await second;
+  assert.deepEqual(delivered, ["two"]);
+});
+
+test("shutdown during session persistence reports the turn as stopped", async () => {
+  let finishSave;
+  let saveStarted;
+  const saving = new Promise((resolve) => saveStarted = resolve);
+  const failures = [];
+  const runner = createConversationRunner({
+    sessionStore: {
+      get: () => null,
+      set: async () => {
+        saveStarted();
+        await new Promise((resolve) => finishSave = resolve);
+      },
+    },
+    runTurn: async () => ({ text: "done", sessionId: "ses_1" }),
+  });
+  const active = runner.enqueue("A", { prompt: "one", deliverFailure: (error) => failures.push(error) });
+  await saving;
+  runner.close();
+  finishSave();
+
+  const result = await active;
+  assert.ok(result.error instanceof PipaStoppedError);
+  assert.deepEqual(failures, [result.error]);
+});
+
 test("closing the runner prevents queued turns from starting", async () => {
   let release;
   const prompts = [];
@@ -356,6 +439,22 @@ test("closing the runner prevents queued turns from starting", async () => {
   assert.deepEqual(typing, []);
 });
 
+test("closing the runner aborts its active OpenCode session before draining", async () => {
+  const aborted = [];
+  const runner = createConversationRunner({
+    sessionStore: { get: () => "ses_1", set: async () => undefined },
+    abortTurn: async (sessionId) => aborted.push(sessionId),
+    runTurn: async ({ signal }) => new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })),
+  });
+  const active = runner.enqueue("A", { prompt: "active", deliverFailure: () => undefined });
+  await new Promise((resolve) => setImmediate(resolve));
+  runner.close();
+
+  assert.deepEqual(aborted, ["ses_1"]);
+  await runner.drain();
+  assert.ok((await active).error instanceof PipaStoppedError);
+});
+
 test("conversation tail preserves Slack delivery order", async () => {
   const events = [];
   let releaseDelivery;
@@ -379,6 +478,30 @@ test("conversation tail preserves Slack delivery order", async () => {
   releaseDelivery();
   await Promise.all([first, second]);
   assert.deepEqual(events, ["run:one", "deliver:one", "run:two", "deliver:two"]);
+});
+
+test("replacement stops remaining delivery work", async () => {
+  let releaseDelivery;
+  const events = [];
+  const runner = createConversationRunner({
+    sessionStore: { get: () => null, set: async () => undefined },
+    runTurn: async ({ prompt }) => ({ text: prompt, sessionId: "ses_1" }),
+  });
+  const first = runner.enqueue("A", {
+    prompt: "one",
+    deliver: async (_, signal) => {
+      events.push("first chunk");
+      await new Promise((resolve) => releaseDelivery = resolve);
+      if (!signal.aborted) events.push("second chunk");
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = runner.enqueue("A", { prompt: "two" });
+  releaseDelivery();
+
+  assert.equal((await first).superseded, true);
+  await second;
+  assert.deepEqual(events, ["first chunk"]);
 });
 
 test("Slack composition subscribes mentions, restores sessions, and ignores unsupported traffic", async () => {
@@ -462,6 +585,7 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   assert.equal(calls.length, beforeIgnored);
   await handlers.subscribed(thread, { id: "missing-size", text: "no declared size", attachments: [{ ...attachment, size: undefined }], author: human, raw: { subtype: "file_share" } });
   await waitFor(() => calls.length === beforeIgnored + 1);
+  await waitFor(() => posts.length === 6);
   assert.equal(calls.length, beforeIgnored + 1);
   await handlers.subscribed(thread, { id: "broken", text: "broken attachment", attachments: [attachment], author: human, raw: { subtype: "file_share" } });
   await waitFor(() => posts.length === 7);

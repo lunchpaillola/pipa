@@ -25,12 +25,6 @@ export class PipaStoppedError extends Error {
   }
 }
 
-export class PipaSupersededError extends Error {
-  constructor(message = "Pipa replaced this turn with a newer message.") {
-    super(message);
-  }
-}
-
 export function cleanChildEnvironment(environment = process.env) {
   return Object.fromEntries(Object.entries(environment).filter(([key]) => !SECRET_ENV_KEYS.has(key.toUpperCase())));
 }
@@ -265,7 +259,7 @@ export function createOpenCodeExecutor(options = {}) {
 
   return {
     runTurn,
-    async abortTurn(sessionId, reason = new PipaSupersededError()) {
+    async abortTurn(sessionId, reason = new Error("OpenCode turn aborted.")) {
       const turn = activeSessions.get(sessionId);
       if (!turn) return;
       const abortController = new AbortController();
