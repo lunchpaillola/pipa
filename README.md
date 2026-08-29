@@ -9,7 +9,7 @@ Pipa runs Slack through one persistent private OpenCode server with no hosted re
 
 ## Pipa Managed
 
-Want someone to configure, run, and manage agent workflows for your company? Check out [Pipa Managed](https://usepipa.com/managed). Lunch Pail Labs sets up a Slack-native operations agent around how your team works, then keeps its workflows running and improving over time.
+Want someone to configure, run, and manage agent workflows for your company? Check out [Pipa Managed](https://usepipa.com/managed). We set up a Slack-native operations agent around how your team works, then keep its workflows running and improving over time.
 
 ## Local Socket Mode
 
