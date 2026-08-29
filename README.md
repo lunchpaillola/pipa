@@ -7,6 +7,10 @@ Pipa runs Slack through one persistent private OpenCode server with no hosted re
 
 **Pipa is in early preview. Features may break unintentionally, and CLI commands, configuration, and Slack behavior may continue to change.**
 
+## Pipa Managed
+
+[Pipa Managed](https://usepipa.com/managed) is the hosted version of this repo, configured and run for you as a Slack-native operations agent. It costs $1,000 per month plus a one-time $2,500 setup fee.
+
 ## Local Socket Mode
 
 Profiles created by `pipa init` use Socket Mode. Profiles written before mode support continue to load as Socket Mode.
