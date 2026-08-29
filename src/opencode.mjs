@@ -88,6 +88,7 @@ export function createOpenCodeExecutor(options = {}) {
   const remove = options.rm ?? rm;
   const artifactRoot = options.artifactRoot;
   const active = new Set();
+  const activeSessions = new Map();
   let stopReason;
 
   async function request(pathname, init, workingDirectory, controller, acceptedStatuses = [200], reportFatal = true) {
@@ -125,25 +126,21 @@ export function createOpenCodeExecutor(options = {}) {
     }
   }
 
-  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [], onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
+  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     if (stopReason) throw stopReason;
     const temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
     const slackTurn = contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack";
     const controller = new AbortController();
+    const abort = () => controller.abort(signal.reason);
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
     const timer = setTimeout(() => controller.abort(new Error(`OpenCode timed out after ${timeoutMs}ms.`)), timeoutMs);
     active.add(controller);
     let artifactDirectory;
 
     try {
       try {
-        if (slackTurn && !useDataUrls && artifactRoot) {
-          try {
-            await mkdir(artifactRoot, { recursive: true, mode: 0o700 });
-            artifactDirectory = await mkdtemp(path.join(artifactRoot, "turn-"));
-          } catch {}
-        }
-        if (artifactDirectory) await chmod(artifactDirectory, 0o700);
         const files = await stageAttachments(attachments, temporaryDirectory, timeoutMs, useDataUrls, controller.signal);
         if (stopReason) throw stopReason;
         let selectedSessionId = sessionId;
@@ -168,7 +165,19 @@ export function createOpenCodeExecutor(options = {}) {
           messages = [];
         }
 
+        activeSessions.set(selectedSessionId, { controller, workingDirectory });
         await onSession?.(selectedSessionId);
+        if (controller.signal.aborted) throw controller.signal.reason;
+
+        if (slackTurn && !useDataUrls && artifactRoot) {
+          try {
+            await mkdir(artifactRoot, { recursive: true, mode: 0o700 });
+            artifactDirectory = await sessionArtifactDirectory(artifactRoot, selectedSessionId, workingDirectory);
+            await remove(artifactDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+            await mkdir(artifactDirectory, { mode: 0o700 });
+            await chmod(artifactDirectory, 0o700);
+          } catch {}
+        }
 
         const baseline = new Set(messages.map((message) => message?.info?.id).filter(Boolean));
         let dismissed = false;
@@ -222,6 +231,9 @@ export function createOpenCodeExecutor(options = {}) {
         clearTimeout(timer);
         controller.abort(new Error("OpenCode turn completed."));
         active.delete(controller);
+        for (const [sessionId, turn] of activeSessions) {
+          if (turn.controller === controller) activeSessions.delete(sessionId);
+        }
       }
     } catch (error) {
       if (stopReason) throw stopReason;
@@ -241,16 +253,40 @@ export function createOpenCodeExecutor(options = {}) {
           process.stderr.write("Pipa could not remove temporary artifact files.\n");
         }
       }
+      signal?.removeEventListener("abort", abort);
     }
   }
 
   return {
     runTurn,
+    async abortTurn(sessionId, reason = new Error("OpenCode turn aborted.")) {
+      const turn = activeSessions.get(sessionId);
+      if (!turn) return;
+      const abortController = new AbortController();
+      try {
+        await request(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }, turn.workingDirectory, abortController, [200, 204, 404], false);
+      } catch {
+        // Local cancellation still supersedes the turn if OpenCode's abort request fails.
+      } finally {
+        abortController.abort(reason);
+        turn.controller.abort(reason);
+      }
+    },
     stopAll(reason = new PipaStoppedError()) {
       stopReason ??= reason;
       for (const controller of active) controller.abort(stopReason);
     },
   };
+}
+
+async function sessionArtifactDirectory(root, sessionId, workingDirectory) {
+  if (!/^[A-Za-z0-9_-]{1,200}$/u.test(sessionId)) throw new Error("OpenCode returned an invalid session ID.");
+  const stats = await lstat(root);
+  if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error("Pipa's artifact root must be a directory, not a symlink.");
+  const [resolvedRoot, resolvedWorkingDirectory] = await Promise.all([realpath(root), realpath(workingDirectory)]);
+  const relative = path.relative(resolvedWorkingDirectory, resolvedRoot);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("Pipa's artifact root must be inside the working directory.");
+  return path.join(resolvedRoot, sessionId);
 }
 
 export function startOpenCodeServer(config, options = {}) {

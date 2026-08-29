@@ -209,37 +209,92 @@ test("bounds executor-setup cleanup when an owned server never reports exit", as
   assert.ok(Date.now() - startedAt < 100);
 });
 
-test("conversation runner serializes one thread, overlaps threads, and persists before release", async () => {
+test("conversation runner interrupts one thread, reuses its session, and overlaps other threads", async () => {
   const events = [];
   const sessions = new Map();
-  const gates = new Map();
+  const active = new Map();
   const sessionStore = {
     get: (key) => sessions.get(key) ?? null,
     async set(key, value) { events.push(`save:${key}:${value}`); sessions.set(key, value); },
   };
   const runner = createConversationRunner({
     sessionStore,
-    runTurn: async ({ prompt, sessionId }) => {
+    abortTurn: async (sessionId) => events.push(`abort:${sessionId}`),
+    runTurn: async ({ prompt, sessionId, onSession, signal }) => {
+      const selectedSessionId = sessionId ?? `ses_${prompt === "other" ? "other" : "A"}`;
       events.push(`start:${prompt}:${sessionId}`);
-      await new Promise((resolve) => gates.set(prompt, resolve));
+      await onSession(selectedSessionId);
+      if (prompt === "one" || prompt === "other") {
+        await new Promise((resolve, reject) => {
+          active.set(selectedSessionId, { resolve, reject });
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      }
       events.push(`end:${prompt}`);
-      return { text: prompt, sessionId: `ses_${prompt}` };
+      return { text: prompt, sessionId: selectedSessionId };
     },
   });
 
-  const first = runner.enqueue("A", { prompt: "one" });
-  const second = runner.enqueue("A", { prompt: "two" });
+  const delivered = [];
+  const failed = [];
+  const first = runner.enqueue("A", { prompt: "one", deliver: (result) => delivered.push(result.text), deliverFailure: (error) => failed.push(error) });
   const other = runner.enqueue("B", { prompt: "other" });
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(events, ["start:one:null", "start:other:null"]);
-  gates.get("other")();
-  await other;
-  gates.get("one")();
-  await first;
+  const second = runner.enqueue("A", { prompt: "two", deliver: (result) => delivered.push(result.text) });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.match(events.join("|"), /save:A:ses_one\|start:two:ses_one/u);
-  gates.get("two")();
-  await second;
+  assert.match(events.join("|"), /abort:ses_A\|start:two:ses_A/u);
+  active.get("ses_other").resolve();
+  await other;
+  assert.equal((await first).superseded, true);
+  assert.equal((await second).text, "two");
+  assert.deepEqual(delivered, ["two"]);
+  assert.deepEqual(failed, []);
+});
+
+test("conversation runner interrupts before OpenCode selects a session", async () => {
+  const runner = createConversationRunner({
+    sessionStore: { get: () => null, set: async () => undefined },
+    runTurn: async ({ prompt, signal }) => {
+      if (prompt === "one") await new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      return { text: prompt, sessionId: "ses_1" };
+    },
+  });
+  const first = runner.enqueue("A", { prompt: "one" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = runner.enqueue("A", { prompt: "two" });
+  assert.equal((await first).superseded, true);
+  assert.equal((await second).text, "two");
+});
+
+test("conversation runner skips an intermediate turn when aborts finish out of order", async () => {
+  let finishFirstAbort;
+  let aborts = 0;
+  const prompts = [];
+  const runner = createConversationRunner({
+    sessionStore: { get: () => null, set: async () => undefined },
+    abortTurn: async () => {
+      aborts += 1;
+      if (aborts === 1) await new Promise((resolve) => finishFirstAbort = resolve);
+    },
+    runTurn: async ({ prompt, signal, onSession }) => {
+      prompts.push(prompt);
+      await onSession("ses_1");
+      if (prompt === "A") await new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      return { text: prompt, sessionId: "ses_1" };
+    },
+  });
+
+  const first = runner.enqueue("thread", { prompt: "A" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = runner.enqueue("thread", { prompt: "B" });
+  const third = runner.enqueue("thread", { prompt: "C" });
+  finishFirstAbort();
+
+  assert.equal((await first).superseded, true);
+  assert.equal((await second).superseded, true);
+  assert.equal((await third).text, "C");
+  assert.deepEqual(prompts, ["A", "C"]);
 });
 
 test("conversation runner starts typing once for active turns and ignores typing failures", async () => {
@@ -270,14 +325,20 @@ test("failed turns release the conversation tail", async () => {
 });
 
 test("failed delivery releases the conversation tail", async () => {
+  let signalDeliveryStarted;
+  const deliveryStarted = new Promise((resolve) => signalDeliveryStarted = resolve);
   const runner = createConversationRunner({
     sessionStore: { get: () => null, set: async () => undefined },
     runTurn: async ({ prompt }) => ({ text: prompt, sessionId: `ses_${prompt}` }),
   });
   const first = runner.enqueue("A", {
     prompt: "one",
-    deliver: async () => { throw new Error("delivery failed"); },
+    deliver: async () => {
+      signalDeliveryStarted();
+      throw new Error("delivery failed");
+    },
   });
+  await deliveryStarted;
   const second = runner.enqueue("A", { prompt: "two" });
   await assert.rejects(first, /delivery failed/u);
   await second;
@@ -294,6 +355,59 @@ test("failed replacement turns do not overwrite the persisted session", async ()
   });
   await assert.rejects(runner.enqueue("A", { prompt: "continue" }), /replacement failed/u);
   assert.equal(saved, undefined);
+});
+
+test("replacement during session persistence suppresses stale delivery", async () => {
+  let finishSave;
+  let saveStarted;
+  let saves = 0;
+  const saving = new Promise((resolve) => saveStarted = resolve);
+  const delivered = [];
+  const runner = createConversationRunner({
+    sessionStore: {
+      get: () => null,
+      set: async () => {
+        saves += 1;
+        if (saves > 1) return;
+        saveStarted();
+        await new Promise((resolve) => finishSave = resolve);
+      },
+    },
+    runTurn: async ({ prompt }) => ({ text: prompt, sessionId: "ses_1" }),
+  });
+  const first = runner.enqueue("A", { prompt: "one", deliver: ({ text }) => delivered.push(text) });
+  await saving;
+  const second = runner.enqueue("A", { prompt: "two", deliver: ({ text }) => delivered.push(text) });
+  finishSave();
+
+  assert.equal((await first).superseded, true);
+  await second;
+  assert.deepEqual(delivered, ["two"]);
+});
+
+test("shutdown during session persistence reports the turn as stopped", async () => {
+  let finishSave;
+  let saveStarted;
+  const saving = new Promise((resolve) => saveStarted = resolve);
+  const failures = [];
+  const runner = createConversationRunner({
+    sessionStore: {
+      get: () => null,
+      set: async () => {
+        saveStarted();
+        await new Promise((resolve) => finishSave = resolve);
+      },
+    },
+    runTurn: async () => ({ text: "done", sessionId: "ses_1" }),
+  });
+  const active = runner.enqueue("A", { prompt: "one", deliverFailure: (error) => failures.push(error) });
+  await saving;
+  runner.close();
+  finishSave();
+
+  const result = await active;
+  assert.ok(result.error instanceof PipaStoppedError);
+  assert.deepEqual(failures, [result.error]);
 });
 
 test("closing the runner prevents queued turns from starting", async () => {
@@ -325,6 +439,22 @@ test("closing the runner prevents queued turns from starting", async () => {
   assert.deepEqual(typing, []);
 });
 
+test("closing the runner aborts its active OpenCode session before draining", async () => {
+  const aborted = [];
+  const runner = createConversationRunner({
+    sessionStore: { get: () => "ses_1", set: async () => undefined },
+    abortTurn: async (sessionId) => aborted.push(sessionId),
+    runTurn: async ({ signal }) => new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })),
+  });
+  const active = runner.enqueue("A", { prompt: "active", deliverFailure: () => undefined });
+  await new Promise((resolve) => setImmediate(resolve));
+  runner.close();
+
+  assert.deepEqual(aborted, ["ses_1"]);
+  await runner.drain();
+  assert.ok((await active).error instanceof PipaStoppedError);
+});
+
 test("conversation tail preserves Slack delivery order", async () => {
   const events = [];
   let releaseDelivery;
@@ -342,12 +472,36 @@ test("conversation tail preserves Slack delivery order", async () => {
       await new Promise((resolve) => releaseDelivery = resolve);
     },
   });
-  const second = runner.enqueue("A", { prompt: "two", deliver: async () => events.push("deliver:two") });
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(events, ["run:one", "deliver:one"]);
+  const second = runner.enqueue("A", { prompt: "two", deliver: async () => events.push("deliver:two") });
   releaseDelivery();
   await Promise.all([first, second]);
   assert.deepEqual(events, ["run:one", "deliver:one", "run:two", "deliver:two"]);
+});
+
+test("replacement stops remaining delivery work", async () => {
+  let releaseDelivery;
+  const events = [];
+  const runner = createConversationRunner({
+    sessionStore: { get: () => null, set: async () => undefined },
+    runTurn: async ({ prompt }) => ({ text: prompt, sessionId: "ses_1" }),
+  });
+  const first = runner.enqueue("A", {
+    prompt: "one",
+    deliver: async (_, signal) => {
+      events.push("first chunk");
+      await new Promise((resolve) => releaseDelivery = resolve);
+      if (!signal.aborted) events.push("second chunk");
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = runner.enqueue("A", { prompt: "two" });
+  releaseDelivery();
+
+  assert.equal((await first).superseded, true);
+  await second;
+  assert.deepEqual(events, ["first chunk"]);
 });
 
 test("Slack composition subscribes mentions, restores sessions, and ignores unsupported traffic", async () => {
@@ -405,9 +559,12 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   };
   const thread = { id: "slack:C2:2.0", adapter, channel: { isDM: false, channelVisibility: "private" }, subscribe: async () => restored.push("subscribed"), post: async (text) => posts.push(text) };
   await handlers.mention(thread, { id: "1", text: "@U1 ask <@U2> for help", author: human, raw: {} });
+  await waitFor(() => posts.length === 1);
   await handlers.subscribed(thread, { id: "2", text: "<@U2> follow up", author: human, raw: {} });
+  await waitFor(() => posts.length === 2);
   const attachment = { name: "notes.txt", size: 100 * 1024 * 1024, fetchData: async () => Buffer.from("notes") };
   await handlers.mention(thread, { id: "file-1", text: "@U1 summarize", attachments: [attachment], author: human, raw: {} });
+  await waitFor(() => posts.length === 3);
   await handlers.subscribed(thread, { id: "file-2", text: "compare this", attachments: [attachment], author: human, raw: { subtype: "file_share" } });
   await waitFor(() => posts.length === 4);
   const beforeIgnored = calls.length;
@@ -428,10 +585,14 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   assert.equal(calls.length, beforeIgnored);
   await handlers.subscribed(thread, { id: "missing-size", text: "no declared size", attachments: [{ ...attachment, size: undefined }], author: human, raw: { subtype: "file_share" } });
   await waitFor(() => calls.length === beforeIgnored + 1);
+  await waitFor(() => posts.length === 6);
   assert.equal(calls.length, beforeIgnored + 1);
   await handlers.subscribed(thread, { id: "broken", text: "broken attachment", attachments: [attachment], author: human, raw: { subtype: "file_share" } });
+  await waitFor(() => posts.length === 7);
   await handlers.subscribed(thread, { id: "3", text: "long", author: human, raw: {} });
+  await waitFor(() => posts.length === 10);
   await handlers.subscribed(thread, { id: "4", text: "secret failure", author: human, raw: {} });
+  await waitFor(() => posts.length === 11);
   await handlers.subscribed(thread, { id: "5", text: "markdown", author: human, raw: {} });
   await waitFor(() => posts.length === 12);
   assert.deepEqual(posts.slice(0, 2), [
@@ -506,6 +667,67 @@ test("failed artifact post retries declaration-free text once without files", as
   ]);
   assert.deepEqual(delivery.reactions, ["add:eyes", "remove:eyes", "add:white_check_mark"]);
   await delivery.app.shutdown();
+});
+
+test("interrupted Slack messages keep their eyes until the latest turn succeeds", async () => {
+  const handlers = {};
+  const reactions = [];
+  const posts = [];
+  let firstStarted = false;
+  let secondStarted = false;
+  let finishSecond;
+  const app = await startPipa({
+    chat: {
+      onNewMention(handler) { handlers.mention = handler; },
+      onSubscribedMessage(handler) { handlers.subscribed = handler; },
+      async initialize() {},
+      async shutdown() {},
+    },
+    executor: {
+      async runTurn({ prompt, signal, onSession }) {
+        await onSession("ses_1");
+        if (prompt === "first") {
+          firstStarted = true;
+          await new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+        }
+        secondStarted = true;
+        await new Promise((resolve) => finishSecond = resolve);
+        return { text: "second complete", sessionId: "ses_1" };
+      },
+      async abortTurn() {},
+      stopAll() {},
+    },
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+  });
+  const thread = {
+    id: "slack:C1:1.0",
+    adapter: {
+      addReaction: async (_, messageId, emoji) => reactions.push(`add:${messageId}:${emoji}`),
+      removeReaction: async (_, messageId, emoji) => reactions.push(`remove:${messageId}:${emoji}`),
+    },
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async (payload) => posts.push(payload),
+  };
+  const author = { userId: "U1" };
+
+  await handlers.mention(thread, { id: "1", text: "@U1 first", author, raw: {} });
+  await waitFor(() => firstStarted);
+  await handlers.subscribed(thread, { id: "2", text: "second", author, raw: {} });
+  await waitFor(() => secondStarted);
+  assert.deepEqual(reactions, ["add:1:eyes", "add:2:eyes"]);
+
+  finishSecond();
+  await waitFor(() => reactions.length === 6);
+  assert.deepEqual(reactions, [
+    "add:1:eyes", "add:2:eyes",
+    "remove:1:eyes", "add:1:white_check_mark",
+    "remove:2:eyes", "add:2:white_check_mark",
+  ]);
+  assert.deepEqual(posts, [{ markdown: "second complete" }]);
+  await app.shutdown();
 });
 
 test("inline fallback prefers paragraphs and lines and preserves fenced code across chunks", async () => {

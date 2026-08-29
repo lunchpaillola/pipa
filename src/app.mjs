@@ -63,11 +63,19 @@ export async function startPipa(options = {}) {
     await withTimeout(server?.wait(), options.shutdownTimeoutMs ?? 15_000, "OpenCode shutdown timed out.").catch(() => undefined);
     throw error;
   }
-  const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn });
+  const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn, abortTurn: executor.abortTurn });
   let accepting = true;
   const interactions = createPendingInteractions();
+  const pendingReactions = new Map();
   chat.onAction?.(interactions.onAction);
   chat.onModalSubmit?.("pipa_custom", interactions.onCustomAnswer);
+
+  const finishPendingReactions = async (conversationKey, currentMessage, emoji) => {
+    const pending = pendingReactions.get(conversationKey) ?? [];
+    if (pending.at(-1)?.message !== currentMessage) return;
+    pendingReactions.delete(conversationKey);
+    for (const entry of pending) await finishReaction(entry.thread, entry.message, entry.message === currentMessage ? emoji : "white_check_mark");
+  };
 
   const handle = async (thread, message, subscribe) => {
     if (!accepting || !isAuthorized(thread, message, config) || shouldIgnore(thread, message)) return;
@@ -82,6 +90,9 @@ export async function startPipa(options = {}) {
     if (!accepting) return;
 
     await react(thread, message, "eyes");
+    const pending = pendingReactions.get(thread.id) ?? [];
+    pending.push({ thread, message });
+    pendingReactions.set(thread.id, pending);
     try {
       const interactionContext = { thread };
       const result = await runner.enqueue(thread.id, {
@@ -94,14 +105,15 @@ export async function startPipa(options = {}) {
         onPermissionReplied: interactions.onPermissionReplied,
         onPermissionsReconciled: interactions.onPermissionsReconciled,
         startTyping: () => thread.startTyping("Working on it..."),
-        deliver: (result) => postResult(thread, result),
+        deliver: (result, signal) => postResult(thread, result, signal),
         deliverFailure: (error) => thread.post(error instanceof PipaStoppedError
           ? `${config.botName} stopped before finishing this request.`
           : `${config.botName} failed: ${safeError(error)}`),
       });
-      await finishReaction(thread, message, result.error instanceof PipaStoppedError ? null : result.error ? "warning" : "white_check_mark");
+      if (result.superseded) return;
+      await finishPendingReactions(thread.id, message, result.error instanceof PipaStoppedError ? null : result.error ? "warning" : "white_check_mark");
     } catch (error) {
-      await finishReaction(thread, message, "warning");
+      await finishPendingReactions(thread.id, message, "warning");
       process.stderr.write("Pipa could not complete or deliver a Slack turn.\n");
     }
   };
@@ -433,47 +445,99 @@ function displayName(value) {
   return name ? name[0].toUpperCase() + name.slice(1) : "";
 }
 
-export function createConversationRunner({ sessionStore, runTurn }) {
-  const tails = new Map();
+export function createConversationRunner({ sessionStore, runTurn, abortTurn = async () => undefined }) {
+  const latest = new Map();
   let closed = false;
   let closeReason;
+  let closing = Promise.resolve();
 
   function enqueue(conversationKey, input) {
     if (closed && input.deliverFailure) return Promise.resolve(input.deliverFailure(closeReason)).then(() => ({ error: closeReason }));
     if (closed) return Promise.reject(closeReason);
-    const previous = tails.get(conversationKey) ?? Promise.resolve();
-    const current = previous.catch(() => undefined).then(async () => {
-      const { deliver, deliverFailure, startTyping, ...turn } = input;
-      let result;
-      try {
-        if (closed) throw closeReason;
-        try {
-          Promise.resolve(startTyping?.()).catch(() => undefined);
-        } catch {}
-        result = await runTurn({ ...turn, sessionId: sessionStore.get(conversationKey) });
-        if (result.sessionId) await sessionStore.set(conversationKey, result.sessionId);
-      } catch (error) {
-        if (deliverFailure) {
-          await deliverFailure(error);
-          return { error };
-        }
-        throw error;
+    const previous = latest.get(conversationKey);
+    const reason = new Error("Pipa replaced this turn with a newer message.");
+    previous?.controller.abort(reason);
+    const turn = {
+      controller: new AbortController(),
+      generation: (previous?.generation ?? 0) + 1,
+      sessionId: previous?.sessionId ?? sessionStore.get(conversationKey),
+    };
+    latest.set(conversationKey, turn);
+    turn.done = execute(conversationKey, turn, previous, input, reason);
+    void turn.done.then(
+      () => { if (latest.get(conversationKey) === turn) latest.delete(conversationKey); },
+      () => { if (latest.get(conversationKey) === turn) latest.delete(conversationKey); },
+    );
+    return turn.done;
+  }
+
+  async function execute(conversationKey, current, previous, input, abortReason) {
+    const { deliver, deliverFailure, startTyping, onSession, ...turn } = input;
+    const isLatest = () => latest.get(conversationKey)?.generation === current.generation;
+    const stopped = async () => {
+      const error = closeReason ?? current.controller.signal.reason;
+      if (!deliverFailure) throw error;
+      await deliverFailure(error);
+      return { error };
+    };
+    let result;
+    try {
+      if (previous) {
+        if (previous.sessionId) await Promise.resolve(abortTurn(previous.sessionId, abortReason)).catch(() => undefined);
+        await previous.done.catch(() => undefined);
+        current.sessionId = previous.sessionId ?? current.sessionId;
       }
-      if (deliver) await deliver(result);
-      return result;
-    });
-    const tail = current.then(() => undefined, () => undefined);
-    tails.set(conversationKey, tail);
-    tail.finally(() => {
-      if (tails.get(conversationKey) === tail) tails.delete(conversationKey);
-    });
-    return current;
+      if (!isLatest()) return { superseded: true };
+      if (closed) throw closeReason;
+      try {
+        Promise.resolve(startTyping?.()).catch(() => undefined);
+      } catch {}
+      result = await runTurn({
+        ...turn,
+        signal: current.controller.signal,
+        sessionId: current.sessionId,
+        onSession: async (sessionId) => {
+          current.sessionId = sessionId;
+          await onSession?.(sessionId);
+        },
+      });
+    } catch (error) {
+      if (!isLatest()) return { superseded: true };
+      error = closed ? closeReason : error;
+      if (!deliverFailure) throw error;
+      await deliverFailure(error);
+      return { error };
+    }
+    if (!isLatest()) return { superseded: true };
+    if (current.controller.signal.aborted) return stopped();
+    if (result.sessionId) {
+      current.sessionId = result.sessionId;
+      await sessionStore.set(conversationKey, result.sessionId);
+    }
+    if (!isLatest()) return { superseded: true };
+    if (current.controller.signal.aborted) return stopped();
+    if (deliver) await deliver(result, current.controller.signal);
+    if (!isLatest()) return { superseded: true };
+    if (current.controller.signal.aborted) return stopped();
+    return result;
   }
 
   return {
     enqueue,
-    close(reason = new PipaStoppedError()) { closed = true; closeReason ??= reason; },
-    drain: () => Promise.all([...tails.values()]),
+    close(reason = new PipaStoppedError()) {
+      closed = true;
+      closeReason ??= reason;
+      const aborts = [];
+      for (const turn of latest.values()) {
+        turn.controller.abort(closeReason);
+        if (turn.sessionId) aborts.push(Promise.resolve(abortTurn(turn.sessionId, closeReason)).catch(() => undefined));
+      }
+      closing = Promise.allSettled(aborts);
+    },
+    async drain() {
+      await closing;
+      while (latest.size) await Promise.allSettled([...latest.values()].map((turn) => turn.done));
+    },
   };
 }
 
@@ -572,7 +636,8 @@ function slackContext(thread, message) {
   };
 }
 
-async function postResult(thread, { text, files = [] }) {
+async function postResult(thread, { text, files = [] }, signal) {
+  if (signal?.aborted) return;
   if (files.length) {
     try {
       await thread.post({ markdown: text, files });
@@ -581,8 +646,11 @@ async function postResult(thread, { text, files = [] }) {
       // A failed adapter call may still have uploaded files, so retry text only.
     }
   }
-  if (!text) return;
-  for (const markdown of splitSlackMarkdown(text)) await thread.post({ markdown });
+  if (!text || signal?.aborted) return;
+  for (const markdown of splitSlackMarkdown(text)) {
+    if (signal?.aborted) return;
+    await thread.post({ markdown });
+  }
 }
 
 function splitSlackMarkdown(text, limit = 3500) {
