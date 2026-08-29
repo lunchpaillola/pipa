@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { checkSlackAppToken, checkSlackToken, createConversationRunner, initializePipa, startPipa } from "../src/app.mjs";
-import { PipaStoppedError } from "../src/opencode.mjs";
+import { PipaStoppedError, PipaSupersededError } from "../src/opencode.mjs";
 import { createSessionStore, pipaPaths } from "../src/state.mjs";
 
 test("init validates dependencies before replacing config", async () => {
@@ -209,37 +209,62 @@ test("bounds executor-setup cleanup when an owned server never reports exit", as
   assert.ok(Date.now() - startedAt < 100);
 });
 
-test("conversation runner serializes one thread, overlaps threads, and persists before release", async () => {
+test("conversation runner interrupts one thread, reuses its session, and overlaps other threads", async () => {
   const events = [];
   const sessions = new Map();
-  const gates = new Map();
+  const active = new Map();
   const sessionStore = {
     get: (key) => sessions.get(key) ?? null,
     async set(key, value) { events.push(`save:${key}:${value}`); sessions.set(key, value); },
   };
   const runner = createConversationRunner({
     sessionStore,
-    runTurn: async ({ prompt, sessionId }) => {
+    abortTurn: async (sessionId) => {
+      events.push(`abort:${sessionId}`);
+      active.get(sessionId)?.reject(new PipaSupersededError());
+    },
+    runTurn: async ({ prompt, sessionId, onSession }) => {
+      const selectedSessionId = sessionId ?? `ses_${prompt === "other" ? "other" : "A"}`;
       events.push(`start:${prompt}:${sessionId}`);
-      await new Promise((resolve) => gates.set(prompt, resolve));
+      await onSession(selectedSessionId);
+      if (prompt === "one" || prompt === "other") {
+        await new Promise((resolve, reject) => active.set(selectedSessionId, { resolve, reject }));
+      }
       events.push(`end:${prompt}`);
-      return { text: prompt, sessionId: `ses_${prompt}` };
+      return { text: prompt, sessionId: selectedSessionId };
     },
   });
 
-  const first = runner.enqueue("A", { prompt: "one" });
-  const second = runner.enqueue("A", { prompt: "two" });
+  const delivered = [];
+  const failed = [];
+  const first = runner.enqueue("A", { prompt: "one", deliver: (result) => delivered.push(result.text), deliverFailure: (error) => failed.push(error) });
   const other = runner.enqueue("B", { prompt: "other" });
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(events, ["start:one:null", "start:other:null"]);
-  gates.get("other")();
-  await other;
-  gates.get("one")();
-  await first;
+  const second = runner.enqueue("A", { prompt: "two", deliver: (result) => delivered.push(result.text) });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.match(events.join("|"), /save:A:ses_one\|start:two:ses_one/u);
-  gates.get("two")();
-  await second;
+  assert.match(events.join("|"), /abort:ses_A\|start:two:ses_A/u);
+  active.get("ses_other").resolve();
+  await other;
+  assert.equal((await first).superseded, true);
+  assert.equal((await second).text, "two");
+  assert.deepEqual(delivered, ["two"]);
+  assert.deepEqual(failed, []);
+});
+
+test("conversation runner interrupts before OpenCode selects a session", async () => {
+  const runner = createConversationRunner({
+    sessionStore: { get: () => null, set: async () => undefined },
+    runTurn: async ({ prompt, signal }) => {
+      if (prompt === "one") await new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      return { text: prompt, sessionId: "ses_1" };
+    },
+  });
+  const first = runner.enqueue("A", { prompt: "one" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = runner.enqueue("A", { prompt: "two" });
+  assert.equal((await first).superseded, true);
+  assert.equal((await second).text, "two");
 });
 
 test("conversation runner starts typing once for active turns and ignores typing failures", async () => {
@@ -270,14 +295,20 @@ test("failed turns release the conversation tail", async () => {
 });
 
 test("failed delivery releases the conversation tail", async () => {
+  let signalDeliveryStarted;
+  const deliveryStarted = new Promise((resolve) => signalDeliveryStarted = resolve);
   const runner = createConversationRunner({
     sessionStore: { get: () => null, set: async () => undefined },
     runTurn: async ({ prompt }) => ({ text: prompt, sessionId: `ses_${prompt}` }),
   });
   const first = runner.enqueue("A", {
     prompt: "one",
-    deliver: async () => { throw new Error("delivery failed"); },
+    deliver: async () => {
+      signalDeliveryStarted();
+      throw new Error("delivery failed");
+    },
   });
+  await deliveryStarted;
   const second = runner.enqueue("A", { prompt: "two" });
   await assert.rejects(first, /delivery failed/u);
   await second;
@@ -342,9 +373,9 @@ test("conversation tail preserves Slack delivery order", async () => {
       await new Promise((resolve) => releaseDelivery = resolve);
     },
   });
-  const second = runner.enqueue("A", { prompt: "two", deliver: async () => events.push("deliver:two") });
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(events, ["run:one", "deliver:one"]);
+  const second = runner.enqueue("A", { prompt: "two", deliver: async () => events.push("deliver:two") });
   releaseDelivery();
   await Promise.all([first, second]);
   assert.deepEqual(events, ["run:one", "deliver:one", "run:two", "deliver:two"]);
@@ -405,9 +436,12 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   };
   const thread = { id: "slack:C2:2.0", adapter, channel: { isDM: false, channelVisibility: "private" }, subscribe: async () => restored.push("subscribed"), post: async (text) => posts.push(text) };
   await handlers.mention(thread, { id: "1", text: "@U1 ask <@U2> for help", author: human, raw: {} });
+  await waitFor(() => posts.length === 1);
   await handlers.subscribed(thread, { id: "2", text: "<@U2> follow up", author: human, raw: {} });
+  await waitFor(() => posts.length === 2);
   const attachment = { name: "notes.txt", size: 100 * 1024 * 1024, fetchData: async () => Buffer.from("notes") };
   await handlers.mention(thread, { id: "file-1", text: "@U1 summarize", attachments: [attachment], author: human, raw: {} });
+  await waitFor(() => posts.length === 3);
   await handlers.subscribed(thread, { id: "file-2", text: "compare this", attachments: [attachment], author: human, raw: { subtype: "file_share" } });
   await waitFor(() => posts.length === 4);
   const beforeIgnored = calls.length;
@@ -430,8 +464,11 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   await waitFor(() => calls.length === beforeIgnored + 1);
   assert.equal(calls.length, beforeIgnored + 1);
   await handlers.subscribed(thread, { id: "broken", text: "broken attachment", attachments: [attachment], author: human, raw: { subtype: "file_share" } });
+  await waitFor(() => posts.length === 7);
   await handlers.subscribed(thread, { id: "3", text: "long", author: human, raw: {} });
+  await waitFor(() => posts.length === 10);
   await handlers.subscribed(thread, { id: "4", text: "secret failure", author: human, raw: {} });
+  await waitFor(() => posts.length === 11);
   await handlers.subscribed(thread, { id: "5", text: "markdown", author: human, raw: {} });
   await waitFor(() => posts.length === 12);
   assert.deepEqual(posts.slice(0, 2), [

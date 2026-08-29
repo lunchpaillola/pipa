@@ -4,7 +4,7 @@ import { Chat, Modal, TextInput } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { canonicalWorkingDirectory, createManifest, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
-import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
+import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaStoppedError, PipaSupersededError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
 
 export async function initializePipa(input, options = {}) {
   const paths = options.paths ?? pipaPaths();
@@ -63,7 +63,7 @@ export async function startPipa(options = {}) {
     await withTimeout(server?.wait(), options.shutdownTimeoutMs ?? 15_000, "OpenCode shutdown timed out.").catch(() => undefined);
     throw error;
   }
-  const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn });
+  const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn, abortTurn: executor.abortTurn });
   let accepting = true;
   const interactions = createPendingInteractions();
   chat.onAction?.(interactions.onAction);
@@ -99,7 +99,7 @@ export async function startPipa(options = {}) {
           ? `${config.botName} stopped before finishing this request.`
           : `${config.botName} failed: ${safeError(error)}`),
       });
-      await finishReaction(thread, message, result.error instanceof PipaStoppedError ? null : result.error ? "warning" : "white_check_mark");
+      await finishReaction(thread, message, result.superseded || result.error instanceof PipaStoppedError ? null : result.error ? "warning" : "white_check_mark");
     } catch (error) {
       await finishReaction(thread, message, "warning");
       process.stderr.write("Pipa could not complete or deliver a Slack turn.\n");
@@ -433,47 +433,115 @@ function displayName(value) {
   return name ? name[0].toUpperCase() + name.slice(1) : "";
 }
 
-export function createConversationRunner({ sessionStore, runTurn }) {
-  const tails = new Map();
+export function createConversationRunner({ sessionStore, runTurn, abortTurn = async () => undefined }) {
+  const conversations = new Map();
+  const inflight = new Set();
   let closed = false;
   let closeReason;
 
   function enqueue(conversationKey, input) {
     if (closed && input.deliverFailure) return Promise.resolve(input.deliverFailure(closeReason)).then(() => ({ error: closeReason }));
     if (closed) return Promise.reject(closeReason);
-    const previous = tails.get(conversationKey) ?? Promise.resolve();
-    const current = previous.catch(() => undefined).then(async () => {
-      const { deliver, deliverFailure, startTyping, ...turn } = input;
-      let result;
+    const state = conversations.get(conversationKey) ?? {
+      active: null,
+      pending: null,
+      sessionId: sessionStore.get(conversationKey),
+    };
+    conversations.set(conversationKey, state);
+    let resolve;
+    let reject;
+    const promise = new Promise((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    const job = { input, promise, reject, resolve, sessionId: null, superseded: false, aborting: null, controller: new AbortController(), phase: "running" };
+    if (!state.active) start(conversationKey, state, job);
+    else {
+      if (state.pending) state.pending.resolve({ superseded: true });
+      state.pending = job;
+      if (state.active.phase === "running") {
+        state.active.superseded = true;
+        requestAbort(state.active);
+      }
+    }
+    return promise;
+  }
+
+  function requestAbort(job) {
+    const reason = new PipaSupersededError();
+    job.controller.abort(reason);
+    if (!job.sessionId || job.aborting) return;
+    job.aborting = Promise.resolve(abortTurn(job.sessionId, reason)).catch(() => undefined);
+  }
+
+  function start(conversationKey, state, job) {
+    state.active = job;
+    const execution = execute(conversationKey, state, job).finally(() => {
+      state.active = null;
+      const next = state.pending;
+      state.pending = null;
+      if (next) start(conversationKey, state, next);
+      else conversations.delete(conversationKey);
+    });
+    inflight.add(execution);
+    void execution.then(() => inflight.delete(execution), () => inflight.delete(execution));
+  }
+
+  async function execute(conversationKey, state, job) {
+    const { deliver, deliverFailure, startTyping, onSession, ...turn } = job.input;
+    try {
+      if (closed) throw closeReason;
       try {
-        if (closed) throw closeReason;
-        try {
-          Promise.resolve(startTyping?.()).catch(() => undefined);
-        } catch {}
-        result = await runTurn({ ...turn, sessionId: sessionStore.get(conversationKey) });
-        if (result.sessionId) await sessionStore.set(conversationKey, result.sessionId);
-      } catch (error) {
-        if (deliverFailure) {
-          await deliverFailure(error);
-          return { error };
-        }
-        throw error;
+        Promise.resolve(startTyping?.()).catch(() => undefined);
+      } catch {}
+      const result = await runTurn({
+        ...turn,
+        signal: job.controller.signal,
+        sessionId: state.sessionId,
+        onSession: async (sessionId) => {
+          job.sessionId = sessionId;
+          await onSession?.(sessionId);
+          if (job.superseded) requestAbort(job);
+          await job.aborting;
+        },
+      });
+      if (job.superseded) {
+        await job.aborting;
+        state.sessionId = job.sessionId ?? state.sessionId;
+        job.resolve({ superseded: true });
+        return;
+      }
+      job.phase = "delivering";
+      if (result.sessionId) {
+        state.sessionId = result.sessionId;
+        await sessionStore.set(conversationKey, result.sessionId);
       }
       if (deliver) await deliver(result);
-      return result;
-    });
-    const tail = current.then(() => undefined, () => undefined);
-    tails.set(conversationKey, tail);
-    tail.finally(() => {
-      if (tails.get(conversationKey) === tail) tails.delete(conversationKey);
-    });
-    return current;
+      job.resolve(result);
+    } catch (error) {
+      if (job.superseded || error instanceof PipaSupersededError) {
+        await job.aborting;
+        state.sessionId = job.sessionId ?? state.sessionId;
+        job.resolve({ superseded: true });
+      } else if (deliverFailure) {
+        try {
+          await deliverFailure(error);
+          job.resolve({ error });
+        } catch (deliveryError) {
+          job.reject(deliveryError);
+        }
+      } else {
+        job.reject(error);
+      }
+    }
   }
 
   return {
     enqueue,
     close(reason = new PipaStoppedError()) { closed = true; closeReason ??= reason; },
-    drain: () => Promise.all([...tails.values()]),
+    async drain() {
+      while (inflight.size) await Promise.allSettled([...inflight]);
+    },
   };
 }
 

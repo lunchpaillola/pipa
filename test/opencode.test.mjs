@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { access, mkdir, readFile, rename, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -685,7 +685,8 @@ test("Slack turns request concise delivery and return declared binary artifacts"
   assert.match(system, /For deeper work or larger deliverables/u);
   assert.match(system, /Keep naturally short answers inline/u);
   assert.match(system, /use the most suitable artifact format/u);
-  assert.equal(path.dirname(artifactDirectory), path.resolve(os.tmpdir()));
+  assert.equal(path.dirname(artifactDirectory), await realpath(os.tmpdir()));
+  assert.equal(path.basename(artifactDirectory), "ses_1");
   assert.match(system, new RegExp(artifactDirectory.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
   assert.match(system, /copy up to 10 top-level files \(100 MB total\)/u);
   assert.match(system, /PIPA_ARTIFACTS: \["report\.csv","brief\.pdf"\]/u);
@@ -695,6 +696,68 @@ test("Slack turns request concise delivery and return declared binary artifacts"
     ["totals.csv", csv], ["brief.pdf", pdf], ["image.png", image],
   ]);
   await assert.rejects(access(artifactDirectory));
+});
+
+test("Slack artifact paths are stable per session and isolated between sessions", async () => {
+  const paths = [];
+  for (const sessionId of ["ses_same", "ses_same", "ses_other"]) {
+    await artifactTurn({
+      sessionId,
+      response: async (body) => {
+        const directory = artifactPath(body.system);
+        paths.push(directory);
+        await writeFile(path.join(directory, "report.txt"), sessionId);
+        return 'Summary.\nPIPA_ARTIFACTS: ["report.txt"]';
+      },
+    });
+  }
+  assert.equal(paths[0], paths[1]);
+  assert.notEqual(paths[0], paths[2]);
+  assert.equal(path.basename(paths[0]), "ses_same");
+  assert.equal(path.basename(paths[2]), "ses_other");
+  for (const directory of paths) await assert.rejects(access(directory));
+});
+
+test("Slack artifact delivery ignores a symlinked artifact root", async () => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "pipa-artifact-root-"));
+  const target = path.join(temporaryDirectory, "target");
+  const root = path.join(temporaryDirectory, "artifacts");
+  await mkdir(target);
+  await symlink(target, root);
+  let system;
+  const result = await createOpenCodeExecutor({ artifactRoot: root, baseUrl: "http://localhost:5555", fetch: artifactFetch(async (body) => {
+    system = body.system;
+    return "Summary.";
+  }), pollIntervalMs: 1 }).runTurn({
+    prompt: "do the work",
+    sessionId: "ses_1",
+    workingDirectory: os.tmpdir(),
+    contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" },
+  });
+  assert.equal(result.text, "Summary.");
+  assert.doesNotMatch(system, /PIPA_ARTIFACTS:/u);
+  await rm(temporaryDirectory, { recursive: true, force: true });
+});
+
+test("Slack artifact delivery ignores an artifact root redirected outside the workspace", async () => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "pipa-artifact-parent-"));
+  const workspace = path.join(temporaryDirectory, "workspace");
+  const outside = path.join(temporaryDirectory, "outside");
+  await Promise.all([mkdir(workspace), mkdir(outside)]);
+  await symlink(outside, path.join(workspace, ".pipa"));
+  let system;
+  const result = await createOpenCodeExecutor({ artifactRoot: path.join(workspace, ".pipa", "artifacts"), baseUrl: "http://localhost:5555", fetch: artifactFetch(async (body) => {
+    system = body.system;
+    return "Summary.";
+  }), pollIntervalMs: 1 }).runTurn({
+    prompt: "do the work",
+    sessionId: "ses_1",
+    workingDirectory: workspace,
+    contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" },
+  });
+  assert.equal(result.text, "Summary.");
+  assert.doesNotMatch(system, /PIPA_ARTIFACTS:/u);
+  await rm(temporaryDirectory, { recursive: true, force: true });
 });
 
 test("short Slack answers stay inline and remote attached servers get no local artifact contract", async () => {
@@ -854,21 +917,21 @@ test("artifact cleanup failure does not replace a completed turn", async () => {
   await rm(directory, { recursive: true, force: true });
 });
 
-async function artifactTurn({ baseUrl = "http://localhost:5555", contextEnvironment = { PIPA_MESSAGE_CHANNEL: "slack" }, response }) {
-  return createOpenCodeExecutor({ artifactRoot: os.tmpdir(), baseUrl, fetch: artifactFetch(response), pollIntervalMs: 1 })
-    .runTurn({ prompt: "do the work", sessionId: "ses_1", workingDirectory: os.tmpdir(), contextEnvironment });
+async function artifactTurn({ baseUrl = "http://localhost:5555", contextEnvironment = { PIPA_MESSAGE_CHANNEL: "slack" }, response, sessionId = "ses_1" }) {
+  return createOpenCodeExecutor({ artifactRoot: os.tmpdir(), baseUrl, fetch: artifactFetch(response, sessionId), pollIntervalMs: 1 })
+    .runTurn({ prompt: "do the work", sessionId, workingDirectory: os.tmpdir(), contextEnvironment });
 }
 
-function artifactFetch(response) {
+function artifactFetch(response, sessionId = "ses_1") {
   let prompted = false;
   let assistantText;
   return async (url, init = {}) => {
     const pathname = new URL(url).pathname;
-    if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
-    if (pathname === "/session/ses_1/message") return jsonResponse(prompted && assistantText !== undefined
+    if (pathname === "/session/status") return jsonResponse({ [sessionId]: { type: "idle" } });
+    if (pathname === `/session/${sessionId}/message`) return jsonResponse(prompted && assistantText !== undefined
       ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: assistantText }] }]
       : []);
-    if (pathname === "/session/ses_1/prompt_async") {
+    if (pathname === `/session/${sessionId}/prompt_async`) {
       assistantText = await response(JSON.parse(init.body), init);
       prompted = true;
       return new Response(null, { status: 204 });
