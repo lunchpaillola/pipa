@@ -669,6 +669,67 @@ test("failed artifact post retries declaration-free text once without files", as
   await delivery.app.shutdown();
 });
 
+test("interrupted Slack messages keep their eyes until the latest turn succeeds", async () => {
+  const handlers = {};
+  const reactions = [];
+  const posts = [];
+  let firstStarted = false;
+  let secondStarted = false;
+  let finishSecond;
+  const app = await startPipa({
+    chat: {
+      onNewMention(handler) { handlers.mention = handler; },
+      onSubscribedMessage(handler) { handlers.subscribed = handler; },
+      async initialize() {},
+      async shutdown() {},
+    },
+    executor: {
+      async runTurn({ prompt, signal, onSession }) {
+        await onSession("ses_1");
+        if (prompt === "first") {
+          firstStarted = true;
+          await new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+        }
+        secondStarted = true;
+        await new Promise((resolve) => finishSecond = resolve);
+        return { text: "second complete", sessionId: "ses_1" };
+      },
+      async abortTurn() {},
+      stopAll() {},
+    },
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+  });
+  const thread = {
+    id: "slack:C1:1.0",
+    adapter: {
+      addReaction: async (_, messageId, emoji) => reactions.push(`add:${messageId}:${emoji}`),
+      removeReaction: async (_, messageId, emoji) => reactions.push(`remove:${messageId}:${emoji}`),
+    },
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async (payload) => posts.push(payload),
+  };
+  const author = { userId: "U1" };
+
+  await handlers.mention(thread, { id: "1", text: "@U1 first", author, raw: {} });
+  await waitFor(() => firstStarted);
+  await handlers.subscribed(thread, { id: "2", text: "second", author, raw: {} });
+  await waitFor(() => secondStarted);
+  assert.deepEqual(reactions, ["add:1:eyes", "add:2:eyes"]);
+
+  finishSecond();
+  await waitFor(() => reactions.length === 6);
+  assert.deepEqual(reactions, [
+    "add:1:eyes", "add:2:eyes",
+    "remove:1:eyes", "add:1:white_check_mark",
+    "remove:2:eyes", "add:2:white_check_mark",
+  ]);
+  assert.deepEqual(posts, [{ markdown: "second complete" }]);
+  await app.shutdown();
+});
+
 test("inline fallback prefers paragraphs and lines and preserves fenced code across chunks", async () => {
   const paragraph = "ordinary words ".repeat(240).trim();
   const codeLine = `const value = "${"x".repeat(3400)}";`;

@@ -66,8 +66,16 @@ export async function startPipa(options = {}) {
   const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn, abortTurn: executor.abortTurn });
   let accepting = true;
   const interactions = createPendingInteractions();
+  const pendingReactions = new Map();
   chat.onAction?.(interactions.onAction);
   chat.onModalSubmit?.("pipa_custom", interactions.onCustomAnswer);
+
+  const finishPendingReactions = async (conversationKey, currentMessage, emoji) => {
+    const pending = pendingReactions.get(conversationKey) ?? [];
+    if (pending.at(-1)?.message !== currentMessage) return;
+    pendingReactions.delete(conversationKey);
+    for (const entry of pending) await finishReaction(entry.thread, entry.message, entry.message === currentMessage ? emoji : "white_check_mark");
+  };
 
   const handle = async (thread, message, subscribe) => {
     if (!accepting || !isAuthorized(thread, message, config) || shouldIgnore(thread, message)) return;
@@ -82,6 +90,9 @@ export async function startPipa(options = {}) {
     if (!accepting) return;
 
     await react(thread, message, "eyes");
+    const pending = pendingReactions.get(thread.id) ?? [];
+    pending.push({ thread, message });
+    pendingReactions.set(thread.id, pending);
     try {
       const interactionContext = { thread };
       const result = await runner.enqueue(thread.id, {
@@ -99,9 +110,10 @@ export async function startPipa(options = {}) {
           ? `${config.botName} stopped before finishing this request.`
           : `${config.botName} failed: ${safeError(error)}`),
       });
-      await finishReaction(thread, message, result.superseded || result.error instanceof PipaStoppedError ? null : result.error ? "warning" : "white_check_mark");
+      if (result.superseded) return;
+      await finishPendingReactions(thread.id, message, result.error instanceof PipaStoppedError ? null : result.error ? "warning" : "white_check_mark");
     } catch (error) {
-      await finishReaction(thread, message, "warning");
+      await finishPendingReactions(thread.id, message, "warning");
       process.stderr.write("Pipa could not complete or deliver a Slack turn.\n");
     }
   };
