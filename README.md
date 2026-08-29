@@ -5,6 +5,8 @@
 
 Pipa runs Slack through one persistent private OpenCode server with no hosted relay, database, public endpoint, or sandbox.
 
+[View Pipa on GitHub](https://github.com/lunchpaillola/pipa). If it is useful, star the repo so more people can find it.
+
 **Pipa is in early preview. Features may break unintentionally, and CLI commands, configuration, and Slack behavior may continue to change.**
 
 ## Pipa Managed
