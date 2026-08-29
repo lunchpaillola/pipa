@@ -39,7 +39,22 @@ Pipa is a small Node.js CLI that connects Slack Socket Mode to a persistent Open
 ## Change expectations
 
 - Read the full caller path before editing shared orchestration. Concurrency fixes need coverage for same-thread replacement and cross-thread independence.
-- Add a regression test for behavior changes. Prefer a focused test in the owning suite over new fixtures or helper layers.
 - Keep user-facing documentation aligned when commands, configuration, Slack behavior, limits, or release behavior changes.
 - Run `npm test`, `npm run test:pack`, and `git diff --check` before submitting a pull request.
 - Do not bump versions unless the change is intended for release. When requested, update both `package.json` and `package-lock.json` and follow `CONTRIBUTING.md`.
+
+## Code style
+
+- Keep logic in one function unless it is composable or reused. Do not extract single-use helpers unless they name a real boundary and make the caller clearer.
+- Prefer `const`, early returns, and direct property access. Avoid reassignment, unnecessary destructuring, and `else` after a returning branch.
+- Use named or default imports without aliases; do not add star imports.
+- Keep supporting helpers near the code they serve, below the main export when practical.
+- Comment non-obvious constraints and surprising behavior, not routine assignments or control flow.
+- Prefer the Node standard library and existing dependencies. Add a package only when neither provides a small, clear solution.
+
+## Tests and pull requests
+
+- Add a focused regression test for behavior changes. Test the real implementation and avoid duplicating production logic in assertions.
+- Avoid broad mocks and global patches. Use the smallest boundary fake needed for Slack, HTTP, filesystem, or child-process behavior.
+- Use conventional commit-style messages and PR titles: `type(scope): summary`. Common types are `feat`, `fix`, `docs`, `chore`, `refactor`, and `test`.
+- Keep pull requests focused. Open an issue before large architectural or behavioral changes so the approach can be agreed on first.
