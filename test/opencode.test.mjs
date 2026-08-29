@@ -34,7 +34,7 @@ test("starts one owned loopback server on port 0 and stops it", async () => {
     environment: { PATH: "/bin", PIPA_SLACK_BOT_TOKEN: "secret" },
     fetch: async (url) => {
       requests.push(String(url));
-      return jsonResponse({ healthy: true });
+      return jsonResponse({});
     },
     spawn(command, args, options) {
       invocation = { command, args, options };
@@ -51,15 +51,15 @@ test("starts one owned loopback server on port 0 and stops it", async () => {
   assert.equal(invocation.options.env.PIPA_SLACK_BOT_TOKEN, undefined);
   assert.equal(child.stdout.readableFlowing, true);
   assert.equal(child.stderr.readableFlowing, true);
-  assert.deepEqual(requests, ["http://127.0.0.1:54321/global/health"]);
+  assert.deepEqual(requests, ["http://127.0.0.1:54321/session/status?directory=%2Fwork"]);
   server.stop("SIGTERM");
   await server.wait();
   assert.equal(killed, true);
 });
 
-test("health-checks an authenticated attached server without owning it", async () => {
+test("checks an authenticated attached workspace without owning it", async () => {
   let spawned = false;
-  let request;
+  const requests = [];
   const server = await startSocketOpenCodeServer({ workingDirectory: "/work" }, {
     environment: {
       PIPA_OPENCODE_ATTACH_URL: " http://localhost:5555/ ",
@@ -67,8 +67,8 @@ test("health-checks an authenticated attached server without owning it", async (
       OPENCODE_SERVER_PASSWORD: "secret",
     },
     fetch: async (url, init) => {
-      request = { url: String(url), init };
-      return jsonResponse({ healthy: true });
+      requests.push({ url: String(url), init });
+      return jsonResponse({});
     },
     spawn: () => { spawned = true; },
   });
@@ -76,13 +76,13 @@ test("health-checks an authenticated attached server without owning it", async (
   assert.equal(server.baseUrl, "http://localhost:5555");
   assert.equal(server.owned, false);
   assert.equal(spawned, false);
-  assert.equal(request.url, "http://localhost:5555/global/health");
-  assert.equal(request.init.headers.authorization, `Basic ${Buffer.from("pipa:secret").toString("base64")}`);
+  assert.deepEqual(requests.map(({ url }) => url), ["http://localhost:5555/session/status?directory=%2Fwork"]);
+  assert.ok(requests.every(({ init }) => init.headers.authorization === `Basic ${Buffer.from("pipa:secret").toString("base64")}`));
   server.stop();
   await server.wait();
 });
 
-test("cleans up an owned child when startup health never succeeds", async () => {
+test("cleans up an owned child when workspace readiness never succeeds", async () => {
   let killed = false;
   const child = childProcess();
   child.kill = () => {
@@ -92,13 +92,37 @@ test("cleans up an owned child when startup health never succeeds", async () => 
   };
   await assert.rejects(startSocketOpenCodeServer({ workingDirectory: "/work" }, {
     startupTimeoutMs: 5,
-    fetch: async () => jsonResponse({ healthy: false }, 503),
+    fetch: async () => jsonResponse({}, 503),
     spawn: () => {
       queueMicrotask(() => child.stdout.write("opencode server listening on http://127.0.0.1:54321\n"));
       return child;
     },
-  }), /health check timed out/u);
+  }), /workspace readiness check timed out/u);
   assert.equal(killed, true);
+});
+
+test("waits for a valid workspace status response", async () => {
+  let statusReads = 0;
+  const child = childProcess();
+  child.kill = () => {
+    queueMicrotask(() => child.emit("close", 0));
+    return true;
+  };
+  const server = await startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    startupTimeoutMs: 1_000,
+    fetch: async () => {
+      statusReads += 1;
+      return jsonResponse(statusReads === 1 ? { healthy: true } : {});
+    },
+    spawn: () => {
+      queueMicrotask(() => child.stdout.write("opencode server listening on http://127.0.0.1:54321\n"));
+      return child;
+    },
+  });
+
+  assert.equal(statusReads, 2);
+  server.stop();
+  await server.wait();
 });
 
 test("uses native sessions, prompt_async, status, messages, context, and file parts", async () => {
@@ -365,7 +389,7 @@ test("Windows server shutdown falls back when taskkill is unavailable", async ()
   };
   const server = await startSocketOpenCodeServer({ workingDirectory: "/work" }, {
     platform: "win32",
-    fetch: async () => jsonResponse({ healthy: true }),
+    fetch: async () => jsonResponse({}),
     spawn: () => {
       queueMicrotask(() => child.stdout.write("opencode server listening on http://127.0.0.1:54321\n"));
       return child;
@@ -446,6 +470,45 @@ test("subscribes to interaction events before prompt_async", async () => {
   assert.equal(seen[0].type, "question");
   assert.equal(seen[0].request.id, "req_1");
   assert.deepEqual(settledBody, { answers: [["Red"]] });
+});
+
+test("keeps an established event stream open beyond the request timeout", async () => {
+  let eventConnections = 0;
+  let prompted = false;
+  let statusRead = false;
+  const fetch = async (url, init = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/event") {
+      eventConnections += 1;
+      return new Response(new ReadableStream({
+        start(stream) {
+          init.signal.addEventListener("abort", () => stream.error(init.signal.reason), { once: true });
+        },
+      }), { status: 200 });
+    }
+    if (pathname === "/permission") return jsonResponse([]);
+    if (pathname === "/session/status") {
+      if (prompted && !statusRead) {
+        statusRead = true;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
+      return jsonResponse({ ses_1: { type: "idle" } });
+    }
+    if (pathname === "/session/ses_1/message") {
+      return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
+    }
+    if (pathname.endsWith("/prompt_async")) {
+      prompted = true;
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+
+  const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1, requestTimeoutMs: 5 })
+    .runTurn({ prompt: "go", sessionId: "ses_1", workingDirectory: "/work", onInteraction: () => undefined });
+
+  assert.equal(result.text, "done");
+  assert.equal(eventConnections, 1);
 });
 
 test("routes a subagent permission through its parent session", async () => {

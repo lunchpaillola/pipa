@@ -1,6 +1,6 @@
 {
   "name": "@usepipa/pipa",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Run Pipa through Slack Socket Mode with OpenCode",
   "keywords": [
     "slack",

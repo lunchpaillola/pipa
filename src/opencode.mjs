@@ -38,7 +38,7 @@ export async function startSocketOpenCodeServer(config, options = {}) {
 
   if (attachUrl) {
     const baseUrl = normalizeBaseUrl(attachUrl);
-    await waitForHealth(baseUrl, fetchImpl, headers, startupTimeoutMs);
+    await waitForWorkspace(baseUrl, config.workingDirectory, fetchImpl, headers, startupTimeoutMs);
     return externalServer(baseUrl);
   }
 
@@ -65,7 +65,7 @@ export async function startSocketOpenCodeServer(config, options = {}) {
     child.stdout?.resume();
     child.stderr?.resume();
     await Promise.race([
-      waitForHealth(baseUrl, fetchImpl, headers, startupTimeoutMs),
+      waitForWorkspace(baseUrl, config.workingDirectory, fetchImpl, headers, startupTimeoutMs),
       exit.then((code) => { throw new Error(`OpenCode server exited before startup with code ${code}.`); }),
     ]);
     return ownedServer(baseUrl, child, exit, platform);
@@ -528,21 +528,23 @@ function externalServer(baseUrl) {
   };
 }
 
-async function waitForHealth(baseUrl, fetchImpl, headers, timeoutMs) {
+async function waitForWorkspace(baseUrl, workingDirectory, fetchImpl, headers, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const response = await fetchImpl(`${baseUrl}/global/health`, {
+      const status = await fetchImpl(serverUrl(baseUrl, "/session/status", workingDirectory), {
         headers,
         signal: AbortSignal.timeout(Math.min(5_000, Math.max(1, deadline - Date.now()))),
       });
-      if (response.ok && (await response.json())?.healthy === true) return;
+      const sessions = status.ok ? await status.json() : null;
+      if (sessions && typeof sessions === "object" && !Array.isArray(sessions)
+        && Object.values(sessions).every((session) => session && typeof session === "object" && typeof session.type === "string")) return;
     } catch {
-      // The server can accept its socket shortly before the health route is ready.
+      // OpenCode can accept its socket before the configured workspace is ready.
     }
     await delay(Math.min(250, Math.max(0, deadline - Date.now())));
   }
-  throw new Error("OpenCode server health check timed out.");
+  throw new Error("OpenCode workspace readiness check timed out.");
 }
 
 function readListeningUrl(child, timeoutMs) {
@@ -684,10 +686,18 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
     while (!controller.signal.aborted) {
       try {
         const url = serverUrl(baseUrl, "/event", workingDirectory);
-        const response = await fetchImpl(url, {
-          headers: { ...headers, accept: "text/event-stream" },
-          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(requestTimeoutMs)]),
-        });
+        const connection = new AbortController();
+        const connectionTimer = setTimeout(() => connection.abort(new Error("OpenCode event connection timed out.")), requestTimeoutMs);
+        connectionTimer.unref?.();
+        let response;
+        try {
+          response = await fetchImpl(url, {
+            headers: { ...headers, accept: "text/event-stream" },
+            signal: AbortSignal.any([controller.signal, connection.signal]),
+          });
+        } finally {
+          clearTimeout(connectionTimer);
+        }
         if (!response.ok) throw new OpenCodeRequestError(response.status);
         await reconcile();
         if (!subscribed) {
