@@ -532,19 +532,13 @@ async function waitForWorkspace(baseUrl, workingDirectory, fetchImpl, headers, t
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const health = await fetchImpl(`${baseUrl}/global/health`, {
+      const status = await fetchImpl(serverUrl(baseUrl, "/session/status", workingDirectory), {
         headers,
         signal: AbortSignal.timeout(Math.min(5_000, Math.max(1, deadline - Date.now()))),
       });
-      if (health.ok && (await health.json())?.healthy === true) {
-        const status = await fetchImpl(serverUrl(baseUrl, "/session/status", workingDirectory), {
-          headers,
-          signal: AbortSignal.timeout(Math.min(5_000, Math.max(1, deadline - Date.now()))),
-        });
-        const sessions = status.ok ? await status.json() : null;
-        if (sessions && typeof sessions === "object" && !Array.isArray(sessions)
-          && Object.values(sessions).every((session) => session && typeof session === "object" && typeof session.type === "string")) return;
-      }
+      const sessions = status.ok ? await status.json() : null;
+      if (sessions && typeof sessions === "object" && !Array.isArray(sessions)
+        && Object.values(sessions).every((session) => session && typeof session === "object" && typeof session.type === "string")) return;
     } catch {
       // OpenCode can accept its socket before the configured workspace is ready.
     }

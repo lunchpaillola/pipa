@@ -34,7 +34,7 @@ test("starts one owned loopback server on port 0 and stops it", async () => {
     environment: { PATH: "/bin", PIPA_SLACK_BOT_TOKEN: "secret" },
     fetch: async (url) => {
       requests.push(String(url));
-      return jsonResponse(new URL(url).pathname === "/global/health" ? { healthy: true } : {});
+      return jsonResponse({});
     },
     spawn(command, args, options) {
       invocation = { command, args, options };
@@ -51,16 +51,13 @@ test("starts one owned loopback server on port 0 and stops it", async () => {
   assert.equal(invocation.options.env.PIPA_SLACK_BOT_TOKEN, undefined);
   assert.equal(child.stdout.readableFlowing, true);
   assert.equal(child.stderr.readableFlowing, true);
-  assert.deepEqual(requests, [
-    "http://127.0.0.1:54321/global/health",
-    "http://127.0.0.1:54321/session/status?directory=%2Fwork",
-  ]);
+  assert.deepEqual(requests, ["http://127.0.0.1:54321/session/status?directory=%2Fwork"]);
   server.stop("SIGTERM");
   await server.wait();
   assert.equal(killed, true);
 });
 
-test("health-checks an authenticated attached server without owning it", async () => {
+test("checks an authenticated attached workspace without owning it", async () => {
   let spawned = false;
   const requests = [];
   const server = await startSocketOpenCodeServer({ workingDirectory: "/work" }, {
@@ -71,7 +68,7 @@ test("health-checks an authenticated attached server without owning it", async (
     },
     fetch: async (url, init) => {
       requests.push({ url: String(url), init });
-      return jsonResponse(new URL(url).pathname === "/global/health" ? { healthy: true } : {});
+      return jsonResponse({});
     },
     spawn: () => { spawned = true; },
   });
@@ -79,10 +76,7 @@ test("health-checks an authenticated attached server without owning it", async (
   assert.equal(server.baseUrl, "http://localhost:5555");
   assert.equal(server.owned, false);
   assert.equal(spawned, false);
-  assert.deepEqual(requests.map(({ url }) => url), [
-    "http://localhost:5555/global/health",
-    "http://localhost:5555/session/status?directory=%2Fwork",
-  ]);
+  assert.deepEqual(requests.map(({ url }) => url), ["http://localhost:5555/session/status?directory=%2Fwork"]);
   assert.ok(requests.every(({ init }) => init.headers.authorization === `Basic ${Buffer.from("pipa:secret").toString("base64")}`));
   server.stop();
   await server.wait();
@@ -98,9 +92,7 @@ test("cleans up an owned child when workspace readiness never succeeds", async (
   };
   await assert.rejects(startSocketOpenCodeServer({ workingDirectory: "/work" }, {
     startupTimeoutMs: 5,
-    fetch: async (url) => new URL(url).pathname === "/global/health"
-      ? jsonResponse({ healthy: true })
-      : jsonResponse({}, 503),
+    fetch: async () => jsonResponse({}, 503),
     spawn: () => {
       queueMicrotask(() => child.stdout.write("opencode server listening on http://127.0.0.1:54321\n"));
       return child;
@@ -118,8 +110,7 @@ test("waits for a valid workspace status response", async () => {
   };
   const server = await startSocketOpenCodeServer({ workingDirectory: "/work" }, {
     startupTimeoutMs: 1_000,
-    fetch: async (url) => {
-      if (new URL(url).pathname === "/global/health") return jsonResponse({ healthy: true });
+    fetch: async () => {
       statusReads += 1;
       return jsonResponse(statusReads === 1 ? { healthy: true } : {});
     },
@@ -398,7 +389,7 @@ test("Windows server shutdown falls back when taskkill is unavailable", async ()
   };
   const server = await startSocketOpenCodeServer({ workingDirectory: "/work" }, {
     platform: "win32",
-    fetch: async (url) => jsonResponse(new URL(url).pathname === "/global/health" ? { healthy: true } : {}),
+    fetch: async () => jsonResponse({}),
     spawn: () => {
       queueMicrotask(() => child.stdout.write("opencode server listening on http://127.0.0.1:54321\n"));
       return child;
