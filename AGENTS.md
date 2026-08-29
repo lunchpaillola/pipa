@@ -1,60 +1,44 @@
 # Pipa Agent Guide
 
-Pipa is a small Node.js CLI that connects Slack Socket Mode to a persistent OpenCode server. Keep changes focused: this repository intentionally uses three runtime modules and Node's built-in test runner instead of a framework or internal abstraction layer.
+Architecture, request flow, file ownership: [`docs/repository-overview.md`](docs/repository-overview.md).
 
-## Setup and commands
+Setup, checks, contribution, release process: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-- Requires Node.js 22+; install the lockfile exactly with `npm ci`.
-- Run all tests with `npm test`; run one suite with `node --test test/app.test.mjs` (or `test/opencode.test.mjs` / `test/state.test.mjs`).
-- Run `npm run test:pack` for changes affecting the CLI, package contents, startup, or release behavior. CI runs `npm test` then this smoke test on Linux, macOS, and Windows.
-- Manual Socket Mode checks use `pipa init`, `pipa start`, and `pipa stop`. Use a disposable `PIPA_HOME` and test Slack app; never reuse production credentials.
+## Runtime
 
-## Change map
+- Socket profile connects Slack to OpenCode. Managed profile runs OpenCode only.
+- One Slack thread maps to one persisted OpenCode session.
+- Different threads run concurrently. New same-thread message aborts and supersedes old work.
+- Superseded turns must not persist stale state, post stale output, or add success reactions.
+- Shutdown rejects new work, aborts local and server-side turns immediately, then runs bounded cleanup.
+- Attached OpenCode servers are health-checked, never process-owned.
+- Runtime stays plain ESM. Prefer Node APIs and existing dependencies.
 
-- `bin/pipa.mjs` is the published `pipa` executable and command dispatcher.
-- `src/app.mjs` owns Slack Socket Mode, latest-turn coordination per thread, Slack delivery, interactions, and startup/shutdown orchestration.
-- `src/opencode.mjs` owns `opencode serve`, its session HTTP client, attachment/artifact staging, timeouts, and child-process cleanup. Socket Mode may attach via `PIPA_OPENCODE_ATTACH_URL`; attached servers are not owned or stopped by Pipa.
-- `src/state.mjs` owns persistent configuration, sessions, and the single-instance lock. State is under `~/.pipa` by default; set `PIPA_HOME` to isolate it in tests or manual checks.
-- `test/app.test.mjs` covers Slack orchestration and concurrency, `test/opencode.test.mjs` covers the OpenCode boundary and files, and `test/state.test.mjs` covers persisted state and locking.
-- `scripts/pack-smoke.mjs` validates the packed npm artifact rather than the source checkout.
-- `docs/repository-overview.md` describes the complete request flow and file layout.
+## Security
 
-## Runtime invariants
+- Never expose Slack tokens through child environments, errors, logs, fixtures, or commits.
+- Never commit local Pipa state.
+- Configured working directory is trust boundary. Access-control changes require security review and regression tests.
+- Preserve attachment cleanup, filename sanitization, and 100 MB per-file limit.
+- Preserve artifact containment, symlink, identity, type, count, and aggregate-size checks.
+- Never expose local artifact paths to Slack.
 
-- Pipa supports `socket` (default) and `managed` profiles. Socket mode requires Slack tokens; managed mode only starts OpenCode using its configured host and port.
-- One Slack thread maps to one persisted OpenCode session. Different threads may overlap; a newer message in the same thread aborts and supersedes older work.
-- Superseded turns must not persist stale state, post stale output, or add a success reaction. Preserve the generation checks around asynchronous persistence and delivery.
-- Shutdown rejects new messages, aborts local and server-side turns immediately, then waits only for bounded cleanup before closing Slack and owned OpenCode processes.
-- Owned Socket Mode servers bind to loopback port `0`. Explicitly attached servers are health-checked but are not process-owned by Pipa.
-- Keep the runtime in plain ESM and use Node platform APIs or existing dependencies before adding packages.
+## Code
 
-## Security boundaries
+- Trace full caller path before changing shared orchestration.
+- Keep logic in one function unless composable or reused.
+- No preemptive single-use helpers.
+- Prefer `const`, early returns, direct property access.
+- Avoid unnecessary reassignment, destructuring, import aliases, star imports, and `else` after return.
+- Keep helpers near callers. Comment surprising constraints, not obvious control flow.
+- Add dependencies only when Node and installed packages cannot provide a small clear solution.
 
-- Keep Slack tokens out of child OpenCode environments and out of errors, logs, fixtures, and commits. Never commit `~/.pipa` state.
-- Treat the configured working directory as a trust boundary. Pipa grants Slack users access to OpenCode there, so changes to access-list validation require security review and regression tests.
-- Attachments are temporary, capped at 100 MB each, and removed on every terminal path. Preserve filename sanitization and cleanup on errors, cancellation, and timeout.
-- Artifact delivery is only for filesystem-local OpenCode turns and is constrained to the configured working directory's `.pipa/artifacts` directory. Do not weaken its path, identity, type, or size checks.
-- Do not expose local artifact paths to Slack. Deliver only declared top-level regular files after containment, symlink, identity, count, and aggregate-size validation.
+## Tests and PRs
 
-## Change expectations
-
-- Read the full caller path before editing shared orchestration. Concurrency fixes need coverage for same-thread replacement and cross-thread independence.
-- Keep user-facing documentation aligned when commands, configuration, Slack behavior, limits, or release behavior changes.
-- Run `npm test`, `npm run test:pack`, and `git diff --check` before submitting a pull request.
-- Do not bump versions unless the change is intended for release. When requested, update both `package.json` and `package-lock.json` and follow `CONTRIBUTING.md`.
-
-## Code style
-
-- Keep logic in one function unless it is composable or reused. Do not extract single-use helpers unless they name a real boundary and make the caller clearer.
-- Prefer `const`, early returns, and direct property access. Avoid reassignment, unnecessary destructuring, and `else` after a returning branch.
-- Use named or default imports without aliases; do not add star imports.
-- Keep supporting helpers near the code they serve, below the main export when practical.
-- Comment non-obvious constraints and surprising behavior, not routine assignments or control flow.
-- Prefer the Node standard library and existing dependencies. Add a package only when neither provides a small, clear solution.
-
-## Tests and pull requests
-
-- Add a focused regression test for behavior changes. Test the real implementation and avoid duplicating production logic in assertions.
-- Avoid broad mocks and global patches. Use the smallest boundary fake needed for Slack, HTTP, filesystem, or child-process behavior.
-- Use conventional commit-style messages and PR titles: `type(scope): summary`. Common types are `feat`, `fix`, `docs`, `chore`, `refactor`, and `test`.
-- Keep pull requests focused. Open an issue before large architectural or behavioral changes so the approach can be agreed on first.
+- Behavior change needs focused regression test in owning suite.
+- Test real implementation. Avoid copied production logic, broad mocks, and global patches.
+- Concurrency changes cover same-thread replacement and cross-thread independence.
+- Keep docs aligned with user-facing commands, config, Slack behavior, limits, and releases.
+- Use `type(scope): summary` commits and PR titles. Keep PRs focused.
+- Open issue before large architecture or behavior changes.
+- Version bumps happen only for intended releases; update both package files.
