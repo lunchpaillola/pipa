@@ -70,7 +70,7 @@ By default Pipa answers anyone who mentions it in a channel it can see. In a sha
 
 A mention is only handled when the channel ID is in `allowedSlackChannelIds` **and** the author's user ID is in `allowedSlackUserIds`. Leave a list empty to allow any channel or any user. You can also set them non-interactively during setup with `PIPA_ALLOWED_CHANNEL_IDS` and `PIPA_ALLOWED_USER_IDS` (comma-separated).
 
-To use an existing OpenCode server instead, set its URL before starting Pipa. Pipa health-checks the server but does not start or stop it. If the server uses authentication, also set `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD`:
+To use an existing OpenCode server instead, set its URL before starting Pipa. Pipa checks that the server can serve the configured workspace but does not start or stop it. If the server uses authentication, also set `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD`:
 
 ```sh
 export PIPA_OPENCODE_ATTACH_URL=http://localhost:5555
