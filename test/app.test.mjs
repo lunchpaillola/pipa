@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { checkSlackAppToken, checkSlackToken, createConversationRunner, createPendingInteractions, initializePipa, postResult, slackDestinationId, startPipa as startPipaRuntime } from "../src/app.mjs";
 import { PipaStoppedError } from "../src/opencode.mjs";
-import { normalizeRoutine } from "../src/routines.mjs";
+import { createRoutineScheduler, normalizeRoutine } from "../src/routines.mjs";
 import { createSessionStore, pipaPaths, writePrivateJson } from "../src/state.mjs";
 
 const startPipa = (options) => startPipaRuntime({ routinesEnabled: false, ...options });
@@ -884,6 +884,7 @@ test("routine scheduler uses a fresh session and exact Slack destination without
   }, now);
   await writePrivateJson(paths.routines, { version: 1, routines: [routine] });
   let intervalTick;
+  let schedulerError;
   const posts = [];
   const calls = [];
   const chat = {
@@ -903,6 +904,7 @@ test("routine scheduler uses a fresh session and exact Slack destination without
     routineNow: () => now,
     setRoutineInterval(callback) { intervalTick = callback; return { unref() {} }; },
     clearRoutineInterval() {},
+    createRoutineScheduler: (options) => createRoutineScheduler({ ...options, onError: (error) => { schedulerError = error; } }),
     chat,
     executor: {
       async runTurn(input) {
@@ -929,7 +931,8 @@ test("routine scheduler uses a fresh session and exact Slack destination without
   assert.equal(calls[0].contextEnvironment.PIPA_CURRENT_SLACK_CHANNEL_ID, "C123");
   assert.equal(calls[0].contextEnvironment.PIPA_CURRENT_SLACK_THREAD_TS, "123.456");
   assert.deepEqual(posts, [{ markdown: "finished" }]);
-  await waitFor(async () => (await readFile(paths.routines, "utf8")).includes('"completed"'));
+  await waitFor(async () => schedulerError || (await readFile(paths.routines, "utf8")).includes('"completed"'));
+  assert.ifError(schedulerError);
   await app.shutdown();
 });
 

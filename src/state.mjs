@@ -189,15 +189,7 @@ export async function writePrivateJson(file, value) {
   try {
     await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
     if (process.platform !== "win32") await chmod(temporary, 0o600);
-    for (let attempt = 0; ; attempt++) {
-      try {
-        await rename(temporary, file);
-        break;
-      } catch (error) {
-        if (process.platform !== "win32" || !["EACCES", "EPERM"].includes(error?.code) || attempt === 5) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 10 * (attempt + 1)));
-      }
-    }
+    await rename(temporary, file);
   } finally {
     await rm(temporary, { force: true });
   }
