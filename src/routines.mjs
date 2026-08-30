@@ -181,6 +181,59 @@ export async function requestRoutineRun(id, now = DateTime.utc().toISO(), paths 
   return requested;
 }
 
+export function assertRoutineDestinationAllowed(destination, allowedChannelIds = []) {
+  const normalized = normalizeDestination(destination);
+  if (!/^[CG][A-Z0-9]+$/u.test(normalized.channelId)) invalid("destination channelId must be a concrete Slack channel ID");
+  if (normalized.threadTs !== null && !/^\d+\.\d+$/u.test(normalized.threadTs)) invalid("destination threadTs is invalid");
+  if (allowedChannelIds.length > 0 && !allowedChannelIds.includes(normalized.channelId)) invalid("destination channel is not allowed");
+  return normalized;
+}
+
+export async function createRoutine(input, options = {}) {
+  const now = options.now ?? DateTime.utc().toISO();
+  const paths = options.paths ?? pipaPaths();
+  const routine = normalizeRoutine(input, now);
+  assertRoutineDestinationAllowed(routine.destination, options.allowedChannelIds);
+  if (options.preview) return routine;
+  await mutateRoutineState((state) => {
+    if (state.routines.some((item) => item.id === routine.id)) throw new Error(`Routine already exists: ${routine.id}`);
+    state.routines.push(routine);
+  }, paths);
+  return routine;
+}
+
+export async function editRoutine(id, changes, options = {}) {
+  const now = options.now ?? DateTime.utc().toISO();
+  const paths = options.paths ?? pipaPaths();
+  let edited;
+  await mutateRoutineState((state) => {
+    const index = state.routines.findIndex((item) => item.id === id);
+    if (index === -1) throw new Error(`Routine not found: ${id}`);
+    const current = state.routines[index];
+    const candidate = {
+      ...current,
+      ...changes,
+      destination: changes.destination ? { ...current.destination, ...changes.destination } : current.destination,
+      updatedAt: now,
+    };
+    edited = normalizeRoutine(candidate, now);
+    assertRoutineDestinationAllowed(edited.destination, options.allowedChannelIds);
+    state.routines[index] = edited;
+  }, paths);
+  return edited;
+}
+
+export async function deleteRoutine(id, paths = pipaPaths()) {
+  let deleted = false;
+  await mutateRoutineState((state) => {
+    const index = state.routines.findIndex((item) => item.id === id);
+    if (index === -1) throw new Error(`Routine not found: ${id}`);
+    state.routines.splice(index, 1);
+    deleted = true;
+  }, paths);
+  return deleted;
+}
+
 export function reconcileRoutineState(input, now = DateTime.utc().toISO()) {
   validateRoutineState(input);
   const state = structuredClone(input);
