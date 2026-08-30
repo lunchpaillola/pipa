@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -63,6 +63,9 @@ test("create, list, show, edit, run, and delete preserve lifecycle fields", asyn
   assert.equal(json(run(home, "list", "--json")).routines.length, 1);
   assert.deepEqual(json(run(home, "show", created.id, "--json")).routine, created);
 
+  const channelOnly = json(run(home, "edit", created.id, "--thread", "none", "--json")).routine;
+  assert.equal(channelOnly.destination.threadTs, null);
+
   const inactive = json(run(home, "edit", created.id, "--status", "inactive", "--json")).routine;
   assert.equal(inactive.status, "inactive");
   assert.equal(inactive.nextRunAt, null);
@@ -120,4 +123,35 @@ test("prompt files preserve exact multiline and shell-like bytes", async () => {
   assert.deepEqual(result.routine.schedule.weekdays, [2, 4, 6]);
   assert.deepEqual(result.routine.schedule.times, ["09:00", "15:00", "18:00"]);
   assert.equal(result.routine.schedule.until, "2030-09-05");
+});
+
+test("prompt files stay inside the configured workspace and reject symlinks", async () => {
+  const { home } = await setup();
+  const outside = await mkdtemp(path.join(os.tmpdir(), "pipa-prompt-outside-"));
+  const outsideFile = path.join(outside, "secret.txt");
+  await writeFile(outsideFile, "secret");
+  const escaped = run(home, "create", "--prompt-file", outsideFile, "--timezone", "UTC", "--channel", "C123", "--in", "5m", "--preview", "--json");
+  assert.notEqual(escaped.status, 0);
+  assert.match(JSON.parse(escaped.stdout).error.message, /configured working directory/u);
+
+  if (process.platform !== "win32") {
+    const link = path.join(home, "prompt-link.txt");
+    await symlink(outsideFile, link);
+    const linked = run(home, "create", "--prompt-file", link, "--timezone", "UTC", "--channel", "C123", "--in", "5m", "--preview", "--json");
+    assert.notEqual(linked.status, 0);
+    assert.match(JSON.parse(linked.stdout).error.message, /configured working directory|symbolic link/u);
+
+    const nested = path.join(home, "prompts");
+    await mkdir(nested);
+    await symlink(outside, path.join(nested, "outside"));
+    const nestedLink = run(home, "create", "--prompt-file", path.join(nested, "outside", "secret.txt"), "--timezone", "UTC", "--channel", "C123", "--in", "5m", "--preview", "--json");
+    assert.notEqual(nestedLink.status, 0);
+    assert.match(JSON.parse(nestedLink.stdout).error.message, /configured working directory/u);
+  }
+
+  const oversized = path.join(home, "oversized.txt");
+  await writeFile(oversized, Buffer.alloc((1024 * 1024) + 1));
+  const tooLarge = run(home, "create", "--prompt-file", oversized, "--timezone", "UTC", "--channel", "C123", "--in", "5m", "--preview", "--json");
+  assert.notEqual(tooLarge.status, 0);
+  assert.match(JSON.parse(tooLarge.stdout).error.message, /no larger than 1 MB/u);
 });

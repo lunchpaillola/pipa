@@ -86,15 +86,13 @@ export async function startPipa(options = {}) {
         try {
           const latestConfig = await loadConfig(paths.config);
           assertRoutineDestinationAllowed(snapshot.destination, latestConfig.allowedSlackChannelIds ?? []);
-          return latestConfig;
         } catch {
           throw new RoutineDeniedError();
         }
       };
-      let latestConfig;
       let denied = false;
       try {
-        latestConfig = await authorize();
+        await authorize();
       } catch (error) {
         if (error instanceof PipaStoppedError) throw error;
         return { status: "denied", errorCode: "destination_denied", errorSummary: "Routine destination is no longer allowed." };
@@ -114,7 +112,7 @@ export async function startPipa(options = {}) {
         result = await executor.runTurn({
           prompt: snapshot.prompt,
           sessionId: null,
-          workingDirectory: latestConfig.workingDirectory,
+          workingDirectory: config.workingDirectory,
           contextEnvironment: {
             PIPA_MESSAGE_CHANNEL: "slack",
             PIPA_CURRENT_SLACK_CHANNEL_ID: snapshot.destination.channelId,

@@ -916,6 +916,8 @@ test("routine scheduler uses a fresh session and exact Slack destination without
     checkSlackToken: async () => ({ ok: true }),
     sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
   });
+  const replacementWorkspace = await mkdtemp(path.join(os.tmpdir(), "pipa-routine-reconfigured-"));
+  await writePrivateJson(paths.config, { ...config, workingDirectory: replacementWorkspace });
   now = "2026-08-29T13:00:00.000Z";
   intervalTick();
   await waitFor(() => posts.length === 1);

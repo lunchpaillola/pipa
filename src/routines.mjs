@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { link, lstat, mkdir, open, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { DateTime, IANAZone } from "luxon";
@@ -110,44 +110,51 @@ export async function acquireRoutineMutationLock(file = pipaPaths().routinesLock
   const retryMs = options.retryMs ?? 10;
   const token = randomUUID();
   const startedAt = Date.now();
-  await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-
-  while (true) {
-    try {
-      const handle = await open(file, "wx", 0o600);
-      try {
-        await handle.writeFile(JSON.stringify({ token, pid: process.pid, createdAt: new Date().toISOString() }));
-      } catch (error) {
-        await rm(file, { force: true });
-        throw error;
-      } finally {
-        await handle.close();
-      }
-      break;
-    } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
-      const owner = await readLock(file);
-      if (owner && !isRunning(owner.pid)) {
-        const abandoned = `${file}.${token}.abandoned`;
-        try {
-          await rename(file, abandoned);
-          await rm(abandoned, { force: true });
+  await mkdir(file, { recursive: true, mode: 0o700 });
+  const ticket = path.join(file, `${process.pid}-${token}.json`);
+  const temporary = `${ticket}.tmp`;
+  const createdAt = new Date().toISOString();
+  await writeFile(temporary, JSON.stringify({ token, pid: process.pid, createdAt, choosing: true, number: 0 }), { mode: 0o600 });
+  try {
+    await link(temporary, ticket);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+  let number;
+  try {
+    const existing = await readLockTickets(file);
+    number = Math.max(0, ...existing.map((entry) => entry.owner?.number ?? 0)) + 1;
+    await writePrivateJson(ticket, { token, pid: process.pid, createdAt, choosing: false, number });
+    while (true) {
+      let blocked = false;
+      for (const entry of await readLockTickets(file)) {
+        if (entry.owner?.token === token) continue;
+        if (!entry.owner) {
+          if (entry.pid && !isRunning(entry.pid)) await rm(entry.file, { force: true });
+          else blocked = true;
           continue;
-        } catch (recoveryError) {
-          if (recoveryError?.code !== "ENOENT") throw recoveryError;
         }
+        if (!isRunning(entry.owner.pid)) {
+          await rm(entry.file, { force: true });
+          continue;
+        }
+        if (entry.owner.choosing || entry.owner.number < number || (entry.owner.number === number && entry.owner.token < token)) blocked = true;
       }
+      if (!blocked) break;
       if (Date.now() - startedAt >= timeoutMs) throw new Error("Routine mutation lock timed out.");
       await new Promise((resolve) => setTimeout(resolve, retryMs));
     }
+  } catch (error) {
+    await rm(ticket, { force: true });
+    throw error;
   }
 
   let released = false;
   return async () => {
     if (released) return;
     released = true;
-    const owner = await readLock(file);
-    if (owner?.token === token) await rm(file, { force: true });
+    const owner = await readLock(ticket);
+    if (owner?.token === token) await rm(ticket, { force: true });
   };
 }
 
@@ -210,13 +217,19 @@ export async function editRoutine(id, changes, options = {}) {
     const index = state.routines.findIndex((item) => item.id === id);
     if (index === -1) throw new Error(`Routine not found: ${id}`);
     const current = state.routines[index];
+    const mutable = new Set(["prompt", "schedule", "timezone", "destination", "status"]);
+    if (Object.keys(changes).some((key) => !mutable.has(key))) invalid("edit contains immutable fields");
     const candidate = {
       ...current,
-      ...changes,
+      prompt: changes.prompt ?? current.prompt,
+      schedule: changes.schedule ?? current.schedule,
+      timezone: changes.timezone ?? current.timezone,
+      status: changes.status ?? current.status,
       destination: changes.destination ? { ...current.destination, ...changes.destination } : current.destination,
       updatedAt: now,
     };
     edited = normalizeRoutine(candidate, now);
+    if (changes.schedule === undefined && changes.timezone === undefined && changes.status === undefined) edited.nextRunAt = current.nextRunAt;
     assertRoutineDestinationAllowed(edited.destination, options.allowedChannelIds);
     state.routines[index] = edited;
   }, paths);
@@ -276,6 +289,8 @@ export async function mergeRoutineRunOutcome(snapshot, outcome, completedAt = Da
   await mutateRoutineState((state) => {
     const routine = state.routines.find((item) => item.id === snapshot.id);
     if (!routine) return false;
+    const denialStillOwned = (snapshot.status === undefined || routine.status === snapshot.status)
+      && (snapshot.destination === undefined || JSON.stringify(routine.destination) === JSON.stringify(snapshot.destination));
 
     if (snapshot.trigger === "run-now") {
       if (routine.runRequestedAt !== snapshot.runRequestedAt) return false;
@@ -285,7 +300,6 @@ export async function mergeRoutineRunOutcome(snapshot, outcome, completedAt = Da
         && routine.nextRunAt === snapshot.occurrenceAt
         && JSON.stringify(routine.schedule) === JSON.stringify(snapshot.schedule);
       if (!ownsOccurrence) return false;
-      if (snapshot.destination && JSON.stringify(routine.destination) !== JSON.stringify(snapshot.destination)) return false;
       if (routine.schedule.type === "once") {
         routine.status = "completed";
         routine.nextRunAt = null;
@@ -294,8 +308,6 @@ export async function mergeRoutineRunOutcome(snapshot, outcome, completedAt = Da
         if (routine.nextRunAt === null) routine.status = "completed";
       }
     }
-    const denialStillOwned = snapshot.trigger === "scheduled"
-      || (routine.status === snapshot.status && JSON.stringify(routine.destination) === JSON.stringify(snapshot.destination));
     if (outcome.status === "denied" && denialStillOwned) {
       routine.status = "inactive";
       routine.nextRunAt = null;
@@ -318,6 +330,7 @@ export function createRoutineScheduler(options) {
   const paths = options.paths ?? pipaPaths();
   const intervalMs = options.intervalMs ?? 30_000;
   const active = new Map();
+  const blocked = new Set();
   let timer;
   let ticking = false;
   let currentTick = Promise.resolve();
@@ -345,7 +358,7 @@ export function createRoutineScheduler(options) {
     }
     for (const routine of state.routines) {
       if (stopped) break;
-      if (active.has(routine.id)) continue;
+      if (active.has(routine.id) || blocked.has(routine.id)) continue;
       const scheduled = routine.status === "active" && routine.nextRunAt !== null && parseTimestamp(routine.nextRunAt, "nextRunAt") <= parseTimestamp(now, "clock");
       if (!scheduled && routine.runRequestedAt === null) continue;
       const trigger = scheduled ? "scheduled" : "run-now";
@@ -376,7 +389,10 @@ export function createRoutineScheduler(options) {
         : { status: "failed", errorCode: "executor_failed", errorSummary: "Routine execution failed." };
     }
     try {
-      if (!stopped) await mergeRoutineRunOutcome(entry.snapshot, outcome, options.now?.() ?? DateTime.utc().toISO(), paths);
+      if (!stopped) await (options.mergeOutcome ?? mergeRoutineRunOutcome)(entry.snapshot, outcome, options.now?.() ?? DateTime.utc().toISO(), paths);
+    } catch (error) {
+      blocked.add(entry.snapshot.id);
+      throw error;
     } finally {
       if (active.get(entry.snapshot.id) === entry) active.delete(entry.snapshot.id);
     }
@@ -594,11 +610,21 @@ function requireKeys(value, expected, name, fail = invalidState) {
 async function readLock(file) {
   try {
     const value = JSON.parse(await readFile(file, "utf8"));
-    if (typeof value.token !== "string" || !Number.isSafeInteger(value.pid) || typeof value.createdAt !== "string") return null;
+    if (typeof value.token !== "string" || !Number.isSafeInteger(value.pid) || typeof value.createdAt !== "string"
+      || typeof value.choosing !== "boolean" || !Number.isSafeInteger(value.number) || value.number < 0) return null;
     return value;
   } catch {
     return null;
   }
+}
+
+async function readLockTickets(directory) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  return Promise.all(entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).map(async (entry) => {
+    const file = path.join(directory, entry.name);
+    const pid = Number.parseInt(entry.name.split("-")[0], 10);
+    return { file, pid: Number.isSafeInteger(pid) ? pid : null, owner: await readLock(file) };
+  }));
 }
 
 function isRunning(pid) {

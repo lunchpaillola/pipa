@@ -136,7 +136,8 @@ async function listRoutines() {
 }
 
 async function runCli(...args) {
-  const { stdout } = await runFile(process.execPath, [cli, ...args], { cwd: root, env: process.env });
+  const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/(?:^|_)SLACK(?:_[A-Z0-9]+)*_(?:TOKEN|SECRET)$/iu.test(key)));
+  const { stdout } = await runFile(process.execPath, [cli, ...args], { cwd: root, env: environment });
   return stdout;
 }
 
@@ -156,7 +157,7 @@ async function slackWithToken(token, method, fields) {
 }
 
 function isBot(message, botUserId) {
-  return message.user === botUserId || Boolean(message.bot_id || message.app_id);
+  return message.user === botUserId;
 }
 
 function requiredEnv(name) {

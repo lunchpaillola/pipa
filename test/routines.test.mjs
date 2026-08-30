@@ -7,6 +7,7 @@ import {
   acquireRoutineMutationLock,
   calculateNextRunAt,
   createRoutineScheduler,
+  editRoutine,
   loadRoutineState,
   mergeRoutineRunOutcome,
   mutateRoutineState,
@@ -119,10 +120,19 @@ test("serializes fresh mutations and writes private atomic JSON", async () => {
 test("mutation locks recover dead owners, time out on live owners, and release by token", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routines-lock-"));
   const file = pipaPaths(home).routinesLock;
-  await mkdir(path.dirname(file), { recursive: true });
-  await writeFile(file, JSON.stringify({ token: "dead", pid: 99999999, createdAt: NOW }));
-  const releaseRecovered = await acquireRoutineMutationLock(file, { timeoutMs: 100 });
-  await releaseRecovered();
+  await mkdir(file, { recursive: true });
+  await writeFile(path.join(file, "99999999-dead.json"), JSON.stringify({ token: "dead", pid: 99999999, createdAt: NOW, choosing: false, number: 1 }));
+  let active = 0;
+  let maxActive = 0;
+  await Promise.all(Array.from({ length: 3 }, async () => {
+    const release = await acquireRoutineMutationLock(file, { timeoutMs: 500 });
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    active -= 1;
+    await release();
+  }));
+  assert.equal(maxActive, 1);
 
   const releaseFirst = await acquireRoutineMutationLock(file, { timeoutMs: 100 });
   await assert.rejects(acquireRoutineMutationLock(file, { timeoutMs: 30 }), /timed out/u);
@@ -360,4 +370,76 @@ test("run-now denial does not overwrite a concurrent destination edit", async ()
   assert.equal(merged.status, "active");
   assert.equal(merged.destination.channelId, "C999");
   assert.equal(merged.runRequestedAt, null);
+});
+
+test("scheduled outcomes consume their occurrence without overwriting a destination edit", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routines-"));
+  const paths = pipaPaths(home);
+  const routine = normalizeRoutine(candidate(), NOW);
+  await writePrivateJson(paths.routines, { version: 1, routines: [routine] });
+  await mutateRoutineState((state) => { state.routines[0].destination.channelId = "C999"; }, paths);
+
+  const merged = await mergeRoutineRunOutcome({
+    id: routine.id,
+    trigger: "scheduled",
+    occurrenceAt: routine.nextRunAt,
+    schedule: routine.schedule,
+    status: routine.status,
+    destination: routine.destination,
+  }, { status: "denied", errorCode: "destination_denied" }, "2026-08-29T13:00:00.000Z", paths);
+
+  assert.equal(merged.status, "active");
+  assert.equal(merged.destination.channelId, "C999");
+  assert.ok(Date.parse(merged.nextRunAt) > Date.parse(routine.nextRunAt));
+  assert.equal(merged.lastRun.status, "denied");
+});
+
+test("domain edits reject lifecycle-owned fields", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routines-"));
+  const paths = pipaPaths(home);
+  const routine = normalizeRoutine(candidate(), NOW);
+  await writePrivateJson(paths.routines, { version: 1, routines: [routine] });
+  await assert.rejects(editRoutine(routine.id, { runRequestedAt: NOW }, { now: NOW, paths }), /immutable fields/u);
+  assert.deepEqual((await loadRoutineState(paths.routines)).routines[0], routine);
+});
+
+test("prompt and destination edits preserve a due occurrence", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routines-"));
+  const paths = pipaPaths(home);
+  const routine = normalizeRoutine(candidate(), NOW);
+  await writePrivateJson(paths.routines, { version: 1, routines: [routine] });
+  const edited = await editRoutine(routine.id, { prompt: "updated", destination: { channelId: "C999" } }, {
+    now: "2026-08-29T14:00:00.000Z",
+    paths,
+  });
+  assert.equal(edited.nextRunAt, routine.nextRunAt);
+  assert.equal(edited.prompt, "updated");
+  assert.equal(edited.destination.channelId, "C999");
+});
+
+test("scheduler blocks a routine after outcome persistence fails", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routines-"));
+  const paths = pipaPaths(home);
+  let now = "2026-08-29T12:00:00.000Z";
+  const routine = normalizeRoutine(candidate({ schedule: { type: "once", at: "2026-08-29T13:00:00Z" } }), now);
+  await writePrivateJson(paths.routines, { version: 1, routines: [routine] });
+  let calls = 0;
+  const errors = [];
+  const scheduler = createRoutineScheduler({
+    paths,
+    now: () => now,
+    setInterval: () => ({ unref() {} }),
+    clearInterval() {},
+    onError: (error) => errors.push(error.message),
+    execute: async () => { calls += 1; return { status: "succeeded" }; },
+    mergeOutcome: async () => { throw new Error("disk failed"); },
+  });
+  await scheduler.start();
+  now = "2026-08-29T13:00:00.000Z";
+  await scheduler.tick();
+  await scheduler.drain();
+  await scheduler.tick();
+  assert.equal(calls, 1);
+  assert.deepEqual(errors, ["disk failed"]);
+  scheduler.stop();
 });

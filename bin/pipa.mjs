@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 
 import crossSpawn from "cross-spawn";
-import { readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open, readFile, realpath } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { stdin, stdout } from "node:process";
@@ -32,7 +34,7 @@ Commands:
   create (--prompt <text> | --prompt-file <path>) --timezone <iana> --channel <id> [--thread <ts>] <schedule> [--preview] [--json]
   list [--json]
   show <id> [--json]
-  edit <id> [--prompt <text> | --prompt-file <path>] [--timezone <iana>] [--channel <id>] [--thread <ts>] [<schedule>] [--status active|inactive] [--json]
+  edit <id> [--prompt <text> | --prompt-file <path>] [--timezone <iana>] [--channel <id>] [--thread <ts|none>] [<schedule>] [--status active|inactive] [--json]
   run <id> [--json]
   delete <id> [--json]
 
@@ -104,7 +106,7 @@ async function routine(argv, io) {
   const id = command === "edit" ? requireId(positionals) : positionals.length === 0 ? randomUUID() : cliError("create does not accept an ID");
   const config = await loadConfig();
   const now = new Date().toISOString();
-  const changes = await routineInput(values, command === "create", now);
+  const changes = await routineInput(values, command === "create", now, config.workingDirectory);
   const options = { now, allowedChannelIds: config.allowedSlackChannelIds ?? [] };
   const result = command === "create"
     ? await createRoutine({ id, ...changes }, { ...options, preview: values.preview === true })
@@ -137,7 +139,7 @@ function parseRoutineArgs(argv) {
   return { values, positionals };
 }
 
-async function routineInput(values, creating, now) {
+async function routineInput(values, creating, now, workingDirectory) {
   const supported = ["prompt", "prompt-file", "timezone", "channel", "thread", "at", "in", "every", "times", "weekdays", "until", "status", "preview", "json"];
   requireNoOptions(values, supported);
   if (!creating && values.preview) cliError("--preview is only supported by create");
@@ -145,7 +147,7 @@ async function routineInput(values, creating, now) {
   if (values.prompt !== undefined && values["prompt-file"] !== undefined) cliError("use exactly one of --prompt or --prompt-file");
   const changes = {};
   if (values.prompt !== undefined) changes.prompt = values.prompt;
-  if (values["prompt-file"] !== undefined) changes.prompt = await readFile(values["prompt-file"], "utf8");
+  if (values["prompt-file"] !== undefined) changes.prompt = await readPromptFile(values["prompt-file"], workingDirectory);
   if (creating && changes.prompt === undefined) cliError("create requires --prompt or --prompt-file");
   if (values.timezone !== undefined) changes.timezone = values.timezone;
   if (creating && changes.timezone === undefined) cliError("create requires --timezone");
@@ -153,7 +155,7 @@ async function routineInput(values, creating, now) {
     if (creating && values.channel === undefined) cliError("create requires --channel");
     changes.destination = {
       ...(values.channel === undefined ? {} : { channelId: values.channel }),
-      ...(values.thread === undefined ? {} : { threadTs: values.thread }),
+      ...(values.thread === undefined ? {} : { threadTs: values.thread === "none" ? null : values.thread }),
     };
   }
   if (creating && changes.destination === undefined) cliError("create requires --channel");
@@ -169,6 +171,48 @@ async function routineInput(values, creating, now) {
     changes.status = values.status;
   }
   return changes;
+}
+
+async function readPromptFile(file, workingDirectory) {
+  const maxBytes = 1024 * 1024;
+  const root = await realpath(workingDirectory);
+  const requested = path.resolve(root, file);
+  const beforeOpen = await realpath(requested);
+  if (!isInside(root, beforeOpen)) cliError("--prompt-file must be inside the configured working directory");
+  const initial = await lstat(requested, { bigint: true });
+  if (initial.isSymbolicLink()) cliError("--prompt-file cannot be a symbolic link");
+  if (!initial.isFile()) cliError("--prompt-file must be a regular file");
+  const handle = await open(requested, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  try {
+    const opened = await handle.stat({ bigint: true });
+    const resolved = await realpath(requested);
+    if (!isInside(root, resolved)) cliError("--prompt-file must be inside the configured working directory");
+    const current = await lstat(requested, { bigint: true });
+    if (!opened.isFile() || current.isSymbolicLink()
+      || initial.dev !== opened.dev || initial.ino !== opened.ino
+      || current.dev !== opened.dev || current.ino !== opened.ino) cliError("--prompt-file must be an unchanged regular file");
+    if (opened.size > BigInt(maxBytes)) cliError("--prompt-file must be no larger than 1 MB");
+    const data = Buffer.alloc(maxBytes + 1);
+    let bytesRead = 0;
+    while (bytesRead < data.length) {
+      const read = await handle.read(data, bytesRead, data.length - bytesRead, bytesRead);
+      if (!read.bytesRead) break;
+      bytesRead += read.bytesRead;
+    }
+    if (bytesRead > maxBytes) cliError("--prompt-file must be no larger than 1 MB");
+    const after = await handle.stat({ bigint: true });
+    if (BigInt(bytesRead) !== opened.size || after.size !== opened.size || after.mtimeNs !== opened.mtimeNs || after.ctimeNs !== opened.ctimeNs) {
+      cliError("--prompt-file changed while being read");
+    }
+    return data.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+function isInside(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 function scheduleFromOptions(values, now) {

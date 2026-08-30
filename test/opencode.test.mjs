@@ -16,7 +16,13 @@ import {
 } from "../src/opencode.mjs";
 
 test("removes Slack credentials from child environments regardless of casing", () => {
-  assert.deepEqual(cleanChildEnvironment({ PATH: "/bin", Slack_Bot_Token: "secret", Pipa_Slack_App_Token: "secret" }), { PATH: "/bin" });
+  assert.deepEqual(cleanChildEnvironment({
+    PATH: "/bin",
+    PIPA_CURRENT_SLACK_CHANNEL_ID: "C123",
+    Slack_Api_Token: "secret",
+    Slack_Client_Secret: "secret",
+    Pipa_Slack_App_Token: "secret",
+  }), { PATH: "/bin", PIPA_CURRENT_SLACK_CHANNEL_ID: "C123" });
 });
 
 test("starts one owned loopback server on port 0 and stops it", async () => {

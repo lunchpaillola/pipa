@@ -5,12 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-const SECRET_ENV_KEYS = new Set([
-  "PIPA_SLACK_APP_TOKEN",
-  "PIPA_SLACK_BOT_TOKEN",
-  "SLACK_APP_TOKEN",
-  "SLACK_BOT_TOKEN",
-]);
+const SLACK_SECRET_ENV_KEY = /(?:^|_)SLACK(?:_[A-Z0-9]+)*_(?:TOKEN|SECRET)$/iu;
 const LISTENING_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+/u;
 
 export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
@@ -26,7 +21,7 @@ export class PipaStoppedError extends Error {
 }
 
 export function cleanChildEnvironment(environment = process.env) {
-  return Object.fromEntries(Object.entries(environment).filter(([key]) => !SECRET_ENV_KEYS.has(key.toUpperCase())));
+  return Object.fromEntries(Object.entries(environment).filter(([key]) => !SLACK_SECRET_ENV_KEY.test(key)));
 }
 
 export async function startSocketOpenCodeServer(config, options = {}) {
