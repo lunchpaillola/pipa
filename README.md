@@ -77,11 +77,52 @@ export PIPA_OPENCODE_ATTACH_URL=http://localhost:5555
 pipa start
 ```
 
+### Routines
+
+Local Pipa can save timezone-aware work that runs through the same OpenCode agent and delivers to one exact Slack channel or existing thread. Routines use the configured working directory, tools, permissions, channel allowlist, and responder allowlist.
+
+Preview agent-assisted changes first, inspect the normalized JSON, then create only after confirmation:
+
+```sh
+pipa routine create \
+  --prompt "Send the daily brief" \
+  --timezone America/New_York \
+  --channel C0BSE2JTYPR \
+  --every 1d \
+  --times 05:00 \
+  --preview \
+  --json
+```
+
+Remove `--preview` to save the routine. Use `--prompt-file` when exact multiline text or shell-like characters must be preserved. Timezones must be IANA names such as `America/New_York` or `UTC`; aliases such as `EST` are not accepted.
+
+Supported schedules:
+
+```sh
+# Every 30 minutes
+pipa routine create --prompt "Check the queue" --timezone UTC --channel C0BSE2JTYPR --every 30m
+
+# Once, five minutes from the CLI clock
+pipa routine create --prompt "Follow up" --timezone UTC --channel C0BSE2JTYPR --in 5m
+
+# Tuesday, Thursday, and Saturday at three local times
+pipa routine create --prompt "Post status" --timezone America/New_York --channel C0BSE2JTYPR --every 1w --weekdays 2,4,6 --times 09:00,15:00,18:00
+
+# Daily through the inclusive local date September 5
+pipa routine create --prompt "Evening close" --timezone America/New_York --channel C0BSE2JTYPR --every 1d --times 19:00 --until 2030-09-05
+```
+
+Use `pipa routine list`, `show`, `edit`, `run`, and `delete` for the lifecycle. Deactivate or reactivate with `edit --status inactive|active`. Completed one-time and final recurring routines remain inspectable until deleted. `routine run` requests one execution without changing the saved schedule or status.
+
+Routines run only while the Socket Mode `pipa start` process is running and the machine is awake. Restart skips missed scheduled occurrences instead of backfilling them. Explicit run requests survive restart, but can repeat if the process crashes after agent side effects or Slack delivery and before completion is saved. Managed profiles do not execute routines. Run `pipa routine --help` for the complete syntax and JSON contract.
+
 ## Commands
 
 ```text
 pipa init       Configure Slack and the local working directory
 pipa start      Start the configured Slack runtime
+pipa stop       Stop the running local Pipa process
+pipa routine    Create and manage local scheduled routines
 pipa --version  Print the installed version
 ```
 

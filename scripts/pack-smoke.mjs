@@ -20,6 +20,13 @@ try {
   const installedRoot = path.join(directory, "install", "node_modules", "@usepipa", "pipa");
   const packedRuntime = await import(pathToFileURL(path.join(installedRoot, "src", "opencode.mjs")).href);
   if (typeof packedRuntime.createOpenCodeExecutor !== "function") throw new Error("Packed OpenCode executor is unavailable.");
+  const packedRoutines = await import(pathToFileURL(path.join(installedRoot, "src", "routines.mjs")).href);
+  if (typeof packedRoutines.createRoutineScheduler !== "function") throw new Error("Packed routine runtime is unavailable.");
+  const installedCli = path.join(installedRoot, "bin", "pipa.mjs");
+  const help = await run(process.execPath, [installedCli, "routine", "--help"]);
+  for (const expected of ["create", "list", "show", "edit", "run", "delete", "--preview", "IANA", "--every 30m", "Managed profiles do not execute routines"]) {
+    if (!help.stdout.includes(expected)) throw new Error(`Packed routine help is missing ${expected}.`);
+  }
 
   const home = path.join(directory, "home");
   const workingDirectory = path.join(directory, "work");
@@ -51,7 +58,6 @@ if (process.argv[2] === "--version") {
     : `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/fake-opencode.cjs" "$@"\n`);
   if (process.platform !== "win32") await chmod(fakeOpenCode, 0o755);
 
-  const installedCli = path.join(installedRoot, "bin", "pipa.mjs");
   const init = await run(process.execPath, [installedCli, "init"], {
     ...process.env,
     HOME: home,
@@ -75,6 +81,16 @@ if (process.argv[2] === "--version") {
   if (config.botName !== "Pack Bot" || config.workingDirectory !== await realpath(workingDirectory)) throw new Error("Packed init wrote invalid config.");
   if (manifest.display_information.name !== "Pack Bot") throw new Error("Packed init wrote invalid manifest.");
   if (!["channels:read", "assistant:write"].every((scope) => manifest.oauth_config.scopes.bot.includes(scope))) throw new Error("Packed init wrote incomplete Slack bot scopes.");
+
+  const preview = await run(process.execPath, [installedCli, "routine", "create", "--prompt", "Pack preview", "--timezone", "America/New_York", "--channel", "C123", "--every", "1d", "--times", "05:00", "--preview", "--json"], {
+    ...process.env,
+    PIPA_HOME: home,
+  }, "", workingDirectory);
+  const previewJson = JSON.parse(preview.stdout);
+  if (!previewJson.ok || !previewJson.preview || previewJson.routine.schedule.frequency !== "daily" || previewJson.routine.schedule.times[0] !== "05:00") {
+    throw new Error("Packed routine preview returned invalid normalized JSON.");
+  }
+  if (await readFile(path.join(home, ".pipa", "routines.json"), "utf8").then(() => true, () => false)) throw new Error("Packed routine preview mutated state.");
 
   const cancelledHome = path.join(directory, "cancelled-home");
   await mkdir(cancelledHome);
@@ -121,7 +137,7 @@ if (process.argv[2] === "--version") {
   if (await readFile(assertionFile, "utf8") !== "managed-ok") throw new Error("Packed Managed start did not run OpenCode.");
   if (!managedError?.message.includes("OpenCode server exited unexpectedly with code 23")) throw new Error("Packed Managed start did not propagate the OpenCode exit.");
   if (managedError.message.includes("pack-sentinel")) throw new Error("Packed Managed start exposed an environment secret.");
-  process.stdout.write(`Packed CLI ${stdout.trim()} installed, loaded its runtime, initialized, cancelled, and ran Managed start successfully.\n`);
+  process.stdout.write(`Packed CLI ${stdout.trim()} installed, loaded its runtimes, previewed a routine, initialized, cancelled, and ran Managed start successfully.\n`);
 } finally {
   await rm(directory, { recursive: true, force: true });
 }

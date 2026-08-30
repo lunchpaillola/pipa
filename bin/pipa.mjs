@@ -32,12 +32,35 @@ Commands:
   create (--prompt <text> | --prompt-file <path>) --timezone <iana> --channel <id> [--thread <ts>] <schedule> [--preview] [--json]
   list [--json]
   show <id> [--json]
-  edit <id> [create options] [--status active|inactive] [--json]
+  edit <id> [--prompt <text> | --prompt-file <path>] [--timezone <iana>] [--channel <id>] [--thread <ts>] [<schedule>] [--status active|inactive] [--json]
   run <id> [--json]
   delete <id> [--json]
 
 Schedules: --at <iso> | --in <positive><m|h|d|w> | --every <positive><m|h|d|w>
 Recurring options: --times <HH:MM,...> --weekdays <1,...,7> --until <YYYY-MM-DD>
+
+Timezone must be an IANA name such as America/New_York or UTC. Pipa does not
+interpret aliases such as EST. --until is an inclusive local date. Use
+--prompt-file for exact multiline prompts or prompts containing shell syntax.
+
+Examples:
+  pipa routine create --prompt "Daily brief" --timezone America/New_York --channel C123 --every 1d --times 05:00 --preview --json
+  pipa routine create --prompt "Check queue" --timezone UTC --channel C123 --every 30m --preview --json
+  pipa routine create --prompt "Follow up" --timezone UTC --channel C123 --in 5m --preview --json
+  pipa routine create --prompt "Status" --timezone America/New_York --channel C123 --every 1w --weekdays 2,4,6 --times 09:00,15:00,18:00 --preview --json
+  pipa routine create --prompt "Evening close" --timezone America/New_York --channel C123 --every 1d --times 19:00 --until 2030-09-05 --preview --json
+
+--preview validates and normalizes without writing routines.json. Agents should
+preview, show the normalized JSON, and create only after user confirmation.
+JSON success output includes ok plus routine, routines, or deleted. JSON errors
+include ok:false and a stable error object.
+
+Routines use normal local OpenCode authority and run only while the Socket Mode
+pipa start process is running and this machine is awake. Restart skips missed
+scheduled work; an explicit run request remains pending and can repeat if the
+process crashes after external side effects but before saving completion.
+Completed routines remain visible until deleted. run never changes the saved
+schedule or lifecycle status. Managed profiles do not execute routines.
 `;
 
 async function routine(argv, io) {
