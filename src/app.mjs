@@ -83,8 +83,8 @@ export async function startPipa(options = {}) {
       const authorize = async () => {
         const current = (await loadRoutineState(paths.routines)).routines.find((routine) => routine.id === snapshot.id);
         if (!current || (snapshot.status === "active" && current.status !== "active")) throw new PipaStoppedError();
+        const latestConfig = await loadConfig(paths.config);
         try {
-          const latestConfig = await loadConfig(paths.config);
           assertRoutineDestinationAllowed(snapshot.destination, latestConfig.allowedSlackChannelIds ?? []);
         } catch {
           throw new RoutineDeniedError();
@@ -95,7 +95,8 @@ export async function startPipa(options = {}) {
         await authorize();
       } catch (error) {
         if (error instanceof PipaStoppedError) throw error;
-        return { status: "denied", errorCode: "destination_denied", errorSummary: "Routine destination is no longer allowed." };
+        if (error instanceof RoutineDeniedError) return { status: "denied", errorCode: "destination_denied", errorSummary: "Routine destination is no longer allowed." };
+        throw error;
       }
       const thread = chat.thread(slackDestinationId(snapshot.destination));
       const authorizeInteraction = async () => {
@@ -337,7 +338,8 @@ export function createPendingInteractions(allowedUserIds = []) {
     const token = interactionToken(event);
     const entry = pending.get(token);
     if (!entry) return;
-    if ((event.threadId ?? event.thread?.id) !== entry.threadId) return;
+    const expectedThreadId = entry.threadId.endsWith(":") ? `${entry.threadId}${entry.message?.id}` : entry.threadId;
+    if ((event.threadId ?? event.thread?.id) !== expectedThreadId) return;
     if (!await canRespond(entry, event.user)) return;
     if (event.actionId?.startsWith("pipa_dismiss_")) {
       entry.resolve?.({ type: "stop" });
@@ -436,6 +438,7 @@ async function postInteraction(thread, entry) {
     blocks: renderSlackInteraction(entry),
   });
   return {
+    id: message.ts,
     edit: (decision) => client.chat.update({
       channel,
       ts: message.ts,

@@ -228,8 +228,10 @@ export async function editRoutine(id, changes, options = {}) {
       destination: changes.destination ? { ...current.destination, ...changes.destination } : current.destination,
       updatedAt: now,
     };
-    edited = normalizeRoutine(candidate, now);
-    if (changes.schedule === undefined && changes.timezone === undefined && changes.status === undefined) edited.nextRunAt = current.nextRunAt;
+    const lifecycleUnchanged = changes.schedule === undefined && changes.timezone === undefined && changes.status === undefined;
+    edited = lifecycleUnchanged
+      ? { ...normalizeRoutine({ ...candidate, status: "inactive" }, now), status: current.status, nextRunAt: current.nextRunAt }
+      : normalizeRoutine(candidate, now);
     assertRoutineDestinationAllowed(edited.destination, options.allowedChannelIds);
     state.routines[index] = edited;
   }, paths);

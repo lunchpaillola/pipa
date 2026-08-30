@@ -406,7 +406,7 @@ test("domain edits reject lifecycle-owned fields", async () => {
 test("prompt and destination edits preserve a due occurrence", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routines-"));
   const paths = pipaPaths(home);
-  const routine = normalizeRoutine(candidate(), NOW);
+  const routine = normalizeRoutine(candidate({ schedule: { type: "once", at: "2026-08-29T13:00:00Z" } }), NOW);
   await writePrivateJson(paths.routines, { version: 1, routines: [routine] });
   const edited = await editRoutine(routine.id, { prompt: "updated", destination: { channelId: "C999" } }, {
     now: "2026-08-29T14:00:00.000Z",
