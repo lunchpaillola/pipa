@@ -160,8 +160,9 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
   const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 });
   const attachment = { name: "notes.txt", mimeType: "text/plain", fetchData: async () => Buffer.from("notes") };
 
+  const prompt = "  summarize `this`\n$HOME && echo 'exact'  \n";
   const result = await executor.runTurn({
-    prompt: "summarize",
+    prompt,
     sessionId: "ses_1",
     workingDirectory: "/work",
     contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack", PIPA_CURRENT_SLACK_CHANNEL_ID: "C1" },
@@ -169,12 +170,27 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
   });
 
   assert.deepEqual(result, { text: "first\nsecond", sessionId: "ses_1" });
-  assert.deepEqual(promptBody.parts[0], { type: "text", text: "summarize" });
+  assert.deepEqual(promptBody.parts[0], { type: "text", text: prompt });
   assert.deepEqual(promptBody.parts[1], { type: "file", mime: "text/plain", filename: "notes.txt", url: temporaryFile.href });
   assert.match(promptBody.system, /not as shell environment variables/u);
   assert.match(promptBody.system, /PIPA_MESSAGE_CHANNEL=slack/u);
   assert.match(promptBody.system, /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
+  assert.match(promptBody.system, /consult `pipa routine --help`/u);
+  assert.match(promptBody.system, /IANA timezone/u);
+  assert.match(promptBody.system, /preview first/u);
+  assert.match(promptBody.system, /create only after user confirmation/u);
   await assert.rejects(access(temporaryFile));
+});
+
+test("rejects an all-whitespace prompt before creating a session", async () => {
+  let requested = false;
+  const executor = createOpenCodeExecutor({
+    baseUrl: "http://localhost:5555",
+    fetch: async () => { requested = true; },
+  });
+
+  await assert.rejects(executor.runTurn({ prompt: " \n\t ", sessionId: null, workingDirectory: "/work" }), /prompt is required/u);
+  assert.equal(requested, false);
 });
 
 test("replaces a stale persisted session only after a successful turn", async () => {

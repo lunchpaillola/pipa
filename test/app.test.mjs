@@ -3,7 +3,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { checkSlackAppToken, checkSlackToken, createConversationRunner, initializePipa, startPipa } from "../src/app.mjs";
+import { checkSlackAppToken, checkSlackToken, createConversationRunner, createPendingInteractions, initializePipa, postResult, slackDestinationId, startPipa } from "../src/app.mjs";
 import { PipaStoppedError } from "../src/opencode.mjs";
 import { createSessionStore, pipaPaths } from "../src/state.mjs";
 
@@ -1090,7 +1090,7 @@ test("interaction registry uses Block Kit selectors in Slack", async () => {
   assert.equal(updated[1].blocks[1].text.text, "Lola selected: “A”, “C”, “D”.");
 });
 
-test("interaction registry uses custom answer instead of an empty Slack selector", async () => {
+test("interaction registry restricts custom answers to allowed users", async () => {
   const posted = [];
   const updated = [];
   const thread = {
@@ -1125,13 +1125,15 @@ test("interaction registry uses custom answer instead of an empty Slack selector
       return { text: "done", sessionId: "ses_1" };
     },
     stopAll() {},
-  }).then(() => mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} }));
+  }, { allowedSlackUserIds: ["U1"] }).then(() => mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} }));
 
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(posted[0].blocks.some((block) => block.elements?.some((element) => ["radio_buttons", "checkboxes"].includes(element.type))), false);
   const custom = posted[0].blocks.at(-1).elements.find((element) => element.action_id.startsWith("pipa_custom_"));
-  await actionHandler({ actionId: custom.action_id, value: custom.value, thread, openModal: async () => undefined });
-  await customAnswerHandler({ privateMetadata: custom.value, values: { answer: "Orbit" }, user: { fullName: "lola" } });
+  await actionHandler({ actionId: custom.action_id, value: custom.value, user: { userId: "U1" }, thread, openModal: async () => undefined });
+  await customAnswerHandler({ privateMetadata: custom.value, values: { answer: "Wrong" }, user: { userId: "U2", fullName: "other" } });
+  assert.equal(decision, undefined);
+  await customAnswerHandler({ privateMetadata: custom.value, values: { answer: "Orbit" }, user: { userId: "U1", fullName: "lola" } });
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.deepEqual(decision, { type: "answer", answers: [["Orbit"]], selectedBy: "Lola" });
   assert.equal(updated[0].blocks[1].text.text, "Lola selected: “Orbit”.");
@@ -1268,7 +1270,7 @@ test("interaction registry queues concurrent permission cards", async () => {
   await actionHandler({ actionId: action.action_id, value: action.value, thread });
 });
 
-test("another user can answer an active question", async () => {
+test("another user can answer an active question when the allowlist is empty", async () => {
   const posts = [];
   const thread = slackInteractionThread({ posted: posts });
   let actionHandler;
@@ -1316,6 +1318,127 @@ test("another user can answer an active question", async () => {
   assert.deepEqual(resolvedDecision, { type: "answer", answers: [["X"]] });
 });
 
+test("only allowed users can answer an active question", async () => {
+  const posts = [];
+  const thread = slackInteractionThread({ posted: posts });
+  let actionHandler;
+  let mention;
+  const chat = {
+    onNewMention(handler) { mention = handler; },
+    onSubscribedMessage() {},
+    onAction(ids, handler) { actionHandler = handler ?? ids; },
+    async initialize() {},
+    async shutdown() {},
+  };
+  let resolvedDecision = null;
+  void startInteractionPipa(chat, {
+    runTurn: async ({ onInteraction }) => {
+      resolvedDecision = await onInteraction({
+        type: "question",
+        request: { questions: [{ header: "Q", question: "Pick", options: [{ label: "X" }] }] },
+        signal: AbortSignal.timeout(5000),
+      });
+      return { text: "done", sessionId: "ses_1" };
+    },
+    stopAll() {},
+  }, { allowedSlackUserIds: ["U1"] }).then(() => mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} }));
+
+  await waitFor(() => posts.length === 1);
+  const radio = posts[0].blocks.find((block) => block.type === "actions").elements[0];
+  const submit = slackAction(posts[0], "pipa_submit_");
+  await actionHandler({ actionId: radio.action_id, value: radio.options[0].value, user: { userId: "U2" }, thread });
+  await actionHandler({ actionId: submit.action_id, value: submit.value, user: { userId: "U2" }, thread });
+  assert.equal(resolvedDecision, null);
+
+  await actionHandler({ actionId: radio.action_id, value: radio.options[0].value, user: { userId: "U1" }, thread });
+  await actionHandler({ actionId: submit.action_id, value: submit.value, user: { userId: "U1" }, thread });
+  await waitFor(() => resolvedDecision);
+  assert.deepEqual(resolvedDecision, { type: "answer", answers: [["X"]] });
+});
+
+test("routine interactions and results target an exact channel or existing thread", async () => {
+  for (const destination of [
+    { channelId: "C1" },
+    { channelId: "C1", threadTs: "123.456" },
+  ]) {
+    const posted = [];
+    const results = [];
+    const target = slackInteractionThread({ id: slackDestinationId(destination), posted });
+    target.post = async (payload) => results.push({ id: target.id, payload });
+    const interactions = createPendingInteractions();
+
+    const question = interactions.onInteraction({ thread: target }, {
+      type: "question",
+      sessionId: "ses_question",
+      request: { id: "req_1", questions: [{ header: "Q", question: "Pick", options: [{ label: "X" }] }] },
+      signal: AbortSignal.timeout(5000),
+    });
+    await waitFor(() => posted.length === 1);
+    const radio = posted[0].blocks.find((block) => block.type === "actions").elements[0];
+    await interactions.onAction({ actionId: radio.action_id, value: radio.options[0].value, user: { userId: "U1" } });
+    const submit = slackAction(posted[0], "pipa_submit_");
+    await interactions.onAction({ actionId: submit.action_id, value: submit.value, user: { userId: "U1" } });
+    assert.deepEqual(await question, { type: "answer", answers: [["X"]] });
+
+    const permission = interactions.onInteraction({ thread: target }, {
+      type: "permission",
+      sessionId: "ses_permission",
+      request: { id: "perm_1", permission: "read", patterns: ["file.txt"] },
+      signal: AbortSignal.timeout(5000),
+    });
+    await waitFor(() => posted.length === 2);
+    const allow = slackAction(posted[1], "pipa_permission_once_");
+    await interactions.onAction({ actionId: allow.action_id, value: allow.value, user: { userId: "U1" } });
+    assert.deepEqual(await permission, { type: "reply", reply: "once" });
+
+    await postResult(target, { text: "complete" });
+    assert.deepEqual(posted.map(({ channel, thread_ts }) => ({ channel, thread_ts })), [
+      { channel: "C1", thread_ts: destination.threadTs },
+      { channel: "C1", thread_ts: destination.threadTs },
+    ]);
+    assert.deepEqual(results, [{ id: slackDestinationId(destination), payload: { markdown: "complete" } }]);
+  }
+});
+
+test("routine interaction callbacks reload responder authorization", async () => {
+  const posted = [];
+  const target = slackInteractionThread({ posted });
+  let allowedUserIds = ["U1"];
+  const interactions = createPendingInteractions();
+  const loadAllowedUserIds = async () => allowedUserIds;
+
+  let permissionDecision;
+  const permission = interactions.onInteraction({ thread: target, loadAllowedUserIds }, {
+    type: "permission",
+    sessionId: "ses_permission",
+    request: { id: "perm_1", permission: "read", patterns: ["file.txt"] },
+    signal: AbortSignal.timeout(5000),
+  }).then((value) => permissionDecision = value);
+  await waitFor(() => posted.length === 1);
+  const allow = slackAction(posted[0], "pipa_permission_once_");
+  allowedUserIds = ["U2"];
+  await interactions.onAction({ actionId: allow.action_id, value: allow.value, user: { userId: "U1" } });
+  assert.equal(permissionDecision, undefined);
+  await interactions.onAction({ actionId: allow.action_id, value: allow.value, user: { userId: "U2" } });
+  await permission;
+
+  let answerDecision;
+  const answer = interactions.onInteraction({ thread: target, loadAllowedUserIds }, {
+    type: "question",
+    sessionId: "ses_question",
+    request: { id: "req_1", header: "Name", question: "Name?", custom: true },
+    signal: AbortSignal.timeout(5000),
+  }).then((value) => answerDecision = value);
+  await waitFor(() => posted.length === 2);
+  const custom = slackAction(posted[1], "pipa_custom_");
+  allowedUserIds = ["U1"];
+  await interactions.onCustomAnswer({ privateMetadata: custom.value, values: { answer: "Wrong" }, user: { userId: "U2" } });
+  assert.equal(answerDecision, undefined);
+  await interactions.onCustomAnswer({ privateMetadata: custom.value, values: { answer: "Orbit" }, user: { userId: "U1" } });
+  await answer;
+  assert.deepEqual(answerDecision, { type: "answer", answers: [["Orbit"]] });
+});
+
 function slackInteractionThread({ id = "slack:C1:1.0", posted = [], updated = [], deleted = [] } = {}) {
   return {
     id,
@@ -1334,12 +1457,12 @@ function slackAction(message, prefix) {
   return message.blocks.flatMap((block) => block.elements ?? []).find((element) => element.action_id?.startsWith(prefix));
 }
 
-function startInteractionPipa(chat, executor) {
+function startInteractionPipa(chat, executor, config = {}) {
   return startPipa({
     chat,
     executor,
     checkSlackToken: async () => ({ ok: true }),
-    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work", ...config },
     sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
   });
 }

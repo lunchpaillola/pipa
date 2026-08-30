@@ -202,7 +202,7 @@ export function createOpenCodeExecutor(options = {}) {
         }
         await request(`/session/${encodeURIComponent(selectedSessionId)}/prompt_async`, {
           method: "POST",
-          body: JSON.stringify(promptBody(prompt.trim(), files, contextEnvironment, artifactDirectory)),
+          body: JSON.stringify(promptBody(prompt, files, contextEnvironment, artifactDirectory)),
         }, workingDirectory, controller, [204]);
 
         while (true) {
@@ -377,7 +377,7 @@ async function stageAttachments(attachments, temporaryDirectory, timeoutMs, useD
 function promptBody(prompt, files, contextEnvironment, artifactDirectory) {
   const parts = [{ type: "text", text: prompt }, ...files.map((file) => ({ type: "file", ...file }))];
   const context = Object.entries(contextEnvironment).filter(([, value]) => value !== undefined && value !== null && String(value));
-  const instructions = [];
+  const instructions = ["For scheduling requests, consult `pipa routine --help`, convert timezone wording to an IANA timezone, preview first, show the normalized details, and create only after user confirmation."];
   if (context.length) instructions.push(`Slack context for this turn (provided here, not as shell environment variables):\n${context.map(([key, value]) => `${key}=${value}`).join("\n")}`);
   if (contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack") {
     instructions.push("Keep naturally short answers inline. For deeper work or larger deliverables, keep the Slack response concise and use the most suitable artifact format.");

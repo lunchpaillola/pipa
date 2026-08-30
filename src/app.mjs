@@ -65,7 +65,7 @@ export async function startPipa(options = {}) {
   }
   const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn, abortTurn: executor.abortTurn });
   let accepting = true;
-  const interactions = createPendingInteractions();
+  const interactions = createPendingInteractions(config.allowedSlackUserIds);
   const pendingReactions = new Map();
   chat.onAction?.(interactions.onAction);
   chat.onModalSubmit?.("pipa_custom", interactions.onCustomAnswer);
@@ -170,7 +170,7 @@ export async function startPipa(options = {}) {
   };
 }
 
-function createPendingInteractions() {
+export function createPendingInteractions(allowedUserIds = []) {
   const pending = new Map();
   const permissionRequests = new Map();
   const tails = new Map();
@@ -186,6 +186,7 @@ function createPendingInteractions() {
       questionIndex: 0,
       answers: [],
       resolve: null,
+      loadAllowedUserIds: context.loadAllowedUserIds,
     };
     const decision = new Promise((resolve, reject) => {
       const abort = () => reject(interaction.signal.reason);
@@ -245,6 +246,7 @@ function createPendingInteractions() {
     const token = interactionToken(event);
     const entry = pending.get(token);
     if (!entry) return;
+    if (!await canRespond(entry, event.user)) return;
     if (event.actionId?.startsWith("pipa_dismiss_")) {
       entry.resolve?.({ type: "stop" });
       return;
@@ -277,6 +279,7 @@ function createPendingInteractions() {
   async function onCustomAnswer(event) {
     const entry = pending.get(event.privateMetadata);
     if (!entry) return;
+    if (!await canRespond(entry, event.user)) return;
     const answer = event.values?.answer?.trim();
     if (!answer) return { action: "errors", errors: { answer: "Enter an answer." } };
     entry.answers[entry.questionIndex] = [answer];
@@ -289,6 +292,18 @@ function createPendingInteractions() {
       entry.resolve?.({ type: "answer", answers: entry.answers, ...(selectedBy ? { selectedBy } : {}) });
     }
     else entry.message?.edit();
+  }
+
+  async function canRespond(entry, user) {
+    let currentAllowedUserIds = allowedUserIds;
+    try {
+      if (entry.loadAllowedUserIds) currentAllowedUserIds = await entry.loadAllowedUserIds();
+    } catch {
+      return false;
+    }
+    if (!Array.isArray(currentAllowedUserIds)) return false;
+    const userId = user?.userId ?? user?.id;
+    return !currentAllowedUserIds.length || currentAllowedUserIds.includes(userId);
   }
 
   return { onInteraction, onPermissionReplied, onPermissionsReconciled, onAction, onCustomAnswer, close };
@@ -319,10 +334,10 @@ function renderSubmitted(entry, decision) {
 async function postInteraction(thread, entry) {
   const [, channel, threadTs] = thread.id.split(":");
   const client = thread.adapter?.webClient;
-  if (!client || !channel || !threadTs) throw new Error("Slack interaction context is unavailable.");
+  if (!client || !channel) throw new Error("Slack interaction context is unavailable.");
   const message = await client.chat.postMessage({
     channel,
-    thread_ts: threadTs,
+    ...(threadTs ? { thread_ts: threadTs } : {}),
     text: interactionFallback(entry),
     blocks: renderSlackInteraction(entry),
   });
@@ -636,7 +651,12 @@ function slackContext(thread, message) {
   };
 }
 
-async function postResult(thread, { text, files = [] }, signal) {
+export function slackDestinationId({ channelId, threadTs }) {
+  if (!channelId) throw new Error("A Slack channel ID is required.");
+  return `slack:${channelId}:${threadTs ?? ""}`;
+}
+
+export async function postResult(thread, { text, files = [] }, signal) {
   if (signal?.aborted) return;
   if (files.length) {
     try {
