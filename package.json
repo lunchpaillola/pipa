@@ -20,7 +20,8 @@
   ],
   "scripts": {
     "test": "node --test",
-    "test:pack": "node scripts/pack-smoke.mjs"
+    "test:pack": "node scripts/pack-smoke.mjs",
+    "test:slack:routines": "node scripts/slack-routine-eval.mjs"
   },
   "engines": {
     "node": ">=22"
