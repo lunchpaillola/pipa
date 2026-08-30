@@ -124,7 +124,7 @@ export async function acquireRoutineMutationLock(file = pipaPaths().routinesLock
   try {
     const existing = await readLockTickets(file);
     number = Math.max(0, ...existing.map((entry) => entry.owner?.number ?? 0)) + 1;
-    await writePrivateJson(ticket, { token, pid: process.pid, createdAt, choosing: false, number });
+    await writeFile(ticket, JSON.stringify({ token, pid: process.pid, createdAt, choosing: false, number }));
     while (true) {
       let blocked = false;
       for (const entry of await readLockTickets(file)) {

@@ -4,9 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { pipaPaths, writePrivateJson } from "../src/state.mjs";
 
-const cli = new URL("../bin/pipa.mjs", import.meta.url);
+const cli = fileURLToPath(new URL("../bin/pipa.mjs", import.meta.url));
 
 async function setup(allowedSlackChannelIds = ["C123"]) {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-cli-"));
@@ -23,7 +24,7 @@ async function setup(allowedSlackChannelIds = ["C123"]) {
 }
 
 function run(home, ...args) {
-  return spawnSync(process.execPath, [cli.pathname, "routine", ...args], {
+  return spawnSync(process.execPath, [cli, "routine", ...args], {
     encoding: "utf8",
     env: { ...process.env, PIPA_HOME: home },
   });
