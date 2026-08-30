@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   acquireRoutineMutationLock,
   calculateNextRunAt,
+  createRoutineScheduler,
   loadRoutineState,
   mergeRoutineRunOutcome,
   mutateRoutineState,
@@ -206,4 +207,157 @@ test("scheduled outcomes consume failures, final runs complete, denial deactivat
   assert.equal(manualResult.status, "inactive");
   assert.equal(manualResult.nextRunAt, null);
   assert.equal(manualResult.runRequestedAt, null);
+});
+
+test("scheduler runs different routines concurrently without overlapping the same routine", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routines-"));
+  const paths = pipaPaths(home);
+  let now = "2026-08-29T12:00:00.000Z";
+  const first = normalizeRoutine(candidate({ id: "first", schedule: { type: "recurring", frequency: "hours", interval: 1, times: [], weekdays: [], until: null } }), now);
+  const second = normalizeRoutine(candidate({ id: "second", schedule: { type: "once", at: "2026-08-29T13:00:00Z" } }), now);
+  await writePrivateJson(paths.routines, { version: 1, routines: [first, second] });
+  const calls = [];
+  const releases = [];
+  const scheduler = createRoutineScheduler({
+    paths,
+    now: () => now,
+    setInterval: () => ({ unref() {} }),
+    clearInterval() {},
+    execute: async (snapshot) => {
+      calls.push(snapshot);
+      return new Promise((resolve) => releases.push(() => resolve({ status: "succeeded" })));
+    },
+  });
+  await scheduler.start();
+  assert.deepEqual(calls, []);
+
+  await requestRoutineRun(first.id, "2026-08-29T12:30:00.000Z", paths);
+  now = "2026-08-29T13:00:00.000Z";
+  await scheduler.tick();
+  await scheduler.tick();
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every((snapshot) => snapshot.trigger === "scheduled"));
+  releases.splice(0).forEach((release) => release());
+  await scheduler.drain();
+
+  await scheduler.tick();
+  assert.equal(calls.length, 3);
+  assert.equal(calls[2].id, "first");
+  assert.equal(calls[2].trigger, "run-now");
+  releases.splice(0).forEach((release) => release());
+  await scheduler.drain();
+  scheduler.stop();
+
+  const state = await loadRoutineState(paths.routines);
+  assert.equal(state.routines.find((routine) => routine.id === "first").runRequestedAt, null);
+  assert.equal(state.routines.find((routine) => routine.id === "second").status, "completed");
+});
+
+test("scheduler aborts deactivated and deleted routines without resurrecting them", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routines-"));
+  const paths = pipaPaths(home);
+  let now = "2026-08-29T12:00:00.000Z";
+  const routines = ["inactive", "deleted"].map((id) => normalizeRoutine(candidate({ id, schedule: { type: "once", at: "2026-08-29T13:00:00Z" } }), now));
+  await writePrivateJson(paths.routines, { version: 1, routines });
+  const aborted = [];
+  const scheduler = createRoutineScheduler({
+    paths,
+    now: () => now,
+    setInterval: () => ({ unref() {} }),
+    clearInterval() {},
+    abortTurn: async (sessionId) => aborted.push(sessionId),
+    execute: async (snapshot, { signal, onSession }) => {
+      onSession(`ses_${snapshot.id}`);
+      return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    },
+  });
+  await scheduler.start();
+  now = "2026-08-29T13:00:00.000Z";
+  await scheduler.tick();
+  await mutateRoutineState((state) => {
+    state.routines[0].status = "inactive";
+    state.routines[0].nextRunAt = null;
+    state.routines.splice(1, 1);
+  }, paths);
+  await scheduler.tick();
+  await scheduler.drain();
+  scheduler.stop();
+
+  assert.deepEqual(aborted.sort(), ["ses_deleted", "ses_inactive"]);
+  const state = await loadRoutineState(paths.routines);
+  assert.equal(state.routines.length, 1);
+  assert.equal(state.routines[0].status, "inactive");
+  assert.equal(state.routines[0].lastRun, null);
+});
+
+test("scheduler shutdown preserves a pending run-now marker", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routines-"));
+  const paths = pipaPaths(home);
+  const routine = normalizeRoutine(candidate({ status: "inactive" }), NOW);
+  routine.runRequestedAt = "2026-08-29T12:01:00.000Z";
+  await writePrivateJson(paths.routines, { version: 1, routines: [routine] });
+  const scheduler = createRoutineScheduler({
+    paths,
+    now: () => "2026-08-29T12:02:00.000Z",
+    setInterval: () => ({ unref() {} }),
+    clearInterval() {},
+    execute: async (_, { signal }) => new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })),
+  });
+  await scheduler.start();
+  scheduler.stop();
+  await scheduler.drain();
+  assert.equal((await loadRoutineState(paths.routines)).routines[0].runRequestedAt, routine.runRequestedAt);
+});
+
+test("long recurring runs skip elapsed occurrences", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routines-"));
+  const paths = pipaPaths(home);
+  const routine = normalizeRoutine(candidate({ schedule: { type: "recurring", frequency: "minutes", interval: 30, times: [], weekdays: [], until: null } }), NOW);
+  await writePrivateJson(paths.routines, { version: 1, routines: [routine] });
+  const merged = await mergeRoutineRunOutcome({ id: routine.id, trigger: "scheduled", occurrenceAt: routine.nextRunAt, schedule: routine.schedule }, { status: "succeeded" }, "2026-08-29T15:05:00.000Z", paths);
+  assert.equal(merged.nextRunAt, "2026-08-29T15:30:00.000Z");
+});
+
+test("a stopped in-flight tick cannot dispatch new work", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routines-"));
+  const paths = pipaPaths(home);
+  let now = "2026-08-29T12:00:00.000Z";
+  const routine = normalizeRoutine(candidate({ schedule: { type: "once", at: "2026-08-29T13:00:00Z" } }), now);
+  await writePrivateJson(paths.routines, { version: 1, routines: [routine] });
+  let calls = 0;
+  const scheduler = createRoutineScheduler({
+    paths,
+    now: () => now,
+    setInterval: () => ({ unref() {} }),
+    clearInterval() {},
+    execute: async () => { calls += 1; return { status: "succeeded" }; },
+  });
+  await scheduler.start();
+  now = "2026-08-29T13:00:00.000Z";
+  const tick = scheduler.tick();
+  scheduler.stop();
+  await tick;
+  await scheduler.drain();
+  assert.equal(calls, 0);
+});
+
+test("run-now denial does not overwrite a concurrent destination edit", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routines-"));
+  const paths = pipaPaths(home);
+  const routine = normalizeRoutine(candidate({ status: "inactive" }), NOW);
+  routine.runRequestedAt = "2026-08-29T12:01:00.000Z";
+  await writePrivateJson(paths.routines, { version: 1, routines: [routine] });
+  await mutateRoutineState((state) => {
+    state.routines[0].destination = { channelId: "C999", threadTs: null };
+    state.routines[0].status = "active";
+    state.routines[0].nextRunAt = routine.nextRunAt ?? "2026-08-29T13:00:00.000Z";
+  }, paths);
+  const merged = await mergeRoutineRunOutcome({
+    ...routine,
+    trigger: "run-now",
+    occurrenceAt: routine.runRequestedAt,
+  }, { status: "denied", errorCode: "destination_denied" }, "2026-08-29T12:02:00.000Z", paths);
+  assert.equal(merged.status, "active");
+  assert.equal(merged.destination.channelId, "C999");
+  assert.equal(merged.runRequestedAt, null);
 });

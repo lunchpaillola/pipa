@@ -290,11 +290,13 @@ export async function mergeRoutineRunOutcome(snapshot, outcome, completedAt = Da
         routine.status = "completed";
         routine.nextRunAt = null;
       } else {
-        routine.nextRunAt = calculateNextRunAt(routine.schedule, routine.timezone, snapshot.occurrenceAt, routine.createdAt);
+        routine.nextRunAt = calculateNextRunAt(routine.schedule, routine.timezone, completed, routine.createdAt);
         if (routine.nextRunAt === null) routine.status = "completed";
       }
     }
-    if (outcome.status === "denied") {
+    const denialStillOwned = snapshot.trigger === "scheduled"
+      || (routine.status === snapshot.status && JSON.stringify(routine.destination) === JSON.stringify(snapshot.destination));
+    if (outcome.status === "denied" && denialStillOwned) {
       routine.status = "inactive";
       routine.nextRunAt = null;
     }
@@ -310,6 +312,103 @@ export async function mergeRoutineRunOutcome(snapshot, outcome, completedAt = Da
     merged = structuredClone(routine);
   }, paths);
   return merged;
+}
+
+export function createRoutineScheduler(options) {
+  const paths = options.paths ?? pipaPaths();
+  const intervalMs = options.intervalMs ?? 30_000;
+  const active = new Map();
+  let timer;
+  let ticking = false;
+  let currentTick = Promise.resolve();
+  let started = false;
+  let stopped = false;
+  let stopReason;
+
+  function tick() {
+    if (stopped || ticking) return currentTick;
+    ticking = true;
+    currentTick = runTick().finally(() => { ticking = false; });
+    return currentTick;
+  }
+
+  async function runTick() {
+    const now = options.now?.() ?? DateTime.utc().toISO();
+    const state = await loadRoutineState(paths.routines);
+    if (stopped) return;
+    for (const [id, entry] of active) {
+      const current = state.routines.find((routine) => routine.id === id);
+      if (!current || (entry.snapshot.status === "active" && current.status !== "active")) {
+        entry.controller.abort(new Error("Routine was deactivated or deleted."));
+        if (entry.sessionId) await Promise.resolve(options.abortTurn?.(entry.sessionId, entry.controller.signal.reason)).catch(() => undefined);
+      }
+    }
+    for (const routine of state.routines) {
+      if (stopped) break;
+      if (active.has(routine.id)) continue;
+      const scheduled = routine.status === "active" && routine.nextRunAt !== null && parseTimestamp(routine.nextRunAt, "nextRunAt") <= parseTimestamp(now, "clock");
+      if (!scheduled && routine.runRequestedAt === null) continue;
+      const trigger = scheduled ? "scheduled" : "run-now";
+      const occurrenceAt = scheduled ? routine.nextRunAt : routine.runRequestedAt;
+      const snapshot = structuredClone({ ...routine, trigger, occurrenceAt });
+      const entry = { snapshot, controller: new AbortController(), sessionId: null };
+      active.set(routine.id, entry);
+      entry.done = run(entry);
+      void entry.done.catch(options.onError ?? (() => undefined));
+    }
+  }
+
+  async function run(entry) {
+    let outcome;
+    try {
+      outcome = await options.execute(entry.snapshot, {
+        signal: entry.controller.signal,
+        onSession(sessionId) { entry.sessionId = sessionId; },
+        async abort(reason) {
+          entry.controller.abort(reason);
+          if (entry.sessionId) await Promise.resolve(options.abortTurn?.(entry.sessionId, reason)).catch(() => undefined);
+        },
+      });
+      outcome ??= { status: "succeeded" };
+    } catch {
+      outcome = entry.controller.signal.aborted
+        ? { status: "aborted", errorCode: "aborted", errorSummary: "Routine execution was aborted." }
+        : { status: "failed", errorCode: "executor_failed", errorSummary: "Routine execution failed." };
+    }
+    try {
+      if (!stopped) await mergeRoutineRunOutcome(entry.snapshot, outcome, options.now?.() ?? DateTime.utc().toISO(), paths);
+    } finally {
+      if (active.get(entry.snapshot.id) === entry) active.delete(entry.snapshot.id);
+    }
+  }
+
+  return {
+    async start() {
+      if (started) throw new Error("Routine scheduler already started.");
+      started = true;
+      if (stopped) throw stopReason;
+      await reconcileRoutines(options.now?.() ?? DateTime.utc().toISO(), paths);
+      await tick();
+      if (stopped) return;
+      timer = (options.setInterval ?? setInterval)(() => { void tick().catch(options.onError ?? (() => undefined)); }, intervalMs);
+      timer?.unref?.();
+    },
+    tick,
+    stop(reason = new Error("Pipa stopped.")) {
+      if (stopped) return;
+      stopped = true;
+      stopReason = reason;
+      (options.clearInterval ?? clearInterval)(timer);
+      for (const entry of active.values()) {
+        entry.controller.abort(reason);
+        if (entry.sessionId) void Promise.resolve(options.abortTurn?.(entry.sessionId, reason)).catch(() => undefined);
+      }
+    },
+    async drain() {
+      await currentTick.catch(() => undefined);
+      while (active.size) await Promise.allSettled([...active.values()].map((entry) => entry.done));
+    },
+  };
 }
 
 function normalizeSchedule(schedule, timezone, clock) {
