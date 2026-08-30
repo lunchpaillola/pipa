@@ -55,6 +55,8 @@ export function pipaPaths(home = process.env.PIPA_HOME || os.homedir()) {
     config: path.join(directory, "config.json"),
     manifest: path.join(directory, "slack-manifest.json"),
     lock: path.join(directory, "pipa.lock"),
+    routines: path.join(directory, "routines.json"),
+    routinesLock: path.join(directory, "routines.lock"),
     sessions: path.join(directory, "sessions.json"),
   };
 }
@@ -181,7 +183,7 @@ async function readJson(file, missingMessage) {
   }
 }
 
-async function writePrivateJson(file, value) {
+export async function writePrivateJson(file, value) {
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
   try {

@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { acquireInstanceLock, createManifest, createManifestUrl, createSessionStore, loadConfig, loadSessions, pipaPaths, saveConfig, stopInstance } from "../src/state.mjs";
+import { acquireInstanceLock, createManifest, createManifestUrl, createSessionStore, loadConfig, loadSessions, pipaPaths, saveConfig, stopInstance, writePrivateJson } from "../src/state.mjs";
 
 test("manifest preserves approved capabilities and substitutes the bot name", () => {
   const manifest = createManifest('Workshop "Bot"');
@@ -35,6 +35,16 @@ test("config and sessions are stored separately with private permissions", async
   assert.equal(JSON.parse(await readFile(paths.sessions, "utf8"))["slack:C1:1.0"], "ses_1");
   assert.doesNotMatch(await readFile(paths.sessions, "utf8"), /xoxb|xapp/u);
   if (process.platform !== "win32") assert.equal((await stat(paths.config)).mode & 0o777, 0o600);
+});
+
+test("routine paths are separate and the atomic JSON writer is reusable", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-state-"));
+  const paths = pipaPaths(home);
+  assert.equal(paths.routines, path.join(paths.directory, "routines.json"));
+  assert.equal(paths.routinesLock, path.join(paths.directory, "routines.lock"));
+  await writePrivateJson(paths.routines, { version: 1, routines: [] });
+  assert.deepEqual(JSON.parse(await readFile(paths.routines, "utf8")), { version: 1, routines: [] });
+  if (process.platform !== "win32") assert.equal((await stat(paths.routines)).mode & 0o777, 0o600);
 });
 
 test("config validates Socket and Managed profiles", async () => {
