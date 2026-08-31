@@ -79,7 +79,7 @@ pipa start
 
 ### Routines
 
-Local Pipa can save timezone-aware work that runs through the same OpenCode agent and delivers to one exact Slack channel or existing thread. Routines use the configured working directory, tools, permissions, channel allowlist, and responder allowlist.
+Local Pipa can save timezone-aware work that runs through the same OpenCode agent and delivers to one exact Slack channel or existing thread. Replies to a routine result continue the OpenCode session that produced it. Routines use the configured working directory, tools, permissions, channel allowlist, and responder allowlist.
 
 Preview agent-assisted changes first, inspect the normalized JSON, then create only after confirmation:
 

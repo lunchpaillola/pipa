@@ -893,7 +893,7 @@ test("routine scheduler uses a fresh session and exact Slack destination without
     onSubscribedMessage() {},
     thread(id) {
       assert.equal(id, "slack:C123:123.456");
-      return { id, post: async (payload) => posts.push(payload) };
+      return { id, post: async (payload) => posts.push(payload), subscribe: async () => undefined };
     },
     async initialize() {},
     async shutdown() {},
@@ -937,6 +937,99 @@ test("routine scheduler uses a fresh session and exact Slack destination without
   assert.equal(calls[0].contextEnvironment.PIPA_CURRENT_SLACK_THREAD_TS, "123.456");
   assert.deepEqual(posts, [{ markdown: "finished" }]);
   assert.ok((await readFile(paths.routines, "utf8")).includes('"completed"'));
+  await app.shutdown();
+});
+
+test("routine replies resume the OpenCode session that produced the root message", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routine-reply-"));
+  const paths = pipaPaths(home);
+  let now = "2026-08-29T12:00:00.000Z";
+  await writePrivateJson(paths.config, {
+    botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: home,
+    allowedSlackChannelIds: ["C123"], allowedSlackUserIds: ["U1"],
+  });
+  const routine = normalizeRoutine({
+    id: "scheduled",
+    prompt: "Check the queue",
+    schedule: { type: "once", at: "2026-08-29T13:00:00Z" },
+    timezone: "UTC",
+    destination: { channelId: "C123", threadTs: null },
+  }, now);
+  await writePrivateJson(paths.routines, { version: 1, routines: [routine] });
+
+  const handlers = {};
+  const sessions = new Map();
+  const subscriptions = [];
+  const posts = [];
+  const calls = [];
+  let intervalTick;
+  let scheduler;
+  const chat = {
+    onNewMention() {},
+    onSubscribedMessage(handler) { handlers.subscribed = handler; },
+    thread(id) {
+      return {
+        id,
+        channel: { isDM: false, channelVisibility: "private" },
+        adapter: { addReaction: async () => undefined, removeReaction: async () => undefined },
+        subscribe: async () => subscriptions.push(id),
+        post: async (payload) => {
+          posts.push({ id, payload });
+          return { id: id === "slack:C123:" ? "456.789" : "reply" };
+        },
+      };
+    },
+    async initialize() {},
+    async shutdown() {},
+  };
+  const app = await startPipa({
+    paths,
+    routinesEnabled: true,
+    routineNow: () => now,
+    setRoutineInterval(callback) { intervalTick = callback; return { unref() {} }; },
+    clearRoutineInterval() {},
+    createRoutineScheduler: (options) => {
+      scheduler = createRoutineScheduler(options);
+      return scheduler;
+    },
+    chat,
+    executor: {
+      async runTurn(input) {
+        calls.push({ prompt: input.prompt, sessionId: input.sessionId });
+        await input.onSession?.("ses_routine");
+        return { text: calls.length === 1 ? "Queue checked" : "Yes, three items.", sessionId: "ses_routine" };
+      },
+      async abortTurn() {},
+      stopAll() {},
+    },
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: {
+      keys: () => [...sessions.keys()],
+      get: (key) => sessions.get(key) ?? null,
+      async set(key, value) { sessions.set(key, value); },
+    },
+  });
+
+  now = "2026-08-29T13:00:00.000Z";
+  intervalTick();
+  await scheduler.drain();
+  const conversationKey = "slack:C123:456.789";
+  assert.equal(sessions.get(conversationKey), "ses_routine");
+  assert.deepEqual(subscriptions, [conversationKey]);
+
+  const replyThread = chat.thread(conversationKey);
+  await handlers.subscribed(replyThread, {
+    id: "456.790", text: "How many items?", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {},
+  });
+  await waitFor(() => calls.length === 2);
+  assert.deepEqual(calls, [
+    { prompt: "Check the queue", sessionId: null },
+    { prompt: "How many items?", sessionId: "ses_routine" },
+  ]);
+  assert.deepEqual(posts, [
+    { id: "slack:C123:", payload: { markdown: "Queue checked" } },
+    { id: conversationKey, payload: { markdown: "Yes, three items." } },
+  ]);
   await app.shutdown();
 });
 

@@ -138,7 +138,13 @@ export async function startPipa(options = {}) {
       try {
         await authorize();
         if (signal.aborted) throw signal.reason;
-        await postResult(thread, result, signal);
+        const message = await postResult(thread, result, signal);
+        const threadTs = snapshot.destination.threadTs ?? message?.id;
+        if (threadTs && result.sessionId) {
+          const conversationKey = slackDestinationId({ channelId: snapshot.destination.channelId, threadTs });
+          await sessionStore.set(conversationKey, result.sessionId);
+          await chat.thread(conversationKey).subscribe();
+        }
       } catch (error) {
         if (signal.aborted || error instanceof PipaStoppedError) throw error;
         if (error instanceof RoutineDeniedError) return { status: "denied", errorCode: "destination_denied", errorSummary: "Routine destination is no longer allowed." };
@@ -757,17 +763,19 @@ export async function postResult(thread, { text, files = [] }, signal) {
   if (signal?.aborted) return;
   if (files.length) {
     try {
-      await thread.post({ markdown: text, files });
-      return;
+      return await thread.post({ markdown: text, files });
     } catch {
       // A failed adapter call may still have uploaded files, so retry text only.
     }
   }
   if (!text || signal?.aborted) return;
+  let firstMessage;
   for (const markdown of splitSlackMarkdown(text)) {
     if (signal?.aborted) return;
-    await thread.post({ markdown });
+    const message = await thread.post({ markdown });
+    firstMessage ??= message;
   }
+  return firstMessage;
 }
 
 function splitSlackMarkdown(text, limit = 3500) {
