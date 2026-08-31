@@ -306,6 +306,7 @@ export function createPendingInteractions(allowedUserIds = []) {
       if (entry.decision === undefined) {
         await entry.authorize?.();
         entry.message = await postInteraction(context.thread, entry);
+        if (entry.threadId.endsWith(":")) entry.threadId += entry.message.id;
         if (interaction.signal.aborted) throw interaction.signal.reason;
       }
       const result = await decision;
@@ -344,8 +345,7 @@ export function createPendingInteractions(allowedUserIds = []) {
     const token = interactionToken(event);
     const entry = pending.get(token);
     if (!entry) return;
-    const expectedThreadId = entry.threadId.endsWith(":") ? `${entry.threadId}${entry.message?.id}` : entry.threadId;
-    if ((event.threadId ?? event.thread?.id) !== expectedThreadId) return;
+    if ((event.threadId ?? event.thread?.id) !== entry.threadId) return;
     if (!await canRespond(entry, event.user)) return;
     if (event.actionId?.startsWith("pipa_dismiss_")) {
       entry.resolve?.({ type: "stop" });

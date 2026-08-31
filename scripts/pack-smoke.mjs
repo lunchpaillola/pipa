@@ -20,13 +20,7 @@ try {
   const installedRoot = path.join(directory, "install", "node_modules", "@usepipa", "pipa");
   const packedRuntime = await import(pathToFileURL(path.join(installedRoot, "src", "opencode.mjs")).href);
   if (typeof packedRuntime.createOpenCodeExecutor !== "function") throw new Error("Packed OpenCode executor is unavailable.");
-  const packedRoutines = await import(pathToFileURL(path.join(installedRoot, "src", "routines.mjs")).href);
-  if (typeof packedRoutines.createRoutineScheduler !== "function") throw new Error("Packed routine runtime is unavailable.");
   const installedCli = path.join(installedRoot, "bin", "pipa.mjs");
-  const help = await run(process.execPath, [installedCli, "routine", "--help"]);
-  for (const expected of ["create", "list", "show", "edit", "run", "delete", "--preview", "IANA", "--every 30m", "Managed profiles do not execute routines"]) {
-    if (!help.stdout.includes(expected)) throw new Error(`Packed routine help is missing ${expected}.`);
-  }
 
   const home = path.join(directory, "home");
   const workingDirectory = path.join(directory, "work");

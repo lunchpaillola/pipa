@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import { link, lstat, mkdir, open, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { DateTime, IANAZone } from "luxon";
 import { pipaPaths, writePrivateJson } from "./state.mjs";
 
@@ -13,13 +14,12 @@ export function calculateNextRunAt(schedule, timezone, strictAfter, anchor = str
   validateTimezone(timezone);
   const after = parseTimestamp(strictAfter, "strict-future boundary");
   const start = parseTimestamp(anchor, "schedule anchor");
+  assertCanonicalSchedule(schedule, timezone, start);
 
   if (schedule?.type === "once") {
     const at = parseTimestamp(schedule.at, "once timestamp");
     return at > after ? canonicalIso(at) : null;
   }
-  validateCanonicalSchedule(schedule);
-
   if (schedule.frequency === "minutes" || schedule.frequency === "hours") {
     const milliseconds = schedule.interval * (schedule.frequency === "minutes" ? 60_000 : 3_600_000);
     const steps = Math.max(1, Math.floor((after.toMillis() - start.toMillis()) / milliseconds) + 1);
@@ -239,14 +239,11 @@ export async function editRoutine(id, changes, options = {}) {
 }
 
 export async function deleteRoutine(id, paths = pipaPaths()) {
-  let deleted = false;
   await mutateRoutineState((state) => {
     const index = state.routines.findIndex((item) => item.id === id);
     if (index === -1) throw new Error(`Routine not found: ${id}`);
     state.routines.splice(index, 1);
-    deleted = true;
   }, paths);
-  return deleted;
 }
 
 export function reconcileRoutineState(input, now = DateTime.utc().toISO()) {
@@ -276,12 +273,9 @@ export function reconcileRoutineState(input, now = DateTime.utc().toISO()) {
 }
 
 export async function reconcileRoutines(now = DateTime.utc().toISO(), paths = pipaPaths()) {
-  let reconciled;
-  await mutateRoutineState((state) => {
-    reconciled = reconcileRoutineState(state, now);
-    state.routines = reconciled.routines;
+  return mutateRoutineState((state) => {
+    state.routines = reconcileRoutineState(state, now).routines;
   }, paths);
-  return reconciled;
 }
 
 export async function mergeRoutineRunOutcome(snapshot, outcome, completedAt = DateTime.utc().toISO(), paths = pipaPaths()) {
@@ -429,28 +423,28 @@ export function createRoutineScheduler(options) {
   };
 }
 
-function normalizeSchedule(schedule, timezone, clock) {
-  if (!schedule || typeof schedule !== "object" || Array.isArray(schedule)) invalid("schedule must be an object");
-  if (schedule.type === "once") return { type: "once", at: canonicalIso(parseTimestamp(schedule.at, "once timestamp")) };
-  if (schedule.type !== "recurring" || !FREQUENCIES.has(schedule.frequency)) invalid("schedule frequency is unsupported");
-  if (!Number.isSafeInteger(schedule.interval) || schedule.interval <= 0) invalid("schedule interval must be a positive integer");
-  const until = schedule.until == null ? null : normalizeDate(schedule.until);
+function normalizeSchedule(schedule, timezone, clock, fail = invalid) {
+  if (!schedule || typeof schedule !== "object" || Array.isArray(schedule)) fail("schedule must be an object");
+  if (schedule.type === "once") return { type: "once", at: canonicalIso(parseTimestamp(schedule.at, "once timestamp", fail)) };
+  if (schedule.type !== "recurring" || !FREQUENCIES.has(schedule.frequency)) fail("schedule frequency is unsupported");
+  if (!Number.isSafeInteger(schedule.interval) || schedule.interval <= 0) fail("schedule interval must be a positive integer");
+  const until = schedule.until == null ? null : normalizeDate(schedule.until, fail);
   const local = clock.setZone(timezone);
   let times = schedule.times ?? [];
   let weekdays = schedule.weekdays ?? [];
-  if (!Array.isArray(times) || !Array.isArray(weekdays)) invalid("schedule times and weekdays must be lists");
+  if (!Array.isArray(times) || !Array.isArray(weekdays)) fail("schedule times and weekdays must be lists");
   if (schedule.frequency === "daily" || schedule.frequency === "weekly") {
     if (times.length === 0) times = [local.toFormat("HH:mm")];
-    times = [...new Set(times.map((value) => normalizeTime(value, invalid)))].sort();
+    times = [...new Set(times.map((value) => normalizeTime(value, fail)))].sort();
   } else if (times.length !== 0 || weekdays.length !== 0) {
-    invalid("minute and hour schedules cannot have times or weekdays");
+    fail("minute and hour schedules cannot have times or weekdays");
   }
   if (schedule.frequency === "weekly") {
     if (weekdays.length === 0) weekdays = [local.weekday];
-    if (!weekdays.every((value) => Number.isInteger(value) && value >= 1 && value <= 7)) invalid("weekdays must be integers from 1 to 7");
+    if (!weekdays.every((value) => Number.isInteger(value) && value >= 1 && value <= 7)) fail("weekdays must be integers from 1 to 7");
     weekdays = [...new Set(weekdays)].sort((left, right) => left - right);
   } else if (weekdays.length !== 0) {
-    invalid("only weekly schedules can have weekdays");
+    fail("only weekly schedules can have weekdays");
   }
   return { type: "recurring", frequency: schedule.frequency, interval: schedule.interval, times, weekdays, until };
 }
@@ -474,12 +468,12 @@ function validateCanonicalRoutine(routine) {
   requiredString(routine.id, "id", invalidState);
   if (typeof routine.prompt !== "string" || !routine.prompt.trim()) invalidState("prompt is empty");
   validateTimezone(routine.timezone, invalidState);
-  validateCanonicalSchedule(routine.schedule);
+  const createdAt = canonicalTimestamp(routine.createdAt, "createdAt", invalidState);
+  const updatedAt = canonicalTimestamp(routine.updatedAt, "updatedAt", invalidState);
+  assertCanonicalSchedule(routine.schedule, routine.timezone, parseTimestamp(createdAt, "createdAt", invalidState));
   requireKeys(routine.destination, ["channelId", "threadTs"], "destination");
   normalizeDestination(routine.destination, invalidState);
   if (!STATUSES.has(routine.status)) invalidState("status is unsupported");
-  const createdAt = canonicalTimestamp(routine.createdAt, "createdAt", invalidState);
-  const updatedAt = canonicalTimestamp(routine.updatedAt, "updatedAt", invalidState);
   if (updatedAt < createdAt) invalidState("updatedAt cannot precede createdAt");
   if (routine.runRequestedAt !== null) canonicalTimestamp(routine.runRequestedAt, "runRequestedAt", invalidState);
   if (routine.status === "active") {
@@ -491,27 +485,10 @@ function validateCanonicalRoutine(routine) {
   if (routine.lastRun !== null) normalizeLastRun(routine.lastRun, invalidState);
 }
 
-function validateCanonicalSchedule(schedule) {
-  if (!schedule || typeof schedule !== "object" || Array.isArray(schedule)) invalidState("schedule must be an object");
-  if (schedule.type === "once") {
-    requireKeys(schedule, ["type", "at"], "once schedule");
-    canonicalTimestamp(schedule.at, "once timestamp", invalidState);
-    return;
+function assertCanonicalSchedule(schedule, timezone, clock) {
+  if (!isDeepStrictEqual(schedule, normalizeSchedule(schedule, timezone, clock, invalidState))) {
+    invalidState("schedule is not canonical");
   }
-  requireKeys(schedule, ["type", "frequency", "interval", "times", "weekdays", "until"], "recurring schedule");
-  if (schedule.type !== "recurring" || !FREQUENCIES.has(schedule.frequency)) invalidState("schedule frequency is unsupported");
-  if (!Number.isSafeInteger(schedule.interval) || schedule.interval <= 0) invalidState("schedule interval must be a positive integer");
-  if (!Array.isArray(schedule.times) || !Array.isArray(schedule.weekdays)) invalidState("schedule times and weekdays must be lists");
-  const times = [...new Set(schedule.times.map((value) => normalizeTime(value, invalidState)))].sort();
-  if (JSON.stringify(schedule.times) !== JSON.stringify(times)) invalidState("schedule times are not canonical");
-  if (!schedule.weekdays.every((value) => Number.isInteger(value) && value >= 1 && value <= 7)) invalidState("weekdays must be integers from 1 to 7");
-  const weekdays = [...new Set(schedule.weekdays)].sort((left, right) => left - right);
-  if (JSON.stringify(schedule.weekdays) !== JSON.stringify(weekdays)) invalidState("schedule weekdays are not canonical");
-  if ((schedule.frequency === "daily" || schedule.frequency === "weekly") && schedule.times.length === 0) invalidState("wall-clock schedule requires a time");
-  if (schedule.frequency === "weekly" && schedule.weekdays.length === 0) invalidState("weekly schedule requires weekdays");
-  if (schedule.frequency !== "weekly" && schedule.weekdays.length !== 0) invalidState("only weekly schedules can have weekdays");
-  if ((schedule.frequency === "minutes" || schedule.frequency === "hours") && schedule.times.length !== 0) invalidState("duration schedule cannot have times");
-  if (schedule.until !== null) normalizeDate(schedule.until, invalidState);
 }
 
 function normalizeLastRun(lastRun, fail = invalid) {
