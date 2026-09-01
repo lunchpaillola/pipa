@@ -240,6 +240,51 @@ test("does not complete until both the session is idle and a new assistant messa
   assert.ok(messageReads >= 3);
 });
 
+test("completes from a terminal assistant message when session status remains stale", async () => {
+  let prompted = false;
+  const fetch = async (url, init = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/session/ses_1/prompt_async") {
+      prompted = true;
+      return new Response(null, { status: 204 });
+    }
+    if (pathname === "/session/status") return jsonResponse({ ses_1: { type: prompted ? "busy" : "idle" } });
+    if (pathname === "/session/ses_1/message") {
+      return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", finish: "stop", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
+    }
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+
+  const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, timeoutMs: 50, pollIntervalMs: 1 })
+    .runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" });
+  assert.equal(result.text, "done");
+});
+
+test("waits for an active retry despite a terminal assistant message", async () => {
+  let prompted = false;
+  let statusReads = 0;
+  const fetch = async (url, init = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/session/ses_1/prompt_async") {
+      prompted = true;
+      return new Response(null, { status: 204 });
+    }
+    if (pathname === "/session/status") {
+      if (!prompted) return jsonResponse({ ses_1: { type: "idle" } });
+      return jsonResponse({ ses_1: { type: ++statusReads === 1 ? "retry" : "idle" } });
+    }
+    if (pathname === "/session/ses_1/message") {
+      return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", finish: "stop", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
+    }
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+
+  const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 })
+    .runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" });
+  assert.equal(result.text, "done");
+  assert.equal(statusReads, 2);
+});
+
 test("rejects prompt failures and aborts active requests during shutdown", async () => {
   const failed = createOpenCodeExecutor({
     baseUrl: "http://localhost:5555",
@@ -531,6 +576,27 @@ test("keeps an established event stream open beyond the request timeout", async 
 
   assert.equal(result.text, "done");
   assert.equal(eventConnections, 1);
+});
+
+test("overall timeout rejects while interaction subscription is starting", async () => {
+  const fetch = async (url, init = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/event") return new Response(new ReadableStream({ start() {} }));
+    if (pathname === "/permission") {
+      return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+    }
+    if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+    if (pathname === "/session/ses_1/message") return jsonResponse([]);
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, timeoutMs: 10, requestTimeoutMs: 1_000 });
+
+  await assert.rejects(executor.runTurn({
+    prompt: "hello",
+    sessionId: "ses_1",
+    workingDirectory: "/work",
+    onInteraction: () => undefined,
+  }), /OpenCode timed out after 10ms/u);
 });
 
 test("routes a subagent permission through its parent session", async () => {

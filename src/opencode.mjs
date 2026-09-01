@@ -209,7 +209,7 @@ export function createOpenCodeExecutor(options = {}) {
           const status = statuses?.[selectedSessionId]?.type;
           if (dismissed && status !== "busy" && status !== "retry") return { text: "", sessionId: selectedSessionId };
           if (["error", "failed", "cancelled"].includes(status) || finalMessage?.error) throw new Error("OpenCode failed to complete the turn.");
-          if (finalMessage && (status === "idle" || (!status && finalMessage.completed))) {
+          if (finalMessage && ((status !== "retry" && finalMessage.completed && finalMessage.finish === "stop") || status === "idle" || (!status && finalMessage.completed))) {
             if (!finalMessage.text && permissionRejected) return { text: "Stopped after a permission was rejected.", sessionId: selectedSessionId };
             if (!finalMessage.text) throw new Error("OpenCode completed without assistant text.");
             const parsed = slackTurn ? parseArtifactDeclaration(finalMessage.text) : { text: finalMessage.text };
@@ -466,6 +466,7 @@ function latestAssistantMessage(messages, baseline) {
     return {
       completed: typeof message.info.time?.completed === "number",
       error: message.info.error,
+      finish: message.info.finish,
       text: message.parts
         .filter((part) => part.type === "text" && typeof part.text === "string" && part.text)
         .map((part) => part.text)
@@ -677,7 +678,7 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
     }
   };
 
-  void (async () => {
+  const watching = (async () => {
     while (!controller.signal.aborted) {
       try {
         const url = serverUrl(baseUrl, "/event", workingDirectory);
@@ -713,7 +714,10 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
         await reconcile();
         await delay(250, controller.signal).catch(() => undefined);
       } catch (error) {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted) {
+          if (!subscribed) rejectReady(controller.signal.reason);
+          return;
+        }
         if (!subscribed) {
           rejectReady(error);
           return;
@@ -722,6 +726,10 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
       }
     }
   })();
+  void watching.catch((error) => {
+    if (!subscribed) rejectReady(error);
+    else if (!controller.signal.aborted) process.stderr.write("OpenCode interaction watcher failed.\n");
+  });
   return { ready };
 }
 
