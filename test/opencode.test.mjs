@@ -16,7 +16,13 @@ import {
 } from "../src/opencode.mjs";
 
 test("removes Slack credentials from child environments regardless of casing", () => {
-  assert.deepEqual(cleanChildEnvironment({ PATH: "/bin", Slack_Bot_Token: "secret", Pipa_Slack_App_Token: "secret" }), { PATH: "/bin" });
+  assert.deepEqual(cleanChildEnvironment({
+    PATH: "/bin",
+    PIPA_CURRENT_SLACK_CHANNEL_ID: "C123",
+    Slack_Api_Token: "secret",
+    Slack_Client_Secret: "secret",
+    Pipa_Slack_App_Token: "secret",
+  }), { PATH: "/bin", PIPA_CURRENT_SLACK_CHANNEL_ID: "C123" });
 });
 
 test("starts one owned loopback server on port 0 and stops it", async () => {
@@ -160,8 +166,9 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
   const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 });
   const attachment = { name: "notes.txt", mimeType: "text/plain", fetchData: async () => Buffer.from("notes") };
 
+  const prompt = "  summarize `this`\n$HOME && echo 'exact'  \n";
   const result = await executor.runTurn({
-    prompt: "summarize",
+    prompt,
     sessionId: "ses_1",
     workingDirectory: "/work",
     contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack", PIPA_CURRENT_SLACK_CHANNEL_ID: "C1" },
@@ -169,12 +176,27 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
   });
 
   assert.deepEqual(result, { text: "first\nsecond", sessionId: "ses_1" });
-  assert.deepEqual(promptBody.parts[0], { type: "text", text: "summarize" });
+  assert.deepEqual(promptBody.parts[0], { type: "text", text: prompt });
   assert.deepEqual(promptBody.parts[1], { type: "file", mime: "text/plain", filename: "notes.txt", url: temporaryFile.href });
   assert.match(promptBody.system, /not as shell environment variables/u);
   assert.match(promptBody.system, /PIPA_MESSAGE_CHANNEL=slack/u);
   assert.match(promptBody.system, /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
+  assert.match(promptBody.system, /consult `pipa routine --help`/u);
+  assert.match(promptBody.system, /IANA timezone/u);
+  assert.match(promptBody.system, /preview first/u);
+  assert.match(promptBody.system, /create only after user confirmation/u);
   await assert.rejects(access(temporaryFile));
+});
+
+test("rejects an all-whitespace prompt before creating a session", async () => {
+  let requested = false;
+  const executor = createOpenCodeExecutor({
+    baseUrl: "http://localhost:5555",
+    fetch: async () => { requested = true; },
+  });
+
+  await assert.rejects(executor.runTurn({ prompt: " \n\t ", sessionId: null, workingDirectory: "/work" }), /prompt is required/u);
+  assert.equal(requested, false);
 });
 
 test("replaces a stale persisted session only after a successful turn", async () => {
@@ -216,6 +238,51 @@ test("does not complete until both the session is idle and a new assistant messa
     .runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" });
   assert.equal(result.text, "done");
   assert.ok(messageReads >= 3);
+});
+
+test("completes from a terminal assistant message when session status remains stale", async () => {
+  let prompted = false;
+  const fetch = async (url, init = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/session/ses_1/prompt_async") {
+      prompted = true;
+      return new Response(null, { status: 204 });
+    }
+    if (pathname === "/session/status") return jsonResponse({ ses_1: { type: prompted ? "busy" : "idle" } });
+    if (pathname === "/session/ses_1/message") {
+      return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", finish: "stop", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
+    }
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+
+  const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, timeoutMs: 50, pollIntervalMs: 1 })
+    .runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" });
+  assert.equal(result.text, "done");
+});
+
+test("waits for an active retry despite a terminal assistant message", async () => {
+  let prompted = false;
+  let statusReads = 0;
+  const fetch = async (url, init = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/session/ses_1/prompt_async") {
+      prompted = true;
+      return new Response(null, { status: 204 });
+    }
+    if (pathname === "/session/status") {
+      if (!prompted) return jsonResponse({ ses_1: { type: "idle" } });
+      return jsonResponse({ ses_1: { type: ++statusReads === 1 ? "retry" : "idle" } });
+    }
+    if (pathname === "/session/ses_1/message") {
+      return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", finish: "stop", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
+    }
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+
+  const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 })
+    .runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" });
+  assert.equal(result.text, "done");
+  assert.equal(statusReads, 2);
 });
 
 test("rejects prompt failures and aborts active requests during shutdown", async () => {
@@ -509,6 +576,27 @@ test("keeps an established event stream open beyond the request timeout", async 
 
   assert.equal(result.text, "done");
   assert.equal(eventConnections, 1);
+});
+
+test("overall timeout rejects while interaction subscription is starting", async () => {
+  const fetch = async (url, init = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/event") return new Response(new ReadableStream({ start() {} }));
+    if (pathname === "/permission") {
+      return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+    }
+    if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+    if (pathname === "/session/ses_1/message") return jsonResponse([]);
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, timeoutMs: 10, requestTimeoutMs: 1_000 });
+
+  await assert.rejects(executor.runTurn({
+    prompt: "hello",
+    sessionId: "ses_1",
+    workingDirectory: "/work",
+    onInteraction: () => undefined,
+  }), /OpenCode timed out after 10ms/u);
 });
 
 test("routes a subagent permission through its parent session", async () => {

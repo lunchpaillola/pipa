@@ -1,6 +1,6 @@
 {
   "name": "@usepipa/pipa",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "description": "Run Pipa through Slack Socket Mode with OpenCode",
   "keywords": [
     "slack",
@@ -20,7 +20,8 @@
   ],
   "scripts": {
     "test": "node --test",
-    "test:pack": "node scripts/pack-smoke.mjs"
+    "test:pack": "node scripts/pack-smoke.mjs",
+    "test:slack:routines": "node scripts/slack-routine-eval.mjs"
   },
   "engines": {
     "node": ">=22"
@@ -42,6 +43,7 @@
     "@chat-adapter/slack": "4.38.1",
     "@chat-adapter/state-memory": "4.38.1",
     "chat": "4.38.1",
-    "cross-spawn": "7.0.6"
+    "cross-spawn": "7.0.6",
+    "luxon": "3.7.2"
   }
 }

@@ -5,6 +5,9 @@ import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { canonicalWorkingDirectory, createManifest, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
 import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
+import { assertRoutineDestinationAllowed, createRoutineScheduler, loadRoutineState } from "./routines.mjs";
+
+class RoutineDeniedError extends Error {}
 
 export async function initializePipa(input, options = {}) {
   const paths = options.paths ?? pipaPaths();
@@ -65,8 +68,91 @@ export async function startPipa(options = {}) {
   }
   const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn, abortTurn: executor.abortTurn });
   let accepting = true;
-  const interactions = createPendingInteractions();
+  const interactions = createPendingInteractions(config.allowedSlackUserIds);
   const pendingReactions = new Map();
+  const routinesEnabled = options.routinesEnabled !== false;
+  const routineScheduler = routinesEnabled ? (options.createRoutineScheduler ?? createRoutineScheduler)({
+    paths,
+    intervalMs: options.routineIntervalMs,
+    setInterval: options.setRoutineInterval,
+    clearInterval: options.clearRoutineInterval,
+    now: options.routineNow,
+    abortTurn: executor.abortTurn,
+    onError: () => process.stderr.write("Pipa routine reconciliation failed.\n"),
+    execute: async (snapshot, { signal, onSession, abort }) => {
+      const authorize = async () => {
+        const current = (await loadRoutineState(paths.routines)).routines.find((routine) => routine.id === snapshot.id);
+        if (!current || (snapshot.status === "active" && current.status !== "active")) throw new PipaStoppedError();
+        const latestConfig = await loadConfig(paths.config);
+        try {
+          assertRoutineDestinationAllowed(snapshot.destination, latestConfig.allowedSlackChannelIds ?? []);
+        } catch {
+          throw new RoutineDeniedError();
+        }
+      };
+      let denied = false;
+      try {
+        await authorize();
+      } catch (error) {
+        if (error instanceof PipaStoppedError) throw error;
+        if (error instanceof RoutineDeniedError) return { status: "denied", errorCode: "destination_denied", errorSummary: "Routine destination is no longer allowed." };
+        throw error;
+      }
+      const thread = chat.thread(slackDestinationId(snapshot.destination));
+      const authorizeInteraction = async () => {
+        try {
+          return await authorize();
+        } catch (error) {
+          denied = error instanceof RoutineDeniedError;
+          await abort(error);
+          throw error;
+        }
+      };
+      let result;
+      try {
+        result = await executor.runTurn({
+          prompt: snapshot.prompt,
+          sessionId: null,
+          workingDirectory: config.workingDirectory,
+          contextEnvironment: {
+            PIPA_MESSAGE_CHANNEL: "slack",
+            PIPA_CURRENT_SLACK_CHANNEL_ID: snapshot.destination.channelId,
+            PIPA_CURRENT_SLACK_THREAD_TS: snapshot.destination.threadTs ?? "",
+            PIPA_REQUESTER_SLACK_USER_ID: "",
+          },
+          signal,
+          onSession,
+          onInteraction: (interaction) => interactions.onInteraction({
+            thread,
+            authorize: authorizeInteraction,
+            loadAllowedUserIds: async () => (await loadConfig(paths.config)).allowedSlackUserIds ?? [],
+          }, interaction),
+          onPermissionReplied: interactions.onPermissionReplied,
+          onPermissionsReconciled: interactions.onPermissionsReconciled,
+        });
+      } catch (error) {
+        if (denied) return { status: "denied", errorCode: "destination_denied", errorSummary: "Routine destination is no longer allowed." };
+        if (signal.aborted) throw error;
+        return { status: "failed", errorCode: "executor_failed", errorSummary: "Routine execution failed." };
+      }
+      try {
+        await authorize();
+        if (signal.aborted) throw signal.reason;
+        const message = await postResult(thread, result, signal);
+        const threadTs = snapshot.destination.threadTs ?? message?.id;
+        if (threadTs && result.sessionId) {
+          const conversationKey = slackDestinationId({ channelId: snapshot.destination.channelId, threadTs });
+          await sessionStore.set(conversationKey, result.sessionId);
+          await chat.thread(conversationKey).subscribe();
+        }
+      } catch (error) {
+        if (signal.aborted || error instanceof PipaStoppedError) throw error;
+        if (error instanceof RoutineDeniedError) return { status: "denied", errorCode: "destination_denied", errorSummary: "Routine destination is no longer allowed." };
+        return { status: "failed", errorCode: "delivery_failed", errorSummary: "Routine result delivery failed." };
+      }
+      return { status: "succeeded" };
+    },
+  }) : null;
   chat.onAction?.(interactions.onAction);
   chat.onModalSubmit?.("pipa_custom", interactions.onCustomAnswer);
 
@@ -126,8 +212,11 @@ export async function startPipa(options = {}) {
       await chat.thread(conversationKey).subscribe();
     }
     await withTimeout(chat.initialize(), options.startupTimeoutMs ?? 30_000, "Slack Socket Mode startup timed out.");
+    await routineScheduler?.start();
   } catch (error) {
-    await interactions.close();
+    routineScheduler?.stop(error);
+    await routineScheduler?.drain();
+    await withTimeout(interactions.close(), options.shutdownTimeoutMs ?? 15_000, "Interaction shutdown timed out.").catch(() => undefined);
     executor.stopAll();
     await withTimeout(chat.shutdown(), options.shutdownTimeoutMs ?? 15_000, "Slack shutdown timed out.").catch(() => undefined);
     server?.stop();
@@ -138,6 +227,7 @@ export async function startPipa(options = {}) {
   const stop = (reason = new PipaStoppedError()) => {
     if (!accepting) return;
     accepting = false;
+    routineScheduler?.stop(reason);
     runner.close(reason);
     executor.stopAll(reason);
   };
@@ -155,9 +245,10 @@ export async function startPipa(options = {}) {
     stop: () => stop(),
     async shutdown() {
       stop();
-      await interactions.close();
       try {
         await withTimeout((async () => {
+          await interactions.close();
+          await routineScheduler?.drain();
           await runner.drain();
           await chat.shutdown();
           server?.stop();
@@ -170,7 +261,7 @@ export async function startPipa(options = {}) {
   };
 }
 
-function createPendingInteractions() {
+export function createPendingInteractions(allowedUserIds = []) {
   const pending = new Map();
   const permissionRequests = new Map();
   const tails = new Map();
@@ -186,6 +277,9 @@ function createPendingInteractions() {
       questionIndex: 0,
       answers: [],
       resolve: null,
+      threadId: context.thread.id,
+      loadAllowedUserIds: context.loadAllowedUserIds,
+      authorize: context.authorize,
     };
     const decision = new Promise((resolve, reject) => {
       const abort = () => reject(interaction.signal.reason);
@@ -210,13 +304,19 @@ function createPendingInteractions() {
     try {
       await previous;
       if (entry.decision === undefined) {
+        await entry.authorize?.();
         entry.message = await postInteraction(context.thread, entry);
+        if (entry.threadId.endsWith(":")) entry.threadId += entry.message.id;
         if (interaction.signal.aborted) throw interaction.signal.reason;
       }
       const result = await decision;
       await submit(entry, result);
       return result;
     } finally {
+      if (entry.decision === undefined) {
+        entry.resolve?.({ type: "stopped" });
+        await submit(entry, { type: "stopped" }).catch(() => undefined);
+      }
       pending.delete(token);
       if (permissionKey) permissionRequests.delete(permissionKey);
       release();
@@ -245,6 +345,8 @@ function createPendingInteractions() {
     const token = interactionToken(event);
     const entry = pending.get(token);
     if (!entry) return;
+    if ((event.threadId ?? event.thread?.id) !== entry.threadId) return;
+    if (!await canRespond(entry, event.user)) return;
     if (event.actionId?.startsWith("pipa_dismiss_")) {
       entry.resolve?.({ type: "stop" });
       return;
@@ -277,6 +379,8 @@ function createPendingInteractions() {
   async function onCustomAnswer(event) {
     const entry = pending.get(event.privateMetadata);
     if (!entry) return;
+    if (event.relatedThread?.id !== entry.threadId) return;
+    if (!await canRespond(entry, event.user)) return;
     const answer = event.values?.answer?.trim();
     if (!answer) return { action: "errors", errors: { answer: "Enter an answer." } };
     entry.answers[entry.questionIndex] = [answer];
@@ -289,6 +393,19 @@ function createPendingInteractions() {
       entry.resolve?.({ type: "answer", answers: entry.answers, ...(selectedBy ? { selectedBy } : {}) });
     }
     else entry.message?.edit();
+  }
+
+  async function canRespond(entry, user) {
+    let currentAllowedUserIds = allowedUserIds;
+    try {
+      await entry.authorize?.();
+      if (entry.loadAllowedUserIds) currentAllowedUserIds = await entry.loadAllowedUserIds();
+    } catch {
+      return false;
+    }
+    if (!Array.isArray(currentAllowedUserIds)) return false;
+    const userId = user?.userId ?? user?.id;
+    return !currentAllowedUserIds.length || currentAllowedUserIds.includes(userId);
   }
 
   return { onInteraction, onPermissionReplied, onPermissionsReconciled, onAction, onCustomAnswer, close };
@@ -319,14 +436,15 @@ function renderSubmitted(entry, decision) {
 async function postInteraction(thread, entry) {
   const [, channel, threadTs] = thread.id.split(":");
   const client = thread.adapter?.webClient;
-  if (!client || !channel || !threadTs) throw new Error("Slack interaction context is unavailable.");
+  if (!client || !channel) throw new Error("Slack interaction context is unavailable.");
   const message = await client.chat.postMessage({
     channel,
-    thread_ts: threadTs,
+    ...(threadTs ? { thread_ts: threadTs } : {}),
     text: interactionFallback(entry),
     blocks: renderSlackInteraction(entry),
   });
   return {
+    id: message.ts,
     edit: (decision) => client.chat.update({
       channel,
       ts: message.ts,
@@ -636,21 +754,28 @@ function slackContext(thread, message) {
   };
 }
 
-async function postResult(thread, { text, files = [] }, signal) {
+export function slackDestinationId({ channelId, threadTs }) {
+  if (!channelId) throw new Error("A Slack channel ID is required.");
+  return `slack:${channelId}:${threadTs ?? ""}`;
+}
+
+export async function postResult(thread, { text, files = [] }, signal) {
   if (signal?.aborted) return;
   if (files.length) {
     try {
-      await thread.post({ markdown: text, files });
-      return;
+      return await thread.post({ markdown: text, files });
     } catch {
       // A failed adapter call may still have uploaded files, so retry text only.
     }
   }
   if (!text || signal?.aborted) return;
+  let firstMessage;
   for (const markdown of splitSlackMarkdown(text)) {
     if (signal?.aborted) return;
-    await thread.post({ markdown });
+    const message = await thread.post({ markdown });
+    firstMessage ??= message;
   }
+  return firstMessage;
 }
 
 function splitSlackMarkdown(text, limit = 3500) {

@@ -3,9 +3,12 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { checkSlackAppToken, checkSlackToken, createConversationRunner, initializePipa, startPipa } from "../src/app.mjs";
+import { checkSlackAppToken, checkSlackToken, createConversationRunner, createPendingInteractions, initializePipa, postResult, slackDestinationId, startPipa as startPipaRuntime } from "../src/app.mjs";
 import { PipaStoppedError } from "../src/opencode.mjs";
-import { createSessionStore, pipaPaths } from "../src/state.mjs";
+import { createRoutineScheduler, normalizeRoutine } from "../src/routines.mjs";
+import { createSessionStore, pipaPaths, writePrivateJson } from "../src/state.mjs";
+
+const startPipa = (options) => startPipaRuntime({ routinesEnabled: false, ...options });
 
 test("init validates dependencies before replacing config", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-init-"));
@@ -863,6 +866,224 @@ test("ignores mentions from unauthorized users or channels", async () => {
   await app.shutdown();
 });
 
+test("routine scheduler uses an exact destination and binds replies to its fresh session", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routine-app-"));
+  const paths = pipaPaths(home);
+  let now = "2026-08-29T12:00:00.000Z";
+  const config = {
+    botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: home,
+    allowedSlackChannelIds: ["C123"], allowedSlackUserIds: ["U1"],
+  };
+  await writePrivateJson(paths.config, config);
+  const routine = normalizeRoutine({
+    id: "scheduled",
+    prompt: "  exact $(prompt)\n",
+    schedule: { type: "once", at: "2026-08-29T13:00:00Z" },
+    timezone: "UTC",
+    destination: { channelId: "C123", threadTs: null },
+  }, now);
+  await writePrivateJson(paths.routines, { version: 1, routines: [routine] });
+  let intervalTick;
+  let scheduler;
+  let schedulerError;
+  const handlers = {};
+  const sessions = new Map();
+  const subscriptions = [];
+  const posts = [];
+  const calls = [];
+  const chat = {
+    onNewMention() {},
+    onSubscribedMessage(handler) { handlers.subscribed = handler; },
+    thread(id) {
+      return {
+        id,
+        channel: { isDM: false, channelVisibility: "private" },
+        adapter: { addReaction: async () => undefined, removeReaction: async () => undefined },
+        subscribe: async () => subscriptions.push(id),
+        post: async (payload) => {
+          posts.push({ id, payload });
+          return { id: id === "slack:C123:" ? "456.789" : "reply" };
+        },
+      };
+    },
+    async initialize() {},
+    async shutdown() {},
+  };
+  const app = await startPipa({
+    paths,
+    config,
+    routinesEnabled: true,
+    routineNow: () => now,
+    setRoutineInterval(callback) { intervalTick = callback; return { unref() {} }; },
+    clearRoutineInterval() {},
+    createRoutineScheduler: (options) => {
+      scheduler = createRoutineScheduler({ ...options, onError: (error) => { schedulerError = error; } });
+      return scheduler;
+    },
+    chat,
+    executor: {
+      async runTurn(input) {
+        calls.push(input);
+        input.onSession("ses_routine");
+        return { text: calls.length === 1 ? "finished" : "continued", sessionId: "ses_routine" };
+      },
+      async abortTurn() {},
+      stopAll() {},
+    },
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: {
+      keys: () => [...sessions.keys()],
+      get: (key) => sessions.get(key) ?? null,
+      async set(key, value) { sessions.set(key, value); },
+    },
+  });
+  const replacementWorkspace = await mkdtemp(path.join(os.tmpdir(), "pipa-routine-reconfigured-"));
+  await writePrivateJson(paths.config, { ...config, workingDirectory: replacementWorkspace });
+  now = "2026-08-29T13:00:00.000Z";
+  intervalTick();
+  await scheduler.drain();
+  assert.ifError(schedulerError);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].prompt, routine.prompt);
+  assert.equal(calls[0].sessionId, null);
+  assert.equal(calls[0].workingDirectory, home);
+  assert.equal(calls[0].contextEnvironment.PIPA_CURRENT_SLACK_CHANNEL_ID, "C123");
+  assert.equal(calls[0].contextEnvironment.PIPA_CURRENT_SLACK_THREAD_TS, "");
+  const conversationKey = "slack:C123:456.789";
+  assert.equal(sessions.get(conversationKey), "ses_routine");
+  assert.deepEqual(subscriptions, [conversationKey]);
+  assert.ok((await readFile(paths.routines, "utf8")).includes('"completed"'));
+
+  const replyThread = chat.thread(conversationKey);
+  await handlers.subscribed(replyThread, {
+    id: "456.790", text: "How many items?", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {},
+  });
+  await waitFor(() => calls.length === 2);
+  assert.equal(calls[1].prompt, "How many items?");
+  assert.equal(calls[1].sessionId, "ses_routine");
+  assert.deepEqual(posts, [
+    { id: "slack:C123:", payload: { markdown: "finished" } },
+    { id: conversationKey, payload: { markdown: "continued" } },
+  ]);
+  await app.shutdown();
+});
+
+test("routine scheduler distinguishes unavailable config from a disallowed destination", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routine-app-"));
+  const paths = pipaPaths(home);
+  let now = "2026-08-29T12:00:00.000Z";
+  const config = {
+    botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: home,
+    allowedSlackChannelIds: ["C123"], allowedSlackUserIds: [],
+  };
+  await writePrivateJson(paths.config, config);
+  const routine = normalizeRoutine({
+    id: "denied",
+    prompt: "do work",
+    schedule: { type: "recurring", frequency: "hours", interval: 1, times: [], weekdays: [], until: null },
+    timezone: "UTC",
+    destination: { channelId: "C123", threadTs: null },
+  }, now);
+  await writePrivateJson(paths.routines, { version: 1, routines: [routine] });
+  let intervalTick;
+  let scheduler;
+  let calls = 0;
+  const app = await startPipa({
+    paths,
+    config,
+    routinesEnabled: true,
+    routineNow: () => now,
+    setRoutineInterval(callback) { intervalTick = callback; return { unref() {} }; },
+    clearRoutineInterval() {},
+    createRoutineScheduler: (options) => {
+      scheduler = createRoutineScheduler(options);
+      return scheduler;
+    },
+    chat: { onNewMention() {}, onSubscribedMessage() {}, thread() { throw new Error("must not deliver"); }, async initialize() {}, async shutdown() {} },
+    executor: { async runTurn() { calls += 1; }, async abortTurn() {}, stopAll() {} },
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+  });
+  await writeFile(paths.config, "{");
+  now = "2026-08-29T13:00:00.000Z";
+  intervalTick();
+  await scheduler.drain();
+  const failed = JSON.parse(await readFile(paths.routines, "utf8")).routines[0];
+  assert.equal(failed.status, "active");
+  assert.equal(failed.lastRun.status, "failed");
+  assert.equal(failed.lastRun.errorCode, "executor_failed");
+
+  await writePrivateJson(paths.config, { ...config, allowedSlackChannelIds: ["C999"] });
+  now = "2026-08-29T14:00:00.000Z";
+  intervalTick();
+  await scheduler.drain();
+  const denied = JSON.parse(await readFile(paths.routines, "utf8")).routines[0];
+  assert.equal(calls, 0);
+  assert.equal(denied.lastRun.status, "denied");
+  assert.equal(denied.lastRun.errorCode, "destination_denied");
+  await app.shutdown();
+});
+
+test("routine deactivation after execution suppresses final delivery", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routine-app-"));
+  const paths = pipaPaths(home);
+  let now = "2026-08-29T12:00:00.000Z";
+  const config = {
+    botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: home,
+    allowedSlackChannelIds: ["C123"], allowedSlackUserIds: [],
+  };
+  await writePrivateJson(paths.config, config);
+  const routine = normalizeRoutine({
+    id: "cancelled",
+    prompt: "do work",
+    schedule: { type: "once", at: "2026-08-29T13:00:00Z" },
+    timezone: "UTC",
+    destination: { channelId: "C123", threadTs: null },
+  }, now);
+  await writePrivateJson(paths.routines, { version: 1, routines: [routine] });
+  let intervalTick;
+  let finish;
+  let started = false;
+  const posts = [];
+  const app = await startPipa({
+    paths,
+    config,
+    routinesEnabled: true,
+    routineNow: () => now,
+    setRoutineInterval(callback) { intervalTick = callback; return { unref() {} }; },
+    clearRoutineInterval() {},
+    chat: {
+      onNewMention() {}, onSubscribedMessage() {},
+      thread(id) { return { id, post: async (payload) => posts.push(payload) }; },
+      async initialize() {}, async shutdown() {},
+    },
+    executor: {
+      async runTurn() {
+        started = true;
+        await new Promise((resolve) => finish = resolve);
+        return { text: "must not post", sessionId: "ses_cancelled" };
+      },
+      async abortTurn() {},
+      stopAll() {},
+    },
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+  });
+  now = "2026-08-29T13:00:00.000Z";
+  intervalTick();
+  await waitFor(() => started);
+  const state = JSON.parse(await readFile(paths.routines, "utf8"));
+  state.routines[0].status = "inactive";
+  state.routines[0].nextRunAt = null;
+  await writePrivateJson(paths.routines, state);
+  finish();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(posts, []);
+  assert.equal(JSON.parse(await readFile(paths.routines, "utf8")).routines[0].lastRun, null);
+  await app.shutdown();
+});
+
 test("startup cleans up Chat when restored subscription setup fails", async () => {
   const events = [];
   const chat = {
@@ -1090,7 +1311,7 @@ test("interaction registry uses Block Kit selectors in Slack", async () => {
   assert.equal(updated[1].blocks[1].text.text, "Lola selected: “A”, “C”, “D”.");
 });
 
-test("interaction registry uses custom answer instead of an empty Slack selector", async () => {
+test("interaction registry restricts custom answers to allowed users", async () => {
   const posted = [];
   const updated = [];
   const thread = {
@@ -1125,13 +1346,15 @@ test("interaction registry uses custom answer instead of an empty Slack selector
       return { text: "done", sessionId: "ses_1" };
     },
     stopAll() {},
-  }).then(() => mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} }));
+  }, { allowedSlackUserIds: ["U1"] }).then(() => mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} }));
 
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(posted[0].blocks.some((block) => block.elements?.some((element) => ["radio_buttons", "checkboxes"].includes(element.type))), false);
   const custom = posted[0].blocks.at(-1).elements.find((element) => element.action_id.startsWith("pipa_custom_"));
-  await actionHandler({ actionId: custom.action_id, value: custom.value, thread, openModal: async () => undefined });
-  await customAnswerHandler({ privateMetadata: custom.value, values: { answer: "Orbit" }, user: { fullName: "lola" } });
+  await actionHandler({ actionId: custom.action_id, value: custom.value, user: { userId: "U1" }, thread, openModal: async () => undefined });
+  await customAnswerHandler({ privateMetadata: custom.value, values: { answer: "Wrong" }, user: { userId: "U2", fullName: "other" }, relatedThread: thread });
+  assert.equal(decision, undefined);
+  await customAnswerHandler({ privateMetadata: custom.value, values: { answer: "Orbit" }, user: { userId: "U1", fullName: "lola" }, relatedThread: thread });
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.deepEqual(decision, { type: "answer", answers: [["Orbit"]], selectedBy: "Lola" });
   assert.equal(updated[0].blocks[1].text.text, "Lola selected: “Orbit”.");
@@ -1268,7 +1491,7 @@ test("interaction registry queues concurrent permission cards", async () => {
   await actionHandler({ actionId: action.action_id, value: action.value, thread });
 });
 
-test("another user can answer an active question", async () => {
+test("another user can answer an active question when the allowlist is empty", async () => {
   const posts = [];
   const thread = slackInteractionThread({ posted: posts });
   let actionHandler;
@@ -1316,6 +1539,180 @@ test("another user can answer an active question", async () => {
   assert.deepEqual(resolvedDecision, { type: "answer", answers: [["X"]] });
 });
 
+test("only allowed users can answer an active question", async () => {
+  const posts = [];
+  const thread = slackInteractionThread({ posted: posts });
+  let actionHandler;
+  let mention;
+  const chat = {
+    onNewMention(handler) { mention = handler; },
+    onSubscribedMessage() {},
+    onAction(ids, handler) { actionHandler = handler ?? ids; },
+    async initialize() {},
+    async shutdown() {},
+  };
+  let resolvedDecision = null;
+  void startInteractionPipa(chat, {
+    runTurn: async ({ onInteraction }) => {
+      resolvedDecision = await onInteraction({
+        type: "question",
+        request: { questions: [{ header: "Q", question: "Pick", options: [{ label: "X" }] }] },
+        signal: AbortSignal.timeout(5000),
+      });
+      return { text: "done", sessionId: "ses_1" };
+    },
+    stopAll() {},
+  }, { allowedSlackUserIds: ["U1"] }).then(() => mention(thread, { text: "@Pipa go", author: { id: "U1", userId: "U1", isMe: false, isBot: false }, raw: {} }));
+
+  await waitFor(() => posts.length === 1);
+  const radio = posts[0].blocks.find((block) => block.type === "actions").elements[0];
+  const submit = slackAction(posts[0], "pipa_submit_");
+  await actionHandler({ actionId: radio.action_id, value: radio.options[0].value, user: { userId: "U2" }, thread });
+  await actionHandler({ actionId: submit.action_id, value: submit.value, user: { userId: "U2" }, thread });
+  assert.equal(resolvedDecision, null);
+
+  await actionHandler({ actionId: radio.action_id, value: radio.options[0].value, user: { userId: "U1" }, thread });
+  await actionHandler({ actionId: submit.action_id, value: submit.value, user: { userId: "U1" }, thread });
+  await waitFor(() => resolvedDecision);
+  assert.deepEqual(resolvedDecision, { type: "answer", answers: [["X"]] });
+});
+
+test("routine interactions and results target an exact channel or existing thread", async () => {
+  for (const destination of [
+    { channelId: "C1" },
+    { channelId: "C1", threadTs: "123.456" },
+  ]) {
+    const posted = [];
+    const results = [];
+    const target = slackInteractionThread({ id: slackDestinationId(destination), posted });
+    target.post = async (payload) => results.push({ id: target.id, payload });
+    const interactions = createPendingInteractions();
+
+    const question = interactions.onInteraction({ thread: target }, {
+      type: "question",
+      sessionId: "ses_question",
+      request: { id: "req_1", questions: [{ header: "Q", question: "Pick", options: [{ label: "X" }] }] },
+      signal: AbortSignal.timeout(5000),
+    });
+    await waitFor(() => posted.length === 1);
+    const actionThreadId = destination.threadTs ? target.id : `${target.id}1.0`;
+    const radio = posted[0].blocks.find((block) => block.type === "actions").elements[0];
+    await interactions.onAction({ actionId: radio.action_id, value: radio.options[0].value, user: { userId: "U1" }, threadId: actionThreadId });
+    const submit = slackAction(posted[0], "pipa_submit_");
+    await interactions.onAction({ actionId: submit.action_id, value: submit.value, user: { userId: "U1" }, threadId: actionThreadId });
+    assert.deepEqual(await question, { type: "answer", answers: [["X"]] });
+
+    const permission = interactions.onInteraction({ thread: target }, {
+      type: "permission",
+      sessionId: "ses_permission",
+      request: { id: "perm_1", permission: "read", patterns: ["file.txt"] },
+      signal: AbortSignal.timeout(5000),
+    });
+    await waitFor(() => posted.length === 2);
+    const permissionThreadId = destination.threadTs ? target.id : `${target.id}2.0`;
+    const allow = slackAction(posted[1], "pipa_permission_once_");
+    await interactions.onAction({ actionId: allow.action_id, value: allow.value, user: { userId: "U1" }, threadId: permissionThreadId });
+    assert.deepEqual(await permission, { type: "reply", reply: "once" });
+
+    await postResult(target, { text: "complete" });
+    assert.deepEqual(posted.map(({ channel, thread_ts }) => ({ channel, thread_ts })), [
+      { channel: "C1", thread_ts: destination.threadTs },
+      { channel: "C1", thread_ts: destination.threadTs },
+    ]);
+    assert.deepEqual(results, [{ id: slackDestinationId(destination), payload: { markdown: "complete" } }]);
+  }
+});
+
+test("routine interaction callbacks reload responder authorization", async () => {
+  const posted = [];
+  const target = slackInteractionThread({ id: "slack:C1:", posted });
+  let allowedUserIds = ["U1"];
+  const interactions = createPendingInteractions();
+  const loadAllowedUserIds = async () => allowedUserIds;
+
+  let permissionDecision;
+  const permission = interactions.onInteraction({ thread: target, loadAllowedUserIds }, {
+    type: "permission",
+    sessionId: "ses_permission",
+    request: { id: "perm_1", permission: "read", patterns: ["file.txt"] },
+    signal: AbortSignal.timeout(5000),
+  }).then((value) => permissionDecision = value);
+  await waitFor(() => posted.length === 1);
+  const allow = slackAction(posted[0], "pipa_permission_once_");
+  allowedUserIds = ["U2"];
+  await interactions.onAction({ actionId: allow.action_id, value: allow.value, user: { userId: "U1" }, threadId: "slack:C1:1.0" });
+  assert.equal(permissionDecision, undefined);
+  await interactions.onAction({ actionId: allow.action_id, value: allow.value, user: { userId: "U2" }, threadId: "slack:C1:1.0" });
+  await permission;
+
+  let answerDecision;
+  const answer = interactions.onInteraction({ thread: target, loadAllowedUserIds }, {
+    type: "question",
+    sessionId: "ses_question",
+    request: { id: "req_1", header: "Name", question: "Name?", custom: true },
+    signal: AbortSignal.timeout(5000),
+  }).then((value) => answerDecision = value);
+  await waitFor(() => posted.length === 2);
+  const custom = slackAction(posted[1], "pipa_custom_");
+  allowedUserIds = ["U1"];
+  const relatedThread = { id: "slack:C1:2.0" };
+  await interactions.onCustomAnswer({ privateMetadata: custom.value, values: { answer: "Wrong" }, user: { userId: "U2" }, relatedThread });
+  assert.equal(answerDecision, undefined);
+  await interactions.onCustomAnswer({ privateMetadata: custom.value, values: { answer: "Orbit" }, user: { userId: "U1" }, relatedThread });
+  await answer;
+  assert.deepEqual(answerDecision, { type: "answer", answers: [["Orbit"]] });
+});
+
+test("routine interactions reauthorize before posting and accepting responses", async () => {
+  const posted = [];
+  const deleted = [];
+  const target = slackInteractionThread({ posted, deleted });
+  const interactions = createPendingInteractions();
+  const request = {
+    type: "permission",
+    sessionId: "ses_permission",
+    request: { id: "perm_1", permission: "read", patterns: ["file.txt"] },
+    signal: AbortSignal.timeout(5000),
+  };
+  await assert.rejects(interactions.onInteraction({ thread: target, authorize: async () => { throw new Error("denied"); } }, request), /denied/u);
+  assert.deepEqual(posted, []);
+
+  let authorized = true;
+  let decision;
+  const pending = interactions.onInteraction({
+    thread: target,
+    authorize: async () => { if (!authorized) throw new Error("denied"); },
+  }, request).then((value) => decision = value);
+  await waitFor(() => posted.length === 1);
+  authorized = false;
+  const allow = slackAction(posted[0], "pipa_permission_once_");
+  await interactions.onAction({ actionId: allow.action_id, value: allow.value, user: { userId: "U1" }, thread: { id: "slack:C999:9.0" } });
+  assert.equal(decision, undefined);
+  await interactions.onAction({ actionId: allow.action_id, value: allow.value, user: { userId: "U1" }, thread: target });
+  assert.equal(decision, undefined);
+  await interactions.close();
+  await pending;
+  assert.equal(deleted.length, 1);
+});
+
+test("aborting an interaction removes its Slack card", async () => {
+  const posted = [];
+  const deleted = [];
+  const target = slackInteractionThread({ posted, deleted });
+  const interactions = createPendingInteractions();
+  const controller = new AbortController();
+  const pending = interactions.onInteraction({ thread: target }, {
+    type: "question",
+    sessionId: "ses_question",
+    request: { id: "req_1", header: "Name", question: "Name?", custom: true },
+    signal: controller.signal,
+  });
+  await waitFor(() => posted.length === 1);
+  controller.abort(new Error("stopped"));
+  await assert.rejects(pending, /stopped/u);
+  assert.equal(deleted.length, 1);
+});
+
 function slackInteractionThread({ id = "slack:C1:1.0", posted = [], updated = [], deleted = [] } = {}) {
   return {
     id,
@@ -1334,19 +1731,19 @@ function slackAction(message, prefix) {
   return message.blocks.flatMap((block) => block.elements ?? []).find((element) => element.action_id?.startsWith(prefix));
 }
 
-function startInteractionPipa(chat, executor) {
+function startInteractionPipa(chat, executor, config = {}) {
   return startPipa({
     chat,
     executor,
     checkSlackToken: async () => ({ ok: true }),
-    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work", ...config },
     sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
   });
 }
 
 async function waitFor(predicate) {
   for (let attempt = 0; attempt < 100; attempt++) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
   throw new Error("Timed out waiting for test condition.");

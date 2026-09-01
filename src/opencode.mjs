@@ -5,12 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-const SECRET_ENV_KEYS = new Set([
-  "PIPA_SLACK_APP_TOKEN",
-  "PIPA_SLACK_BOT_TOKEN",
-  "SLACK_APP_TOKEN",
-  "SLACK_BOT_TOKEN",
-]);
+const SLACK_SECRET_ENV_KEY = /(?:^|_)SLACK(?:_[A-Z0-9]+)*_(?:TOKEN|SECRET)$/iu;
 const LISTENING_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+/u;
 
 export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
@@ -26,7 +21,7 @@ export class PipaStoppedError extends Error {
 }
 
 export function cleanChildEnvironment(environment = process.env) {
-  return Object.fromEntries(Object.entries(environment).filter(([key]) => !SECRET_ENV_KEYS.has(key.toUpperCase())));
+  return Object.fromEntries(Object.entries(environment).filter(([key]) => !SLACK_SECRET_ENV_KEY.test(key)));
 }
 
 export async function startSocketOpenCodeServer(config, options = {}) {
@@ -202,7 +197,7 @@ export function createOpenCodeExecutor(options = {}) {
         }
         await request(`/session/${encodeURIComponent(selectedSessionId)}/prompt_async`, {
           method: "POST",
-          body: JSON.stringify(promptBody(prompt.trim(), files, contextEnvironment, artifactDirectory)),
+          body: JSON.stringify(promptBody(prompt, files, contextEnvironment, artifactDirectory)),
         }, workingDirectory, controller, [204]);
 
         while (true) {
@@ -214,7 +209,7 @@ export function createOpenCodeExecutor(options = {}) {
           const status = statuses?.[selectedSessionId]?.type;
           if (dismissed && status !== "busy" && status !== "retry") return { text: "", sessionId: selectedSessionId };
           if (["error", "failed", "cancelled"].includes(status) || finalMessage?.error) throw new Error("OpenCode failed to complete the turn.");
-          if (finalMessage && (status === "idle" || (!status && finalMessage.completed))) {
+          if (finalMessage && ((status !== "retry" && finalMessage.completed && finalMessage.finish === "stop") || status === "idle" || (!status && finalMessage.completed))) {
             if (!finalMessage.text && permissionRejected) return { text: "Stopped after a permission was rejected.", sessionId: selectedSessionId };
             if (!finalMessage.text) throw new Error("OpenCode completed without assistant text.");
             const parsed = slackTurn ? parseArtifactDeclaration(finalMessage.text) : { text: finalMessage.text };
@@ -377,7 +372,7 @@ async function stageAttachments(attachments, temporaryDirectory, timeoutMs, useD
 function promptBody(prompt, files, contextEnvironment, artifactDirectory) {
   const parts = [{ type: "text", text: prompt }, ...files.map((file) => ({ type: "file", ...file }))];
   const context = Object.entries(contextEnvironment).filter(([, value]) => value !== undefined && value !== null && String(value));
-  const instructions = [];
+  const instructions = ["For scheduling requests, consult `pipa routine --help`, convert timezone wording to an IANA timezone, preview first, show the normalized details, and create only after user confirmation."];
   if (context.length) instructions.push(`Slack context for this turn (provided here, not as shell environment variables):\n${context.map(([key, value]) => `${key}=${value}`).join("\n")}`);
   if (contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack") {
     instructions.push("Keep naturally short answers inline. For deeper work or larger deliverables, keep the Slack response concise and use the most suitable artifact format.");
@@ -471,6 +466,7 @@ function latestAssistantMessage(messages, baseline) {
     return {
       completed: typeof message.info.time?.completed === "number",
       error: message.info.error,
+      finish: message.info.finish,
       text: message.parts
         .filter((part) => part.type === "text" && typeof part.text === "string" && part.text)
         .map((part) => part.text)
@@ -682,7 +678,7 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
     }
   };
 
-  void (async () => {
+  const watching = (async () => {
     while (!controller.signal.aborted) {
       try {
         const url = serverUrl(baseUrl, "/event", workingDirectory);
@@ -718,7 +714,10 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
         await reconcile();
         await delay(250, controller.signal).catch(() => undefined);
       } catch (error) {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted) {
+          if (!subscribed) rejectReady(controller.signal.reason);
+          return;
+        }
         if (!subscribed) {
           rejectReady(error);
           return;
@@ -727,6 +726,10 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
       }
     }
   })();
+  void watching.catch((error) => {
+    if (!subscribed) rejectReady(error);
+    else if (!controller.signal.aborted) process.stderr.write("OpenCode interaction watcher failed.\n");
+  });
   return { ready };
 }
 
