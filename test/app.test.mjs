@@ -634,7 +634,7 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   assert.deepEqual(restored.slice(-2), ["stopped", "shutdown"]);
 });
 
-test("Slack prompts include full rich-text link URLs", async () => {
+test("Slack prompts include full and prefix rich-text link URLs", async () => {
   const handlers = {};
   const calls = [];
   const chat = {
@@ -658,17 +658,18 @@ test("Slack prompts include full rich-text link URLs", async () => {
     post: async () => undefined,
   };
   const url = "https://app.notion.com/p/lunchpaillabs/full-page-id?v=full-view-id";
+  const prefixUrl = "https://example.com";
 
   await handlers.mention(thread, {
     id: "1",
-    text: "<@U1> review app.notion.com/p/lunchpaillabs/…?v=…",
-    links: [{ url }],
+    text: "<@U1> review app.notion.com/p/lunchpaillabs/…?v=… and https://example.com/docs",
+    links: [{ url }, { url: prefixUrl }],
     author: { userId: "U1" },
     raw: {},
   });
   await waitFor(() => calls.length === 1);
 
-  assert.equal(calls[0], `review app.notion.com/p/lunchpaillabs/…?v=…\n\nFull links:\n${url}`);
+  assert.equal(calls[0], `review app.notion.com/p/lunchpaillabs/…?v=… and https://example.com/docs\n\nFull links:\n${url}\n${prefixUrl}`);
   await app.shutdown();
 });
 

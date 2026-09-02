@@ -167,7 +167,7 @@ export async function startPipa(options = {}) {
     if (!accepting || !isAuthorized(thread, message, config) || shouldIgnore(thread, message)) return;
     const messageText = subscribe || message.isMention ? stripMention(message.text) : message.text.trim();
     const missingLinks = (message.links ?? []).map((link) => link.url)
-      .filter((url) => typeof url === "string" && !messageText.includes(url));
+      .filter((url) => typeof url === "string" && !messageText.split(/\s+/u).includes(url));
     const prompt = missingLinks.length ? `${messageText}\n\nFull links:\n${[...new Set(missingLinks)].join("\n")}` : messageText;
     if (!prompt) return;
     const attachments = message.attachments ?? [];
