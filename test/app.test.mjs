@@ -634,6 +634,45 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   assert.deepEqual(restored.slice(-2), ["stopped", "shutdown"]);
 });
 
+test("Slack prompts include full and prefix rich-text link URLs", async () => {
+  const handlers = {};
+  const calls = [];
+  const chat = {
+    onNewMention(handler) { handlers.mention = handler; },
+    onSubscribedMessage() {},
+    async initialize() {},
+    async shutdown() {},
+  };
+  const app = await startPipa({
+    chat,
+    executor: { runTurn: async ({ prompt }) => { calls.push(prompt); return { text: "ok", sessionId: "ses_1" }; }, stopAll() {} },
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+  });
+  const thread = {
+    id: "slack:C1:1.0",
+    adapter: { addReaction: async () => undefined, removeReaction: async () => undefined },
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async () => undefined,
+  };
+  const url = "https://app.notion.com/p/lunchpaillabs/full-page-id?v=full-view-id";
+  const prefixUrl = "https://example.com";
+
+  await handlers.mention(thread, {
+    id: "1",
+    text: "<@U1> review app.notion.com/p/lunchpaillabs/…?v=… and https://example.com/docs",
+    links: [{ url }, { url: prefixUrl }],
+    author: { userId: "U1" },
+    raw: {},
+  });
+  await waitFor(() => calls.length === 1);
+
+  assert.equal(calls[0], `review app.notion.com/p/lunchpaillabs/…?v=… and https://example.com/docs\n\nFull links:\n${url}\n${prefixUrl}`);
+  await app.shutdown();
+});
+
 test("Slack posts short text and artifacts once", async () => {
   const files = [
     { filename: "report.csv", data: Buffer.from("a,b\n1,2\n") },
