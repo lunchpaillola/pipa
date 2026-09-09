@@ -20,7 +20,7 @@ export async function updateStats({ statsPath = new URL("../STATS.md", import.me
   } catch {
     throw new Error("npm downloads response was not valid JSON");
   }
-  const downloads = validateDownloads(payload, target);
+  const downloads = validateDownloads(payload, start, target);
   const previous = rows.at(-1)?.cumulative;
   const addedDownloads = downloads.reduce((total, entry) => total + entry.downloads, 0);
   const change = previous === undefined ? "n/a" : addedDownloads;
@@ -37,6 +37,7 @@ function parseStats(content) {
   const rows = content.slice(header.length).trimEnd().split("\n").filter(Boolean).map((line) => {
     const match = /^\| (\d{4}-\d{2}-\d{2}) \| (\d+) \| (n\/a|\d+) \|$/u.exec(line);
     if (!match) throw new Error("Invalid STATS.md row");
+    if (!isDate(match[1])) throw new Error("Invalid STATS.md date");
     return { date: match[1], cumulative: Number(match[2]), change: match[3] };
   });
   for (let index = 0; index < rows.length; index += 1) {
@@ -62,14 +63,24 @@ function nextDate(date) {
   return next.toISOString().slice(0, 10);
 }
 
-function validateDownloads(payload, target) {
+function validateDownloads(payload, start, target) {
   if (payload?.package !== packageName || !Array.isArray(payload.downloads)) throw new Error("Invalid npm downloads response");
-  const downloads = payload.downloads.filter((entry) => entry?.day <= target);
-  if (!downloads.some((entry) => entry.day === target)) throw new Error("npm downloads response is missing target date");
-  if (downloads.some((entry) => !/^\d{4}-\d{2}-\d{2}$/u.test(entry?.day) || !Number.isSafeInteger(entry.downloads) || entry.downloads < 0)) {
+  if (payload.downloads.some((entry) => !isDate(entry?.day) || !Number.isSafeInteger(entry.downloads) || entry.downloads < 0)) {
     throw new Error("Invalid npm downloads response");
   }
+  const downloads = payload.downloads.filter((entry) => entry.day <= target);
+  if (!downloads.length || downloads.at(-1).day !== target || (start !== "2020-01-01" && downloads[0].day !== start)) {
+    throw new Error("npm downloads response is missing requested dates");
+  }
+  for (let index = 1; index < downloads.length; index += 1) {
+    if (downloads[index].day !== nextDate(downloads[index - 1].day)) throw new Error("npm downloads response is missing requested dates");
+  }
   return downloads;
+}
+
+function isDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(value)) return false;
+  return new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

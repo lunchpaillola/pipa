@@ -43,9 +43,22 @@ test("fails closed when source data or existing history is invalid", async () =>
       date: new Date("2025-03-11T12:00:00Z"),
       fetchImpl: async () => ({ ok: true, json: async () => ({ package: "@usepipa/pipa", downloads: [{ day: "2025-03-09", downloads: 10 }] }) }),
     }),
-    /missing target date/u,
+    /missing requested dates/u,
   );
   assert.equal(await readFile(statsPath, "utf8"), existing);
+
+  await writeFile(statsPath, "");
+  await assert.rejects(
+    updateStats({
+      statsPath,
+      date: new Date("2025-03-11T12:00:00Z"),
+      fetchImpl: async () => ({ ok: true, json: async () => ({ package: "@usepipa/pipa", downloads: [{ day: "2025-03-08", downloads: 8 }, { day: "2025-03-10", downloads: 3 }] }) }),
+    }),
+    /missing requested dates/u,
+  );
+
+  await writeFile(statsPath, `${header}| 2025-02-30 | 10 | n/a |\n`);
+  await assert.rejects(updateStats({ statsPath, fetchImpl: async () => ({ ok: false }) }), /Invalid STATS.md date/u);
 
   await writeFile(statsPath, "bad history");
   await assert.rejects(updateStats({ statsPath, date: new Date("2025-03-11T12:00:00Z"), fetchImpl: async () => ({ ok: false }) }), /Invalid STATS.md/u);
