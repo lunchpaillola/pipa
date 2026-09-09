@@ -19,6 +19,7 @@ Pipa is a Node.js command-line application with Socket and Managed profile modes
 GitHub-specific automation.
 
 - `.github/workflows/ci.yml`: Runs continuous integration for every pull request and every push to `main`. GitHub creates one job each for Ubuntu, macOS, and Windows. Each job checks out the repository, installs Node.js 22, installs the exact dependencies from `package-lock.json`, runs the unit and integration tests, then packs and smoke-tests the installable CLI. The operating-system matrix catches platform-specific problems before release.
+- `.github/workflows/stats.yml`: Runs daily and on manual dispatch to validate and update the committed npm-download statistics. It uses only `contents: write`, serializes runs, and commits `STATS.md` only when the generated file changed.
 
 ### `bin/`
 
@@ -37,6 +38,7 @@ Long-form repository documentation.
 Repository maintenance and release checks that are not part of the installed runtime.
 
 - `scripts/pack-smoke.mjs`: Tests the package users will actually receive. It packs and installs the archive in a temporary directory, verifies version, routine help and side-effect-free preview, Local initialization, and cancellation, then starts a Managed profile with a fake OpenCode executable that checks arguments, working directory, and inherited environment without Slack credentials. It removes the temporary artifact when finished.
+- `scripts/stats.mjs`: Fetches validated npm download data for `@usepipa/pipa` and appends one completed UTC-day snapshot to `STATS.md`. It fails without changing existing statistics when the source data or prior file is unsafe.
 
 ### `src/`
 
@@ -60,6 +62,7 @@ Tests run by Node's built-in test runner through `npm test`.
 ### Root files
 
 - `.gitignore`: Keeps generated dependencies, package archives, local environment variables, macOS metadata, and local OpenCode state out of Git.
+- `STATS.md`: Public daily npm package download snapshots. Counts are not installs, users, active users, or conversions.
 - `CONTRIBUTING.md`: Gives contributors the supported Node.js version, local verification commands, and expectations for focused changes and secret handling.
 - `LICENSE`: Contains the Apache License 2.0 terms under which Pipa is distributed.
 - `package-lock.json`: Locks the full npm dependency graph to exact versions so local development and CI install the same packages.
