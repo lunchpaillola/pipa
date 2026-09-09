@@ -51,10 +51,8 @@ function parseStats(content) {
 
 function targetDate(rows, date) {
   const completed = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() - 1)).toISOString().slice(0, 10);
-  if (!rows.length) return completed;
-  const next = new Date(`${rows.at(-1).date}T00:00:00Z`);
-  const dateAfterLastRow = nextDate(next.toISOString().slice(0, 10));
-  return dateAfterLastRow < completed ? dateAfterLastRow : completed;
+  const next = rows.length ? nextDate(rows.at(-1).date) : completed;
+  return next < completed ? next : completed;
 }
 
 function nextDate(date) {
