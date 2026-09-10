@@ -28,6 +28,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           git diff --quiet -- STATS.md && exit 0
+          if git ls-remote --exit-code --heads origin chore/download-statistics >/dev/null 2>&1; then
+            git fetch origin chore/download-statistics:refs/remotes/origin/chore/download-statistics
+          fi
           git switch -c chore/download-statistics
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
