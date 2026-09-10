@@ -2,11 +2,12 @@ name: Update download statistics
 
 on:
   schedule:
-    - cron: "0 12 * * *"
+    - cron: "0 8 * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: download-statistics
@@ -22,11 +23,23 @@ jobs:
           node-version: 22
       - run: node --test test/stats.test.mjs
       - run: node scripts/stats.mjs
-      - name: Commit statistics
+      - name: Open statistics pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git diff --quiet -- STATS.md && exit 0
+          if git ls-remote --exit-code --heads origin chore/download-statistics >/dev/null 2>&1; then
+            git fetch origin chore/download-statistics:refs/remotes/origin/chore/download-statistics
+          fi
+          git switch -c chore/download-statistics
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add STATS.md
           git commit -m "chore(stats): update download statistics"
-          git push
+          git push --force-with-lease origin HEAD:chore/download-statistics
+          pr_number="$(gh pr list --head chore/download-statistics --base main --state open --json number --jq '.[0].number')"
+          if [ -n "$pr_number" ]; then
+            gh pr edit "$pr_number" --title "chore(stats): update download statistics" --body "Automated npm download-statistics update."
+          else
+            gh pr create --base main --head chore/download-statistics --title "chore(stats): update download statistics" --body "Automated npm download-statistics update."
+          fi
