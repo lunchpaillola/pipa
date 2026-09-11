@@ -7,8 +7,8 @@ const packageName = "@usepipa/pipa";
 export async function updateStats({ statsPath = new URL("../STATS.md", import.meta.url), date = new Date(), fetchImpl = fetch } = {}) {
   const existing = await readFile(statsPath, "utf8").catch((error) => error.code === "ENOENT" ? "" : Promise.reject(error));
   const rows = parseStats(existing);
-  const target = targetDate(rows, date);
-  if (rows.some((row) => row.date === target)) return false;
+  const target = completedDate(date);
+  if (rows.at(-1)?.date >= target) return false;
 
   const start = rows.length ? nextDate(rows.at(-1).date) : "2020-01-01";
   const response = await fetchImpl(`https://api.npmjs.org/downloads/range/${start}:${target}/${packageName}`, { signal: AbortSignal.timeout(15_000) });
@@ -22,11 +22,18 @@ export async function updateStats({ statsPath = new URL("../STATS.md", import.me
   }
   const downloads = validateDownloads(payload, start, target);
   const previous = rows.at(-1)?.cumulative;
-  const addedDownloads = downloads.reduce((total, entry) => total + entry.downloads, 0);
-  const change = previous === undefined ? "n/a" : addedDownloads;
-  const cumulative = (previous ?? 0) + addedDownloads;
+  if (previous === undefined) {
+    const cumulative = downloads.reduce((total, entry) => total + entry.downloads, 0);
+    await writeFile(statsPath, `${header}| ${target} | ${cumulative} | n/a |\n`);
+    return true;
+  }
 
-  await writeFile(statsPath, `${existing || header}| ${target} | ${cumulative} | ${change} |\n`);
+  let cumulative = previous;
+  const appended = downloads.map((entry) => {
+    cumulative += entry.downloads;
+    return `| ${entry.day} | ${cumulative} | ${entry.downloads} |`;
+  });
+  await writeFile(statsPath, `${existing}${appended.join("\n")}\n`);
   return true;
 }
 
@@ -49,10 +56,8 @@ function parseStats(content) {
   return rows;
 }
 
-function targetDate(rows, date) {
-  const completed = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() - 1)).toISOString().slice(0, 10);
-  const next = rows.length ? nextDate(rows.at(-1).date) : completed;
-  return next < completed ? next : completed;
+function completedDate(date) {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() - 1)).toISOString().slice(0, 10);
 }
 
 function nextDate(date) {
