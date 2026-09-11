@@ -64,3 +64,17 @@ test("fails closed when source data or existing history is invalid", async () =>
   await assert.rejects(updateStats({ statsPath, date: new Date("2025-03-11T12:00:00Z"), fetchImpl: async () => ({ ok: false }) }), /Invalid STATS.md/u);
   assert.equal(await readFile(statsPath, "utf8"), "bad history");
 });
+
+test("catches up every missing completed day in one update", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "pipa-stats-"));
+  const statsPath = path.join(directory, "STATS.md");
+  await writeFile(statsPath, `${header}| 2025-03-08 | 10 | n/a |\n`);
+
+  await updateStats({
+    statsPath,
+    date: new Date("2025-03-11T12:00:00Z"),
+    fetchImpl: async () => ({ ok: true, json: async () => ({ package: "@usepipa/pipa", downloads: [{ day: "2025-03-09", downloads: 8 }, { day: "2025-03-10", downloads: 6 }] }) }),
+  });
+
+  assert.equal(await readFile(statsPath, "utf8"), `${header}| 2025-03-08 | 10 | n/a |\n| 2025-03-09 | 18 | 8 |\n| 2025-03-10 | 24 | 6 |\n`);
+});
