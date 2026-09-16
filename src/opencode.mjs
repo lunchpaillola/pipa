@@ -121,7 +121,7 @@ export function createOpenCodeExecutor(options = {}) {
     }
   }
 
-  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
+  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled, onPermissionRejected }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     if (stopReason) throw stopReason;
     const temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
@@ -189,7 +189,10 @@ export function createOpenCodeExecutor(options = {}) {
             onInteraction,
             onPermissionReplied,
             onPermissionsReconciled,
-            onPermissionRejected: () => { permissionRejected = true; },
+            onPermissionRejected: () => {
+              permissionRejected = true;
+              onPermissionRejected?.();
+            },
             onDismiss: () => { dismissed = true; },
             requestTurn: request,
           });
@@ -756,8 +759,8 @@ async function settleInteraction({ type, requestId, sessionId, request: interact
     } else if (type === "permission" && (decision?.type === "reply" || decision?.type === "reject")) {
       const reply = decision.type === "reject" ? "reject" : decision.reply;
       if (!["once", "always", "reject"].includes(reply)) throw new Error("Invalid OpenCode permission decision.");
-      if (reply === "reject") onPermissionRejected?.();
       await requestTurn(`/permission/${encodeURIComponent(requestId)}/reply`, { method: "POST", body: JSON.stringify({ reply }) }, workingDirectory, controller, [200, 204, 404], false);
+      if (reply === "reject") onPermissionRejected?.();
     } else {
       throw new Error(`Invalid OpenCode ${type} decision.`);
     }
