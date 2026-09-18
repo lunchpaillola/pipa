@@ -93,6 +93,7 @@ export async function startPipa(options = {}) {
       let denied = false;
       let permissionRejected = null;
       let permissionResource = "the requested resource";
+      let routineSessionId;
       try {
         await authorize();
       } catch (error) {
@@ -123,7 +124,10 @@ export async function startPipa(options = {}) {
             PIPA_REQUESTER_SLACK_USER_ID: "",
           },
           signal,
-          onSession,
+          onSession: async (sessionId) => {
+            routineSessionId = sessionId;
+            await onSession(sessionId);
+          },
           onInteraction: (interaction) => {
             if (interaction.type === "permission") {
               permissionResource = interaction.request?.permission === "external_directory" ? "an external directory" : "the requested resource";
@@ -142,6 +146,8 @@ export async function startPipa(options = {}) {
               errorSummary: `Automatically rejected permission to access ${permissionResource}.`,
               message: `Routine blocked: Pipa automatically rejected permission to access ${permissionResource}. Update the routine to avoid that access, then run it again.`,
             };
+            // Do not let a rejected subagent permission leave the parent turn running.
+            if (routineSessionId) void executor.abortTurn(routineSessionId, new Error("Pipa rejected a routine permission.")).catch(() => undefined);
           },
           onPermissionReplied: interactions.onPermissionReplied,
           onPermissionsReconciled: interactions.onPermissionsReconciled,

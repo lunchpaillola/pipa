@@ -1081,6 +1081,7 @@ test("routine permissions are rejected and reported without creating Slack contr
   const posts = [];
   const subscriptions = [];
   const decisions = [];
+  const aborts = [];
   const app = await startPipa({
     paths,
     config,
@@ -1096,11 +1097,12 @@ test("routine permissions are rejected and reported without creating Slack contr
     },
     executor: {
       async runTurn(input) {
+        await input.onSession("ses_routine");
         decisions.push(await input.onInteraction({ type: "permission", request: { permission: "external_directory" }, signal: new AbortController().signal }));
         input.onPermissionRejected();
         return { text: "Stopped after a permission was rejected.", sessionId: "ses_routine" };
       },
-      async abortTurn() {},
+      async abortTurn(sessionId) { aborts.push(sessionId); },
       stopAll() {},
     },
     checkSlackToken: async () => ({ ok: true }),
@@ -1111,6 +1113,7 @@ test("routine permissions are rejected and reported without creating Slack contr
   await scheduler.drain();
   const routine = JSON.parse(await readFile(paths.routines, "utf8")).routines[0];
   assert.deepEqual(decisions, [{ type: "reject" }]);
+  assert.deepEqual(aborts, ["ses_routine"]);
   assert.equal(routine.lastRun.errorCode, "permission_auto_rejected");
   assert.deepEqual(subscriptions, []);
   assert.match(routine.lastRun.errorSummary, /external directory/u);
