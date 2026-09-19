@@ -736,7 +736,12 @@ async function settleInteraction({ type, requestId, sessionId, request: interact
     } else if (type === "permission" && (decision?.type === "reply" || decision?.type === "reject")) {
       const reply = decision.type === "reject" ? "reject" : decision.reply;
       if (!["once", "always", "reject"].includes(reply)) throw new Error("Invalid OpenCode permission decision.");
-      await requestTurn(`/permission/${encodeURIComponent(requestId)}/reply`, { method: "POST", body: JSON.stringify({ reply }) }, workingDirectory, controller, [200, 204, 404], false);
+      try {
+        await requestTurn(`/permission/${encodeURIComponent(requestId)}/reply`, { method: "POST", body: JSON.stringify({ reply }) }, workingDirectory, controller, [200, 204], false);
+      } catch (error) {
+        if (error instanceof OpenCodeRequestError && error.status === 404) return;
+        throw error;
+      }
       if (reply === "reject") onPermissionRejected?.();
     } else {
       throw new Error(`Invalid OpenCode ${type} decision.`);

@@ -690,6 +690,34 @@ test("reports a rejected permission when OpenCode completes without text", async
   assert.deepEqual(result, { text: "Stopped after a permission was rejected.", sessionId: "ses_1" });
 });
 
+test("does not report a rejected permission when its reply is stale", async () => {
+  let prompted = false;
+  let rejected = false;
+  const fetch = async (url, init = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === "/event" && init?.headers?.accept === "text/event-stream") {
+      return sseResponse("permission.asked", { sessionID: "ses_1", id: "perm_1" });
+    }
+    if (parsed.pathname === "/question" || parsed.pathname === "/permission") return jsonResponse([]);
+    if (parsed.pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+    if (parsed.pathname === "/session/ses_1/message") {
+      return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
+    }
+    if (parsed.pathname.endsWith("/prompt_async")) { prompted = true; return new Response(null, { status: 204 }); }
+    if (parsed.pathname.startsWith("/permission/") && parsed.pathname.endsWith("/reply")) return new Response(null, { status: 404 });
+    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+  };
+  const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 }).runTurn({
+    prompt: "go",
+    sessionId: "ses_1",
+    workingDirectory: "/work",
+    onInteraction: () => ({ type: "reject" }),
+    onPermissionRejected: () => { rejected = true; },
+  });
+  assert.equal(result.text, "done");
+  assert.equal(rejected, false);
+});
+
 test("stop rejects active request and aborts session", async () => {
   const settled = [];
   let prompted = false;
