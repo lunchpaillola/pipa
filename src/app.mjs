@@ -5,6 +5,7 @@ import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { canonicalWorkingDirectory, createManifest, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
 import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
+import { createReaderCapabilityAuthority } from "./reader-capabilities.mjs";
 import { assertRoutineDestinationAllowed, createRoutineScheduler, loadRoutineState } from "./routines.mjs";
 
 class RoutineDeniedError extends Error {}
@@ -66,7 +67,12 @@ export async function startPipa(options = {}) {
     await withTimeout(server?.wait(), options.shutdownTimeoutMs ?? 15_000, "OpenCode shutdown timed out.").catch(() => undefined);
     throw error;
   }
-  const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn, abortTurn: executor.abortTurn });
+  const runner = createConversationRunner({
+    sessionStore,
+    runTurn: executor.runTurn,
+    abortTurn: executor.abortTurn,
+    capabilityAuthority: options.readerCapabilityAuthority ?? createReaderCapabilityAuthority(),
+  });
   let accepting = true;
   const interactions = createPendingInteractions(config.allowedSlackUserIds);
   const pendingReactions = new Map();
@@ -189,6 +195,7 @@ export async function startPipa(options = {}) {
         attachments,
         workingDirectory: config.workingDirectory,
         contextEnvironment: slackContext(thread, message),
+        readerSubject: slackReaderSubject(thread, message),
         onSession: () => undefined,
         onInteraction: (interaction) => interactions.onInteraction(interactionContext, interaction),
         onPermissionReplied: interactions.onPermissionReplied,
@@ -566,7 +573,7 @@ function displayName(value) {
   return name ? name[0].toUpperCase() + name.slice(1) : "";
 }
 
-export function createConversationRunner({ sessionStore, runTurn, abortTurn = async () => undefined }) {
+export function createConversationRunner({ sessionStore, runTurn, abortTurn = async () => undefined, capabilityAuthority }) {
   const latest = new Map();
   let closed = false;
   let closeReason;
@@ -578,6 +585,7 @@ export function createConversationRunner({ sessionStore, runTurn, abortTurn = as
     const previous = latest.get(conversationKey);
     const reason = new Error("Pipa replaced this turn with a newer message.");
     previous?.controller.abort(reason);
+    capabilityAuthority?.revokeTurn(previous);
     const turn = {
       controller: new AbortController(),
       generation: (previous?.generation ?? 0) + 1,
@@ -593,7 +601,7 @@ export function createConversationRunner({ sessionStore, runTurn, abortTurn = as
   }
 
   async function execute(conversationKey, current, previous, input, abortReason) {
-    const { deliver, deliverFailure, startTyping, onSession, ...turn } = input;
+    const { deliver, deliverFailure, startTyping, onSession, readerSubject, ...turn } = input;
     const isLatest = () => latest.get(conversationKey)?.generation === current.generation;
     const stopped = async () => {
       const error = closeReason ?? current.controller.signal.reason;
@@ -613,15 +621,21 @@ export function createConversationRunner({ sessionStore, runTurn, abortTurn = as
       try {
         Promise.resolve(startTyping?.()).catch(() => undefined);
       } catch {}
-      result = await runTurn({
-        ...turn,
-        signal: current.controller.signal,
-        sessionId: current.sessionId,
-        onSession: async (sessionId) => {
-          current.sessionId = sessionId;
-          await onSession?.(sessionId);
-        },
-      });
+      const readerCapability = readerSubject ? capabilityAuthority?.issue(readerSubject, current) : undefined;
+      try {
+        result = await runTurn({
+          ...turn,
+          readerCapability,
+          signal: current.controller.signal,
+          sessionId: current.sessionId,
+          onSession: async (sessionId) => {
+            current.sessionId = sessionId;
+            await onSession?.(sessionId);
+          },
+        });
+      } finally {
+        capabilityAuthority?.revokeTurn(current);
+      }
     } catch (error) {
       if (!isLatest()) return { superseded: true };
       error = closed ? closeReason : error;
@@ -651,6 +665,7 @@ export function createConversationRunner({ sessionStore, runTurn, abortTurn = as
       const aborts = [];
       for (const turn of latest.values()) {
         turn.controller.abort(closeReason);
+        capabilityAuthority?.revokeTurn(turn);
         if (turn.sessionId) aborts.push(Promise.resolve(abortTurn(turn.sessionId, closeReason)).catch(() => undefined));
       }
       closing = Promise.allSettled(aborts);
@@ -754,6 +769,18 @@ function slackContext(thread, message) {
     PIPA_CURRENT_SLACK_CHANNEL_ID: channelId,
     PIPA_CURRENT_SLACK_THREAD_TS: threadTs,
     PIPA_REQUESTER_SLACK_USER_ID: message.author?.userId ?? message.author?.id ?? "",
+  };
+}
+
+function slackReaderSubject(thread, message) {
+  const [, channel = "", threadTs = ""] = thread.id.split(":");
+  const requester = message.author?.userId ?? message.author?.id ?? "";
+  if (!channel || !threadTs || !requester) return null;
+  return {
+    adapter: "slack",
+    requester,
+    channel,
+    thread: threadTs,
   };
 }
 

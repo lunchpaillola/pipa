@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { checkSlackAppToken, checkSlackToken, createConversationRunner, createPendingInteractions, initializePipa, postResult, slackDestinationId, startPipa as startPipaRuntime } from "../src/app.mjs";
 import { PipaStoppedError } from "../src/opencode.mjs";
+import { createReaderCapabilityAuthority } from "../src/reader-capabilities.mjs";
 import { createRoutineScheduler, normalizeRoutine } from "../src/routines.mjs";
 import { createSessionStore, pipaPaths, writePrivateJson } from "../src/state.mjs";
 
@@ -298,6 +299,58 @@ test("conversation runner skips an intermediate turn when aborts finish out of o
   assert.equal((await second).superseded, true);
   assert.equal((await third).text, "C");
   assert.deepEqual(prompts, ["A", "C"]);
+});
+
+test("conversation runner revokes reader capabilities after successful and failed turns", async () => {
+  const authority = createReaderCapabilityAuthority();
+  const subject = { adapter: "slack", requester: "U1", channel: "C1", thread: "T1" };
+  const capabilities = [];
+  let calls = 0;
+  const runner = createConversationRunner({
+    sessionStore: { get: () => null, set: async () => undefined },
+    capabilityAuthority: authority,
+    runTurn: async ({ readerCapability }) => {
+      capabilities.push(readerCapability);
+      if (calls++ === 1) throw new Error("failed");
+      return { text: "done", sessionId: "ses_1" };
+    },
+  });
+
+  await runner.enqueue("thread", { prompt: "one", readerSubject: subject });
+  await assert.rejects(runner.enqueue("thread", { prompt: "two", readerSubject: subject }), /failed/u);
+
+  assert.equal(capabilities.length, 2);
+  assert.ok(capabilities.every(Boolean));
+  assert.ok(capabilities.every((capability) => authority.resolve(capability, subject) === null));
+});
+
+test("conversation runner revokes reader capabilities when a turn is replaced or closed", async () => {
+  const authority = createReaderCapabilityAuthority();
+  const subject = { adapter: "slack", requester: "U1", channel: "C1", thread: "T1" };
+  const capabilities = [];
+  const runner = createConversationRunner({
+    sessionStore: { get: () => null, set: async () => undefined },
+    capabilityAuthority: authority,
+    runTurn: async ({ prompt, readerCapability, signal }) => {
+      capabilities.push(readerCapability);
+      if (prompt === "first" || prompt === "active") {
+        await new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      }
+      return { text: prompt, sessionId: "ses_1" };
+    },
+  });
+
+  const first = runner.enqueue("thread", { prompt: "first", readerSubject: subject });
+  await new Promise((resolve) => setImmediate(resolve));
+  const replacement = runner.enqueue("thread", { prompt: "replacement", readerSubject: subject });
+  assert.equal(authority.resolve(capabilities[0], subject), null);
+  await Promise.all([first, replacement]);
+
+  const active = runner.enqueue("other-thread", { prompt: "active", readerSubject: subject, deliverFailure: () => undefined });
+  await new Promise((resolve) => setImmediate(resolve));
+  runner.close();
+  assert.equal(authority.resolve(capabilities.at(-1), subject), null);
+  await active;
 });
 
 test("conversation runner starts typing once for active turns and ignores typing failures", async () => {
@@ -785,6 +838,55 @@ test("inline fallback prefers paragraphs and lines and preserves fenced code acr
   for (const chunk of chunks) assert.equal((chunk.match(/^ {0,3}(?:```|~~~)/gmu) ?? []).length % 2, 0, `unbalanced fence: ${chunk}`);
   assert.match(chunks.join("\n"), /Final paragraph\./u);
   await delivery.app.shutdown();
+});
+
+test("Slack turns issue reader capabilities only for the authorized thread", async () => {
+  const handlers = {};
+  const authority = createReaderCapabilityAuthority();
+  let resolved;
+  let calls = 0;
+  const app = await startPipa({
+    chat: {
+      onNewMention(handler) { handlers.mention = handler; },
+      onSubscribedMessage() {},
+      async initialize() {},
+      async shutdown() {},
+    },
+    executor: {
+      runTurn: async ({ readerCapability }) => {
+        calls += 1;
+        resolved = authority.resolve(readerCapability, { adapter: "slack", requester: "U1", channel: "C1", thread: "1.0" });
+        return { text: "done", sessionId: "ses_1" };
+      },
+      stopAll() {},
+    },
+    readerCapabilityAuthority: authority,
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    config: {
+      botName: "Pipa",
+      slackAppToken: "xapp-test",
+      slackBotToken: "xoxb-test",
+      workingDirectory: "/work",
+      allowedSlackUserIds: ["U1"],
+    },
+  });
+  const thread = {
+    id: "slack:C1:1.0",
+    adapter: { addReaction: async () => undefined, removeReaction: async () => undefined },
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async () => undefined,
+  };
+
+  handlers.mention(thread, { id: "authorized", text: "@Pipa work", author: { userId: "U1" }, raw: {} });
+  await waitFor(() => resolved !== undefined);
+  handlers.mention(thread, { id: "denied", text: "@Pipa work", author: { userId: "U2" }, raw: {} });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(resolved, { adapter: "slack", requester: "U1", channel: "C1", thread: "1.0" });
+  assert.equal(calls, 1);
+  await app.shutdown();
 });
 
 async function deliveryApp(result, { failFiles = false } = {}) {
