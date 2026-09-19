@@ -255,7 +255,7 @@ test("completes from a terminal assistant message when session status remains st
     throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
   };
 
-  const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, timeoutMs: 50, pollIntervalMs: 1 })
+  const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 })
     .runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" });
   assert.equal(result.text, "done");
 });
@@ -539,7 +539,7 @@ test("subscribes to interaction events before prompt_async", async () => {
   assert.deepEqual(settledBody, { answers: [["Red"]] });
 });
 
-test("keeps an established event stream open beyond the request timeout", async () => {
+test("does not impose executor timeouts on OpenCode work", async () => {
   let eventConnections = 0;
   let prompted = false;
   let statusRead = false;
@@ -571,32 +571,11 @@ test("keeps an established event stream open beyond the request timeout", async 
     throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
   };
 
-  const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1, requestTimeoutMs: 5 })
+  const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1, requestTimeoutMs: 5, timeoutMs: 5 })
     .runTurn({ prompt: "go", sessionId: "ses_1", workingDirectory: "/work", onInteraction: () => undefined });
 
   assert.equal(result.text, "done");
   assert.equal(eventConnections, 1);
-});
-
-test("overall timeout rejects while interaction subscription is starting", async () => {
-  const fetch = async (url, init = {}) => {
-    const pathname = new URL(url).pathname;
-    if (pathname === "/event") return new Response(new ReadableStream({ start() {} }));
-    if (pathname === "/permission") {
-      return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
-    }
-    if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
-    if (pathname === "/session/ses_1/message") return jsonResponse([]);
-    throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
-  };
-  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, timeoutMs: 10, requestTimeoutMs: 1_000 });
-
-  await assert.rejects(executor.runTurn({
-    prompt: "hello",
-    sessionId: "ses_1",
-    workingDirectory: "/work",
-    onInteraction: () => undefined,
-  }), /OpenCode timed out after 10ms/u);
 });
 
 test("routes a subagent permission through its parent session", async () => {
@@ -1028,8 +1007,8 @@ test("artifact reads reject a file replaced after opening and sanitize delivered
   assert.equal(sanitized.files[0].filename, "bad_name_.csv");
 });
 
-test("artifact directories are cleaned after OpenCode failure, timeout, and cancellation", async () => {
-  for (const mode of ["failure", "timeout", "cancel"]) {
+test("artifact directories are cleaned after OpenCode failure and cancellation", async () => {
+  for (const mode of ["failure", "cancel"]) {
     let directory;
     let executor;
     const fetch = artifactFetch(async (body, init) => {
@@ -1037,7 +1016,7 @@ test("artifact directories are cleaned after OpenCode failure, timeout, and canc
       if (mode === "failure") throw new Error("prompt failed");
       return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
     });
-    executor = createOpenCodeExecutor({ artifactRoot: os.tmpdir(), baseUrl: "http://localhost:5555", fetch, requestTimeoutMs: mode === "timeout" ? 5 : 30_000 });
+    executor = createOpenCodeExecutor({ artifactRoot: os.tmpdir(), baseUrl: "http://localhost:5555", fetch });
     const turn = executor.runTurn({ prompt: "work", sessionId: "ses_1", workingDirectory: os.tmpdir(), contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" } });
     if (mode === "cancel") {
       await waitForValue(() => directory);

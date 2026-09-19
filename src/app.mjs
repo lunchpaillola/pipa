@@ -91,9 +91,6 @@ export async function startPipa(options = {}) {
         }
       };
       let denied = false;
-      let permissionRejected = null;
-      let permissionResource = "the requested resource";
-      let routineSessionId;
       try {
         await authorize();
       } catch (error) {
@@ -124,46 +121,26 @@ export async function startPipa(options = {}) {
             PIPA_REQUESTER_SLACK_USER_ID: "",
           },
           signal,
-          onSession: async (sessionId) => {
-            routineSessionId = sessionId;
-            await onSession(sessionId);
-          },
-          onInteraction: (interaction) => {
-            if (interaction.type === "permission") {
-              permissionResource = interaction.request?.permission === "external_directory" ? "an external directory" : "the requested resource";
-              return { type: "reject" };
-            }
-            return interactions.onInteraction({
-              thread,
-              authorize: authorizeInteraction,
-              loadAllowedUserIds: async () => (await loadConfig(paths.config)).allowedSlackUserIds ?? [],
-            }, interaction);
-          },
-          onPermissionRejected: () => {
-            permissionRejected = {
-              status: "failed",
-              errorCode: "permission_auto_rejected",
-              errorSummary: `Automatically rejected permission to access ${permissionResource}.`,
-              message: `Routine blocked: Pipa automatically rejected permission to access ${permissionResource}. Update the routine to avoid that access, then run it again.`,
-            };
-            // Do not let a rejected subagent permission leave the parent turn running.
-            if (routineSessionId) void executor.abortTurn(routineSessionId, new Error("Pipa rejected a routine permission.")).catch(() => undefined);
-          },
+          onSession,
+          onInteraction: (interaction) => interactions.onInteraction({
+            thread,
+            authorize: authorizeInteraction,
+            loadAllowedUserIds: async () => (await loadConfig(paths.config)).allowedSlackUserIds ?? [],
+          }, interaction),
           onPermissionReplied: interactions.onPermissionReplied,
           onPermissionsReconciled: interactions.onPermissionsReconciled,
         });
       } catch (error) {
         if (denied) return { status: "denied", errorCode: "destination_denied", errorSummary: "Routine destination is no longer allowed." };
-        if (permissionRejected) return permissionRejected;
         if (signal.aborted) throw error;
         return { status: "failed", errorCode: "executor_failed", errorSummary: "Routine execution failed." };
       }
       try {
         await authorize();
         if (signal.aborted) throw signal.reason;
-        const message = await postResult(thread, permissionRejected ? { text: permissionRejected.message } : result, signal);
+        const message = await postResult(thread, result, signal);
         const threadTs = snapshot.destination.threadTs ?? message?.id;
-        if (!permissionRejected && threadTs && result.sessionId) {
+        if (threadTs && result.sessionId) {
           const conversationKey = slackDestinationId({ channelId: snapshot.destination.channelId, threadTs });
           await sessionStore.set(conversationKey, result.sessionId);
           await chat.thread(conversationKey).subscribe();
@@ -173,7 +150,7 @@ export async function startPipa(options = {}) {
         if (error instanceof RoutineDeniedError) return { status: "denied", errorCode: "destination_denied", errorSummary: "Routine destination is no longer allowed." };
         return { status: "failed", errorCode: "delivery_failed", errorSummary: "Routine result delivery failed." };
       }
-      return permissionRejected ?? { status: "succeeded" };
+      return { status: "succeeded" };
     },
   }) : null;
   chat.onAction?.(interactions.onAction);

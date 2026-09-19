@@ -1064,63 +1064,6 @@ test("routine scheduler distinguishes unavailable config from a disallowed desti
   await app.shutdown();
 });
 
-test("routine permissions are rejected and reported without creating Slack controls", async () => {
-  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routine-permission-"));
-  const paths = pipaPaths(home);
-  let now = "2026-08-29T12:00:00.000Z";
-  const config = {
-    botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: home,
-    allowedSlackChannelIds: ["C123"], allowedSlackUserIds: ["U1"],
-  };
-  await writePrivateJson(paths.config, config);
-  await writePrivateJson(paths.routines, { version: 1, routines: [normalizeRoutine({
-    id: "permission", prompt: "do work", schedule: { type: "once", at: "2026-08-29T13:00:00Z" }, timezone: "UTC", destination: { channelId: "C123", threadTs: null },
-  }, now)] });
-  let intervalTick;
-  let scheduler;
-  const posts = [];
-  const subscriptions = [];
-  const decisions = [];
-  const aborts = [];
-  const app = await startPipa({
-    paths,
-    config,
-    routinesEnabled: true,
-    routineNow: () => now,
-    setRoutineInterval(callback) { intervalTick = callback; return { unref() {} }; },
-    clearRoutineInterval() {},
-    createRoutineScheduler: (options) => scheduler = createRoutineScheduler(options),
-    chat: {
-      onNewMention() {}, onSubscribedMessage() {},
-      thread(id) { return { id, subscribe: async () => subscriptions.push(id), post: async (payload) => { posts.push(payload); return { id: "456.789" }; } }; },
-      async initialize() {}, async shutdown() {},
-    },
-    executor: {
-      async runTurn(input) {
-        await input.onSession("ses_routine");
-        decisions.push(await input.onInteraction({ type: "permission", request: { permission: "external_directory" }, signal: new AbortController().signal }));
-        input.onPermissionRejected();
-        return { text: "Stopped after a permission was rejected.", sessionId: "ses_routine" };
-      },
-      async abortTurn(sessionId) { aborts.push(sessionId); },
-      stopAll() {},
-    },
-    checkSlackToken: async () => ({ ok: true }),
-    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
-  });
-  now = "2026-08-29T13:00:00.000Z";
-  intervalTick();
-  await scheduler.drain();
-  const routine = JSON.parse(await readFile(paths.routines, "utf8")).routines[0];
-  assert.deepEqual(decisions, [{ type: "reject" }]);
-  assert.deepEqual(aborts, ["ses_routine"]);
-  assert.equal(routine.lastRun.errorCode, "permission_auto_rejected");
-  assert.deepEqual(subscriptions, []);
-  assert.match(routine.lastRun.errorSummary, /external directory/u);
-  assert.deepEqual(posts, [{ markdown: "Routine blocked: Pipa automatically rejected permission to access an external directory. Update the routine to avoid that access, then run it again." }]);
-  await app.shutdown();
-});
-
 test("routine deactivation after execution suppresses final delivery", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-routine-app-"));
   const paths = pipaPaths(home);

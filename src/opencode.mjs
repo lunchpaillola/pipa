@@ -76,8 +76,6 @@ export function createOpenCodeExecutor(options = {}) {
   const fetchImpl = options.fetch ?? fetch;
   const environment = options.environment ?? process.env;
   const headers = authenticationHeaders(environment);
-  const timeoutMs = options.timeoutMs ?? 2.5 * 60 * 60 * 1000;
-  const requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
   const pollIntervalMs = options.pollIntervalMs ?? 1_000;
   const useDataUrls = !isLoopbackUrl(baseUrl);
   const remove = options.rm ?? rm;
@@ -97,7 +95,7 @@ export function createOpenCodeExecutor(options = {}) {
           ...(init.body ? { "content-type": "application/json" } : {}),
           ...init.headers,
         },
-        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(requestTimeoutMs)]),
+        signal: controller.signal,
       });
     } catch (error) {
       if (controller.signal.aborted) throw controller.signal.reason;
@@ -121,7 +119,7 @@ export function createOpenCodeExecutor(options = {}) {
     }
   }
 
-  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled, onPermissionRejected }) {
+  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     if (stopReason) throw stopReason;
     const temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
@@ -130,13 +128,12 @@ export function createOpenCodeExecutor(options = {}) {
     const abort = () => controller.abort(signal.reason);
     if (signal?.aborted) abort();
     else signal?.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(() => controller.abort(new Error(`OpenCode timed out after ${timeoutMs}ms.`)), timeoutMs);
     active.add(controller);
     let artifactDirectory;
 
     try {
       try {
-        const files = await stageAttachments(attachments, temporaryDirectory, timeoutMs, useDataUrls, controller.signal);
+        const files = await stageAttachments(attachments, temporaryDirectory, useDataUrls, controller.signal);
         if (stopReason) throw stopReason;
         let selectedSessionId = sessionId;
         let messages;
@@ -182,17 +179,13 @@ export function createOpenCodeExecutor(options = {}) {
             baseUrl,
             fetchImpl,
             headers,
-            requestTimeoutMs,
             sessionId: selectedSessionId,
             workingDirectory,
             controller,
             onInteraction,
             onPermissionReplied,
             onPermissionsReconciled,
-            onPermissionRejected: () => {
-              permissionRejected = true;
-              onPermissionRejected?.();
-            },
+            onPermissionRejected: () => { permissionRejected = true; },
             onDismiss: () => { dismissed = true; },
             requestTurn: request,
           });
@@ -226,7 +219,6 @@ export function createOpenCodeExecutor(options = {}) {
           await delay(pollIntervalMs, controller.signal);
         }
       } finally {
-        clearTimeout(timer);
         controller.abort(new Error("OpenCode turn completed."));
         active.delete(controller);
         for (const [sessionId, turn] of activeSessions) {
@@ -345,12 +337,12 @@ export async function runOpenCodeVersion(options = {}) {
   }
 }
 
-async function stageAttachments(attachments, temporaryDirectory, timeoutMs, useDataUrls, signal) {
+async function stageAttachments(attachments, temporaryDirectory, useDataUrls, signal) {
   const files = [];
   for (const [index, attachment] of attachments.entries()) {
     let data;
     try {
-      data = await fetchAttachment(attachment, timeoutMs, signal);
+      data = await abortable(attachment.fetchData(), signal);
     } catch {
       throw new Error("Could not read one of the attached files. Please try uploading it again.");
     }
@@ -595,13 +587,6 @@ function serverUrl(baseUrl, pathname, workingDirectory) {
   return url;
 }
 
-function fetchAttachment(attachment, timeoutMs, signal) {
-  return Promise.race([
-    attachment.fetchData(),
-    delay(timeoutMs, signal).then(() => { throw new Error(`Attachment download timed out after ${timeoutMs}ms.`); }),
-  ]);
-}
-
 function delay(delayMs, signal) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -619,7 +604,7 @@ function delay(delayMs, signal) {
   });
 }
 
-function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sessionId, workingDirectory, controller, onInteraction, onPermissionReplied, onPermissionsReconciled, onPermissionRejected, onDismiss, requestTurn }) {
+function watchInteractions({ baseUrl, fetchImpl, headers, sessionId, workingDirectory, controller, onInteraction, onPermissionReplied, onPermissionsReconciled, onPermissionRejected, onDismiss, requestTurn }) {
   const seenIds = new Set();
   const messages = new Map();
   const parents = new Map();
@@ -685,18 +670,10 @@ function watchInteractions({ baseUrl, fetchImpl, headers, requestTimeoutMs, sess
     while (!controller.signal.aborted) {
       try {
         const url = serverUrl(baseUrl, "/event", workingDirectory);
-        const connection = new AbortController();
-        const connectionTimer = setTimeout(() => connection.abort(new Error("OpenCode event connection timed out.")), requestTimeoutMs);
-        connectionTimer.unref?.();
-        let response;
-        try {
-          response = await fetchImpl(url, {
-            headers: { ...headers, accept: "text/event-stream" },
-            signal: AbortSignal.any([controller.signal, connection.signal]),
-          });
-        } finally {
-          clearTimeout(connectionTimer);
-        }
+        const response = await fetchImpl(url, {
+          headers: { ...headers, accept: "text/event-stream" },
+          signal: controller.signal,
+        });
         if (!response.ok) throw new OpenCodeRequestError(response.status);
         await reconcile();
         if (!subscribed) {
