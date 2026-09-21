@@ -382,6 +382,7 @@ async function start(io) {
   const finished = Promise.withResolvers();
   void finished.promise.catch(() => undefined);
   const signal = Promise.withResolvers();
+  const startup = new AbortController();
   let app;
   let server;
   let watcher;
@@ -391,6 +392,7 @@ async function start(io) {
   let workspaceReady = true;
   const stop = (termination = "SIGTERM") => {
     stopping = true;
+    startup.abort();
     app?.stop();
     server?.stop(termination);
     signal.resolve();
@@ -421,7 +423,7 @@ async function start(io) {
         workspaceReady = false;
       }
     } else {
-      app = await startPipa({ config });
+      app = await startPipa({ config, signal: startup.signal });
       io.output.write(app.server.owned
         ? `Pipa started a private OpenCode server at ${app.server.baseUrl}.\n`
         : `Pipa is using the configured OpenCode server at ${app.server.baseUrl}.\n`);

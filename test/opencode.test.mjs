@@ -961,6 +961,8 @@ test("short Slack answers stay inline and remote attached servers get no local a
     response: async (body) => { remoteSystem = body.system; return 'Summary.\nPIPA_ARTIFACTS: ["private.pdf"]'; },
   });
   assert.match(remoteSystem, /For deeper work or larger deliverables/u);
+  assert.match(remoteSystem, /Both commands must run on the Pipa host, not a remote attached OpenCode host/u);
+  assert.match(remoteSystem, /If you lack command access to the Pipa host, explain that limitation/u);
   assert.doesNotMatch(remoteSystem, /PIPA_ARTIFACTS|artifact director|pipa-artifacts-/u);
   assert.deepEqual(remote, { text: "Summary.", sessionId: "ses_1" });
 

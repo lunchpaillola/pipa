@@ -142,6 +142,7 @@ test("real watcher/worker chain orders cleanup, process clearance and detached r
 test("expired and changed-generation requests are inert; status is read-only and stale", async (t) => {
   const { home, release } = await fixture(t);
   const request = await requestRestart({ home, now: () => Date.now() - 60_000 });
+  await assert.rejects(requestRestart({ home }), /manual stop\/start/);
   const file = path.join(pipaPaths(home).directory, "restarts", `${request.id}.request.json`);
   const before = await stat(file);
   const watcher = startRestartWatcher({ home, identity: release.identity,
@@ -163,8 +164,9 @@ for (const failure of ["error", "exit", "timeout", "late-armed", "late-error"]) 
     const { home, release } = await fixture(t);
     const request = await requestRestart({ home });
     const [worker] = peers();
+    let shutdownCalls = 0;
     const watcher = startRestartWatcher({ home, identity: release.identity, limits: { ...limits, armMs: 5 },
-      shutdown: () => assert.fail("must not shut down"),
+      shutdown: () => { shutdownCalls += 1; },
       spawn() {
         if (failure === "error") queueMicrotask(() => worker.emit("error", new Error("secret")));
         if (failure === "exit") queueMicrotask(() => worker.emit("exit", 1));
@@ -177,6 +179,8 @@ for (const failure of ["error", "exit", "timeout", "late-armed", "late-error"]) 
     await watcher.poll();
     await delay(15);
     assert.equal((await restartStatus({ home })).state, "failed");
+    assert.equal((await restartStatus({ home })).phase, "arming");
+    assert.equal(shutdownCalls, 0);
     assert.equal(worker.connected, false);
     assert.equal(worker.unreferenced, true);
   });
@@ -220,7 +224,13 @@ for (const failure of ["cleanup", "cleanup-timeout", "lock", "process", "identit
     const status = await restartStatus({ home });
     assert.equal(status.state, "failed");
     assert.doesNotMatch(JSON.stringify(status), /secret/);
+    if (failure === "exit") assert.match(status.error, /Child exited/);
+    if (failure === "ready-timeout") assert.match(status.error, /handoff timed out/);
+    if (failure === "wrong-ready") assert.match(status.error, /identity not confirmed/);
     if (["cleanup", "cleanup-timeout", "lock", "process", "identity"].includes(failure)) assert.equal(launches, 0);
+    else assert.equal(launches, 1);
+    assert.equal(status.phase, ["cleanup", "cleanup-timeout"].includes(failure) ? "cleanup"
+      : ["lock", "process", "identity"].includes(failure) ? "waiting-for-stop" : "starting");
     if (failure === "identity") assert.equal(JSON.parse(await readFile(pipaPaths(home).lock, "utf8")).pid, 4242);
   });
 }
@@ -242,7 +252,7 @@ test("independent concurrent watchers atomically accept only once", async (t) =>
   await Promise.all(watchers.map((watcher) => watcher.poll()));
   watchers.forEach((watcher) => watcher.stop());
   assert.equal(workers, 1);
-  assert.deepEqual(await requestRestart({ home }), request);
+  await assert.rejects(requestRestart({ home }), /manual stop\/start/);
   assert.equal((await restartStatus({ home })).state, "failed");
 });
 

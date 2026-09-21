@@ -12,6 +12,14 @@ const WORKER = fileURLToPath(import.meta.url);
 const CLI = fileURLToPath(new URL("../bin/pipa.mjs", import.meta.url));
 const LIMITS = { armMs: 10_000, cleanupMs: 30_000, stopMs: 15_000, readyMs: 60_000, pollMs: 100 };
 const ACCEPT_MS = 15_000;
+const SAFE_FAILURES = new Set([
+  "Child startup failed.", "Child process could not start.", "Child exited before handoff.",
+  "Restart IPC disconnected before handoff.", "Restart handoff timed out.",
+  "Restart IPC send timed out.", "Restart IPC send failed.", "Restart IPC unavailable.",
+  "Restart acceptance expired.", "Cleanup timed out.", "Cleanup failed.",
+  "Instance changed.", "Original instance did not stop.", "Replacement identity not confirmed.",
+]);
+const safeFailure = (error) => SAFE_FAILURES.has(error?.message) ? ` ${error.message}` : "";
 const validId = (id) => typeof id === "string" && /^[a-f0-9-]{36}$/u.test(id);
 const same = (a, b) => a && b && a.pid === b.pid && a.generation === b.generation;
 const homePath = (home) => path.resolve(home ?? (process.env.PIPA_HOME || os.homedir()));
@@ -56,9 +64,15 @@ export async function requestRestart({ home, running = isRunning, now = Date.now
   const createdAt = now();
   const request = { ...identity, id: identity.generation, createdAt, expiresAt: createdAt + ACCEPT_MS };
   const file = fileFor(home, request.id, "request");
-  await publish(file, request);
+  const created = await publish(file, request);
   const stored = await readOptional(file);
   if (!validRequest(stored, identity)) throw new Error("Invalid restart request.");
+  if (!created) {
+    const status = await restartStatus({ home, id: stored.id, now });
+    if (!["requested", "running"].includes(status?.state)) {
+      throw new Error(`Restart ${stored.id} is ${status?.state ?? "unconfirmed"}. Inspect \`pipa restart --status\` before a manual stop/start.`);
+    }
+  }
   return stored;
 }
 
@@ -191,9 +205,9 @@ export function startRestartWatcher({ home, identity, shutdown, spawn: spawnImpl
       } finally { clearTimeout(timer); }
       phase = "handoff";
       await send(child, { type: "cleanup", id: request.id, ok: true }, timing.armMs);
-    } catch {
+    } catch (error) {
       await writePrivateJson(file, statusRecord(request.id, "failed", phase, Date.now(),
-        `Restart ${phase} failed. Inspect Pipa and its owned runtime before a manual stop/start.`));
+        `Restart ${phase} failed.${safeFailure(error)} Inspect Pipa and its owned runtime before a manual stop/start.`));
     } finally { detach(child); }
   }
   const timer = setInterval(() => { void poll().catch(onError); }, timing.pollMs);
@@ -246,16 +260,16 @@ export async function runRestartWorker({ home, id, peer = process, spawn: spawnI
     }
     await send(child, { type: "accepted", id }, timing.armMs);
     await writePrivateJson(file, { ...statusRecord(id, "completed", "ready", Date.now()), replacement });
-  } catch {
+  } catch (error) {
     if (ownsStatus) await writePrivateJson(file, statusRecord(id, "failed", phase, Date.now(),
-      `Restart ${phase} failed. Inspect Pipa before a manual start; a replacement may still be starting.`));
+      `Restart ${phase} failed.${safeFailure(error)} Inspect Pipa before a manual start; a replacement may still be starting.`));
   } finally {
     detach(child);
     if (peer.connected) peer.disconnect();
   }
 }
 
-// U2 calls after full profile readiness, or on startup failure, before normal CLI error handling.
+// Report readiness only after full profile startup; wait for worker acceptance.
 export async function reportRestartReady(identity, { peer = process, environment = process.env } = {}) {
   const id = environment.PIPA_RESTART_ID;
   if (!id) return;
