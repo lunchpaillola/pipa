@@ -3,7 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { loadConfig, pipaPaths } from "../src/state.mjs";
+import { loadConfig, readInstanceLock } from "../src/state.mjs";
 
 const runFile = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -84,7 +84,7 @@ async function preflight() {
   const config = await loadConfig();
   if (config.slackMode !== "socket") throw new Error("The configured Pipa profile is not using Socket Mode.");
   if (config.allowedSlackChannelIds?.length && !config.allowedSlackChannelIds.includes(channelId)) throw new Error("The eval channel is not in allowedSlackChannelIds.");
-  const pid = Number.parseInt(await readFile(pipaPaths().lock, "utf8").catch(() => ""), 10);
+  const pid = (await readInstanceLock())?.pid;
   if (!pid || !isRunning(pid)) throw new Error("A local `pipa start` Socket Mode process must be running.");
   const auth = await slackWithToken(token, "auth.test", {});
   if (config.allowedSlackUserIds?.length && !config.allowedSlackUserIds.includes(auth.user_id)) throw new Error("The Slack eval user is not in allowedSlackUserIds.");
