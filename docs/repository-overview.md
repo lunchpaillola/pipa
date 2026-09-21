@@ -26,7 +26,7 @@ GitHub-specific automation.
 
 The public command-line entry point installed by npm.
 
-- `bin/pipa.mjs`: Implements the `pipa` command. `pipa init` confirms the working directory, opens Slack's app-manifest setup, reads tokens without displaying them, and calls `initializePipa`. `pipa start` takes a single-instance lock, loads the profile once, and starts either the existing Slack application or the Managed OpenCode server. `pipa routine` parses the six routine lifecycle commands, exact prompt input, schedules, previews, and stable JSON output. It forwards `SIGINT` and `SIGTERM` before releasing the lock. `pipa --version` reads the version from `package.json`.
+- `bin/pipa.mjs`: Implements the `pipa` command. `pipa init` confirms the working directory, opens Slack's app-manifest setup, reads tokens without displaying them, and calls `initializePipa`. `pipa start` takes a single-instance lock, loads the profile once, and starts either the existing Slack application or the Managed OpenCode server. `pipa routine` parses the six routine lifecycle commands, exact prompt input, schedules, previews, and stable JSON output. It forwards `SIGINT` and `SIGTERM` before releasing the lock. `pipa --version` reads the version from `package.json`. `pipa restart` requests an asynchronous detached restart, and `pipa restart --status` provides read-only inspection of its durable outcome.
 
 ### `docs/`
 
