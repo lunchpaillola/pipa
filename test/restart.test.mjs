@@ -63,6 +63,19 @@ function peers() {
 
 const limits = { armMs: 100, cleanupMs: 100, stopMs: 40, readyMs: 80, pollMs: 2 };
 
+test("replacement readiness requires worker acceptance before detachment", async () => {
+  const [worker, replacement] = peers();
+  const id = randomUUID();
+  let settled = false;
+  const ready = reportRestartReady({ pid: 4242, generation: randomUUID() }, {
+    peer: replacement, environment: { PIPA_RESTART_ID: id },
+  }).finally(() => { settled = true; });
+  await delay(1);
+  assert.equal(settled, false);
+  worker.disconnect();
+  await assert.rejects(ready, /disconnected/);
+});
+
 test("real watcher/worker chain orders cleanup, process clearance and detached readiness", async (t) => {
   const { home, release } = await fixture(t);
   const request = await requestRestart({ home });

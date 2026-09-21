@@ -244,6 +244,7 @@ export async function runRestartWorker({ home, id, peer = process, spawn: spawnI
       || !same(ready, replacement) || !running(ready.pid) || child.exitCode != null || child.signalCode != null) {
       throw new Error("Replacement identity not confirmed.");
     }
+    await send(child, { type: "accepted", id }, timing.armMs);
     await writePrivateJson(file, { ...statusRecord(id, "completed", "ready", Date.now()), replacement });
   } catch {
     if (ownsStatus) await writePrivateJson(file, statusRecord(id, "failed", phase, Date.now(),
@@ -259,7 +260,10 @@ export async function reportRestartReady(identity, { peer = process, environment
   const id = environment.PIPA_RESTART_ID;
   if (!id) return;
   if (!validId(id) || !validId(identity?.generation)) throw new Error("Invalid restart readiness identity.");
+  const accepted = receive(peer, "accepted", id, LIMITS.armMs);
+  void accepted.catch(ignoreError);
   await send(peer, { type: "ready", id, ...identity }, LIMITS.armMs);
+  await accepted;
 }
 
 export async function reportRestartFailure({ peer = process, environment = process.env } = {}) {

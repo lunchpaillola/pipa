@@ -22,7 +22,8 @@ test("removes Slack credentials from child environments regardless of casing", (
     Slack_Api_Token: "secret",
     Slack_Client_Secret: "secret",
     Pipa_Slack_App_Token: "secret",
-  }), { PATH: "/bin", PIPA_CURRENT_SLACK_CHANNEL_ID: "C123" });
+  }), { PATH: "/bin", PIPA_CURRENT_SLACK_CHANNEL_ID: "C123", PIPA_HOME: path.resolve(os.homedir()) });
+  assert.equal(cleanChildEnvironment({ PIPA_HOME: "relative-profile" }).PIPA_HOME, path.resolve("relative-profile"));
 });
 
 test("starts one owned loopback server on port 0 and stops it", async () => {
@@ -182,6 +183,10 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
   assert.match(promptBody.system, /PIPA_MESSAGE_CHANNEL=slack/u);
   assert.match(promptBody.system, /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
   assert.match(promptBody.system, /consult `pipa routine --help`/u);
+  assert.match(promptBody.system, /run `pipa restart`/u);
+  assert.match(promptBody.system, /existing messaging authorization is sufficient/u);
+  assert.match(promptBody.system, /pipa restart --status/u);
+  assert.match(promptBody.system, /ensure PIPA_HOME/u);
   assert.match(promptBody.system, /IANA timezone/u);
   assert.match(promptBody.system, /preview first/u);
   assert.match(promptBody.system, /create only after user confirmation/u);
@@ -431,6 +436,28 @@ test("Managed server inherits its clean environment and forwards termination sig
     server.stop(signal);
     await server.wait();
     assert.equal(killCount, 1);
+  }
+});
+
+test("Managed readiness checks workspace health, authentication and a bounded deadline", async () => {
+  for (const healthy of [true, false]) {
+    const child = childProcess();
+    child.kill = () => { queueMicrotask(() => child.emit("close", 0)); return true; };
+    let requests = 0;
+    const server = startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "127.0.0.1", openCodePort: 4096 }, {
+      platform: "linux", spawn: () => child, startupTimeoutMs: healthy ? 1_000 : 10,
+      environment: { OPENCODE_SERVER_PASSWORD: "test-password" },
+      fetch: async (url, init) => {
+        requests += 1;
+        assert.equal(String(url), "http://127.0.0.1:4096/session/status?directory=%2Fwork");
+        assert.equal(init.headers.authorization, `Basic ${Buffer.from("opencode:test-password").toString("base64")}`);
+        return jsonResponse(healthy && requests > 1 ? {} : { ok: true });
+      },
+    });
+    try {
+      if (healthy) { await server.ready(); assert.equal(requests, 2); }
+      else await assert.rejects(server.ready(), /workspace readiness check timed out/u);
+    } finally { server.stop(); await server.wait(); }
   }
 });
 

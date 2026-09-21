@@ -5,6 +5,7 @@ import { constants } from "node:fs";
 import { lstat, open, readFile, realpath } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import os from "node:os";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { stdin, stdout } from "node:process";
@@ -12,6 +13,7 @@ import { acquireInstanceLock, createManifest, createManifestUrl, loadConfig, sto
 import { initializePipa, startPipa } from "../src/app.mjs";
 import { startOpenCodeServer } from "../src/opencode.mjs";
 import { createRoutine, deleteRoutine, editRoutine, loadRoutineState, requestRoutineRun } from "../src/routines.mjs";
+import { requestRestart, restartStatus, startRestartWatcher, reportRestartReady, reportRestartFailure } from "../src/restart.mjs";
 
 const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 
@@ -24,8 +26,26 @@ async function main(argv = process.argv.slice(2), io = { input: stdin, output: s
   if (command === "init") return init(io);
   if (command === "start") return start(io);
   if (command === "stop") return stop(io);
+  if (command === "restart") return restart(argv.slice(1), io);
   if (command === "routine") return routine(argv.slice(1), io);
-  throw new Error("Usage: pipa init | pipa start | pipa stop | pipa routine | pipa --version");
+  const usage = "Usage: pipa init | pipa start | pipa stop | pipa restart [--status] | pipa routine | pipa --version";
+  if (command === "--help" || command === "-h") return io.output.write(`${usage}\n`);
+  throw new Error(usage);
+}
+
+async function restart(argv, io) {
+  if (argv.length === 1 && ["--help", "-h"].includes(argv[0])) {
+    io.output.write("Usage: pipa restart [--status]\nRequest a detached restart, or inspect its latest durable outcome.\n");
+    return;
+  }
+  if (argv.length && (argv.length !== 1 || argv[0] !== "--status")) throw new Error("Usage: pipa restart [--status]");
+  if (argv[0] === "--status") {
+    const status = await restartStatus();
+    io.output.write(status ? `${JSON.stringify(status, null, 2)}\n` : "No restart requested.\n");
+    return;
+  }
+  const request = await requestRestart();
+  io.output.write(`Restart requested (${request.id}). Check \`pipa restart --status\` for the outcome.\n`);
 }
 
 const ROUTINE_HELP = `Usage: pipa routine <command>
@@ -356,55 +376,97 @@ function openUrl(url) {
 }
 
 async function start(io) {
+  // Resolve before OpenCode changes cwd, so its tools address this same profile.
+  process.env.PIPA_HOME = path.resolve(process.env.PIPA_HOME || os.homedir());
   const releaseLock = await acquireInstanceLock();
-  let stop;
-  let stopWithSigint;
-  let stopWithSigterm;
+  const finished = Promise.withResolvers();
+  void finished.promise.catch(() => undefined);
+  const signal = Promise.withResolvers();
+  let app;
+  let server;
+  let watcher;
+  let failure;
+  let stopping = false;
+  let ready = false;
+  let workspaceReady = true;
+  const stop = (termination = "SIGTERM") => {
+    stopping = true;
+    app?.stop();
+    server?.stop(termination);
+    signal.resolve();
+  };
+  const stopWithSigint = () => stop("SIGINT");
+  const stopWithSigterm = () => stop();
+  const disconnected = () => {
+    if (!ready) {
+      failure ??= new Error("Restart readiness handoff disconnected before startup completed.");
+      stop();
+    }
+  };
+  if (process.env.PIPA_RESTART_ID) process.on("disconnect", disconnected);
+  process.on("SIGINT", stopWithSigint);
+  process.on("SIGTERM", stopWithSigterm);
   try {
     const config = await loadConfig();
     if (config.slackMode === "managed") {
-      const server = startOpenCodeServer(config);
+      server = startOpenCodeServer(config);
       io.output.write(`Pipa is starting OpenCode on ${config.openCodeHostname}:${config.openCodePort}.\n`);
-      stopWithSigint = () => server.stop("SIGINT");
-      stopWithSigterm = () => server.stop("SIGTERM");
-      process.on("SIGINT", stopWithSigint);
-      process.on("SIGTERM", stopWithSigterm);
-      await server.wait();
-      return;
-    }
-
-    const app = await startPipa({ config });
-    io.output.write(app.server.owned
-      ? `Pipa started a private OpenCode server at ${app.server.baseUrl}.\n`
-      : `Pipa is using the configured OpenCode server at ${app.server.baseUrl}.\n`);
-    io.output.write("Pipa is connected through Slack Socket Mode.\n");
-    const { promise: signal, resolve: resolveSignal } = Promise.withResolvers();
-    stop = () => {
-      app.stop();
-      resolveSignal();
-    };
-    process.on("SIGINT", stop);
-    process.on("SIGTERM", stop);
-    try {
-      await Promise.race([signal, app.wait()]);
-    } finally {
-      await app.shutdown();
-    }
-  } finally {
-    try {
-      await releaseLock();
-    } finally {
-      if (stop) {
-        process.off("SIGINT", stop);
-        process.off("SIGTERM", stop);
+      // Ordinary Managed starts retain their lifetime even if health is unavailable.
+      // Such an instance cannot accept cooperative restart until it is ready.
+      try {
+        await Promise.race([server.ready(), signal.promise]);
+      } catch (error) {
+        if (process.env.PIPA_RESTART_ID) throw error;
+        process.stderr.write("Managed restart unavailable: workspace readiness failed.\n");
+        workspaceReady = false;
       }
-      if (stopWithSigint) process.off("SIGINT", stopWithSigint);
-      if (stopWithSigterm) process.off("SIGTERM", stopWithSigterm);
+    } else {
+      app = await startPipa({ config });
+      io.output.write(app.server.owned
+        ? `Pipa started a private OpenCode server at ${app.server.baseUrl}.\n`
+        : `Pipa is using the configured OpenCode server at ${app.server.baseUrl}.\n`);
+      io.output.write("Pipa is connected through Slack Socket Mode.\n");
+    }
+    const lifetime = app ? app.wait() : server.wait();
+    // Observe startup failures already reported by the runtime before ready IPC.
+    await Promise.race([lifetime, Promise.resolve()]);
+    if (!stopping && workspaceReady) {
+      watcher = startRestartWatcher({
+        identity: releaseLock.identity,
+        shutdown: () => { stop(); return finished.promise; },
+        onError: () => process.stderr.write("Pipa could not inspect restart requests.\n"),
+      });
+      await reportRestartReady(releaseLock.identity);
+      ready = true;
+    }
+    await Promise.race([signal.promise, lifetime]);
+  } catch (error) {
+    failure = error;
+  } finally {
+    watcher?.stop();
+    try {
+      stop();
+      if (app) await app.shutdown();
+      if (server) await server.wait();
+    } catch (error) {
+      failure ??= error;
+    } finally {
+      try { await releaseLock(); } catch (error) { failure ??= error; }
+      if (failure) finished.reject(failure);
+      else finished.resolve();
+      // poll returns the in-flight handoff even after stop: don't exit before IPC.
+      await watcher?.poll().catch(() => { failure ??= new Error("Restart handoff failed."); });
+      process.off("SIGINT", stopWithSigint);
+      process.off("SIGTERM", stopWithSigterm);
+      process.off("disconnect", disconnected);
     }
   }
+  if (failure) throw failure;
 }
 
-main().catch((error) => {
+main().catch(async (error) => {
+  await reportRestartFailure();
+  if (process.connected) process.disconnect();
   const message = error instanceof Error ? error.message : String(error);
   if (process.argv.includes("--json")) process.stdout.write(`${JSON.stringify({ ok: false, error: { code: error?.code ?? "routine_error", message } })}\n`);
   else process.stderr.write(`Pipa failed: ${message}\n`);
