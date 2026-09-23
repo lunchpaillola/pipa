@@ -31,11 +31,15 @@ export async function initializePipa(input, options = {}) {
 }
 
 export async function startPipa(options = {}) {
+  options.signal?.throwIfAborted();
   const paths = options.paths ?? pipaPaths();
   const config = options.config ?? await loadConfig(paths.config);
+  options.signal?.throwIfAborted();
   const slackAuth = await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
+  options.signal?.throwIfAborted();
   warnMissingSlackScopes(slackAuth, options.warn);
   const sessionStore = options.sessionStore ?? await createSessionStore(paths.sessions);
+  options.signal?.throwIfAborted();
   const state = options.state ?? createMemoryState();
   const chat = options.chat ?? new Chat({
     adapters: {
@@ -56,6 +60,7 @@ export async function startPipa(options = {}) {
   }));
   let executor;
   try {
+    options.signal?.throwIfAborted();
     executor = options.executor ?? (options.createExecutor ?? createOpenCodeExecutor)({
       artifactRoot: path.join(config.workingDirectory, ".pipa", "artifacts"),
       baseUrl: server.baseUrl,
@@ -209,14 +214,29 @@ export async function startPipa(options = {}) {
 
   chat.onNewMention((thread, message) => { void handle(thread, message, true); });
   chat.onSubscribedMessage((thread, message) => { void handle(thread, message, false); });
+  const stop = (reason = new PipaStoppedError()) => {
+    if (!accepting) return;
+    accepting = false;
+    routineScheduler?.stop(reason);
+    runner.close(reason);
+    executor.stopAll(reason);
+  };
+  const cancelled = () => stop();
+  options.signal?.addEventListener("abort", cancelled, { once: true });
   try {
+    options.signal?.throwIfAborted();
     await state.connect();
+    options.signal?.throwIfAborted();
     for (const conversationKey of sessionStore.keys()) {
       await chat.thread(conversationKey).subscribe();
+      options.signal?.throwIfAborted();
     }
     await withTimeout(chat.initialize(), options.startupTimeoutMs ?? 30_000, "Slack Socket Mode startup timed out.");
+    options.signal?.throwIfAborted();
     await routineScheduler?.start();
+    options.signal?.throwIfAborted();
   } catch (error) {
+    options.signal?.removeEventListener("abort", cancelled);
     routineScheduler?.stop(error);
     await routineScheduler?.drain();
     await withTimeout(interactions.close(), options.shutdownTimeoutMs ?? 15_000, "Interaction shutdown timed out.").catch(() => undefined);
@@ -226,14 +246,6 @@ export async function startPipa(options = {}) {
     await withTimeout(server?.wait(), options.shutdownTimeoutMs ?? 15_000, "OpenCode shutdown timed out.").catch(() => undefined);
     throw error;
   }
-
-  const stop = (reason = new PipaStoppedError()) => {
-    if (!accepting) return;
-    accepting = false;
-    routineScheduler?.stop(reason);
-    runner.close(reason);
-    executor.stopAll(reason);
-  };
 
   return {
     server: server ? { baseUrl: server.baseUrl, owned: server.owned } : null,
@@ -247,6 +259,7 @@ export async function startPipa(options = {}) {
     },
     stop: () => stop(),
     async shutdown() {
+      options.signal?.removeEventListener("abort", cancelled);
       stop();
       try {
         await withTimeout((async () => {

@@ -1,13 +1,146 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { createServer } from "node:net";
+import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
-import { pipaPaths, writePrivateJson } from "../src/state.mjs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { acquireInstanceLock, pipaPaths, readInstanceLock, writePrivateJson } from "../src/state.mjs";
+import { restartStatus } from "../src/restart.mjs";
 
 const cli = fileURLToPath(new URL("../bin/pipa.mjs", import.meta.url));
+
+test("restart requests rather than claims success and status survives the caller", async (t) => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-restart-cli-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const release = await acquireInstanceLock(pipaPaths(home).lock);
+  t.after(release);
+  const invoke = (...args) => spawnSync(process.execPath, [cli, "restart", ...args], {
+    encoding: "utf8", env: { ...process.env, PIPA_HOME: home },
+  });
+  assert.match(invoke("--status").stdout, /No restart/u);
+  const requested = invoke();
+  assert.equal(requested.status, 0, requested.stderr);
+  assert.match(requested.stdout, /Restart requested/u);
+  assert.doesNotMatch(requested.stdout, /completed|success/iu);
+  const status = invoke("--status");
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, /requested/u);
+  assert.match(status.stdout, new RegExp(release.identity.generation, "u"));
+  assert.notEqual(invoke("--bogus").status, 0);
+});
+
+for (const mode of ["ready", "unready", "startup-failure"]) test(`isolated Managed restart: ${mode}`, { timeout: 60_000 }, async (t) => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-detached-"));
+  const paths = pipaPaths(home);
+  const reservation = createServer();
+  await new Promise((resolve) => reservation.listen(0, "127.0.0.1", resolve));
+  const port = reservation.address().port;
+  await new Promise((resolve) => reservation.close(resolve));
+  const url = `http://127.0.0.1:${port}`;
+  const fakeBin = path.join(home, "bin");
+  await mkdir(fakeBin);
+  await writePrivateJson(paths.config, {
+    botName: "Isolated", workingDirectory: home, slackMode: "managed",
+    openCodeHostname: "127.0.0.1", openCodePort: port,
+    allowedSlackUserIds: ["U123"], allowedSlackChannelIds: ["C123"],
+  });
+  const configBefore = await readFile(paths.config, "utf8");
+  await writeFile(path.join(fakeBin, "server.cjs"), `
+    const http = require('node:http');
+    if (process.env.PIPA_HOME !== ${JSON.stringify(home)}) throw new Error('Profile home changed in the tool environment.');
+    if (process.env.PIPA_RESTART_ID && ${JSON.stringify(mode)} === 'startup-failure') process.exit(23);
+    const server = http.createServer((req, res) => {
+      if (req.url === '/shutdown') { res.end(); server.close(); return; }
+      if (process.env.PIPA_RESTART_ID && ${JSON.stringify(mode)} === 'unready') res.statusCode = 503;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({}));
+    });
+    server.listen(Number(process.argv[process.argv.indexOf('--port') + 1]), '127.0.0.1');
+    process.on('SIGTERM', () => server.close());
+  `);
+  const executable = path.join(fakeBin, process.platform === "win32" ? "opencode.cmd" : "opencode");
+  await writeFile(executable, process.platform === "win32"
+    ? `@ECHO off\r\n"${process.execPath}" "%~dp0server.cjs" %*\r\n`
+    : `#!/bin/sh\nexec "${process.execPath}" "${path.join(fakeBin, "server.cjs")}" "$@"\n`);
+  if (process.platform !== "win32") await chmod(executable, 0o755);
+  // Observe the real worker's exit without replacing any process boundary.
+  const observer = path.join(home, "observe.mjs");
+  const workerExit = path.join(home, "worker-exit");
+  await writeFile(observer, `import { writeFileSync } from 'node:fs';
+    if (process.argv[2] === '--worker') process.on('exit', () => writeFileSync(${JSON.stringify(workerExit)}, String(process.pid)));
+  `);
+  const environment = {
+    PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+    ...(process.platform === "win32" ? { SystemRoot: process.env.SystemRoot, ComSpec: process.env.ComSpec, PATHEXT: process.env.PATHEXT } : {}),
+    HOME: home, USERPROFILE: home, PIPA_HOME: path.relative(process.cwd(), home),
+    NODE_OPTIONS: `--import=${pathToFileURL(observer).href}`,
+  };
+  const original = spawn(process.execPath, [cli, "start"], { env: environment, stdio: "ignore" });
+  const originalExit = new Promise((resolve, reject) => {
+    original.once("error", reject);
+    original.once("exit", (code) => resolve(code));
+  });
+  let replacement;
+  t.after(async () => {
+    await fetch(`${url}/shutdown`, { signal: AbortSignal.timeout(2_000) }).catch(() => undefined);
+    try { await until(async () => !await readInstanceLock(paths.lock), 8_000); }
+    finally {
+      // Windows fixture wrappers are process trees; never strand their Node child.
+      for (const pid of [original.exitCode === null ? original.pid : null, replacement?.pid].filter(Boolean)) {
+        if (process.platform === "win32") spawnSync("taskkill", ["/pid", String(pid), "/t", "/f"], { stdio: "ignore" });
+        else { try { process.kill(pid, "SIGTERM"); } catch {} }
+      }
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+  await until(async () => fetch(`${url}/session/status`).then((response) => response.ok, () => false));
+  const identity = await readInstanceLock(paths.lock);
+  assert.equal(identity.pid, original.pid);
+  const request = spawnSync(process.execPath, [cli, "restart"], { env: environment, encoding: "utf8" });
+  assert.equal(request.status, 0, request.stderr);
+  assert.match(request.stdout, /Restart requested/u);
+  const outcome = await until(async () => {
+    const status = await restartStatus({ home });
+    const lock = await readInstanceLock(paths.lock);
+    if (lock && lock.pid !== original.pid) replacement = lock;
+    if (status?.state === "unconfirmed") assert.fail(JSON.stringify(status));
+    return ["completed", "failed"].includes(status?.state) ? status : false;
+  }, 45_000);
+  assert.equal(await originalExit, 0);
+  if (mode !== "ready") {
+    assert.equal(outcome.state, "failed");
+    assert.equal(outcome.phase, "starting");
+    assert.equal(await readInstanceLock(paths.lock), null);
+    await assert.rejects(fetch(`${url}/session/status`, { signal: AbortSignal.timeout(1_000) }));
+    await until(() => readFile(workerExit, "utf8").catch(() => false));
+    assert.equal(await readFile(paths.config, "utf8"), configBefore);
+    return;
+  }
+  assert.equal(outcome.state, "completed", JSON.stringify(outcome));
+  replacement = outcome.replacement;
+  assert.notEqual(replacement.pid, original.pid);
+  assert.notEqual(replacement.generation, identity.generation);
+  await until(() => readFile(workerExit, "utf8").catch(() => false));
+  await delay(300);
+  assert.equal((await fetch(`${url}/session/status`)).ok, true);
+  assert.deepEqual(await readInstanceLock(paths.lock), replacement);
+  const status = spawnSync(process.execPath, [cli, "restart", "--status"], { env: environment, encoding: "utf8" });
+  assert.equal(JSON.parse(status.stdout).state, "completed");
+  assert.equal(await readFile(paths.config, "utf8"), configBefore);
+});
+
+async function until(check, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = await check();
+    if (value) return value;
+    await delay(50);
+  }
+  assert.fail("Isolated lifecycle condition timed out.");
+}
 
 async function setup(allowedSlackChannelIds = ["C123"]) {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-cli-"));

@@ -1,4 +1,4 @@
-import { constants } from "node:fs";
+import { constants, readFileSync, unlinkSync } from "node:fs";
 import { access, chmod, link, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -64,31 +64,64 @@ export function pipaPaths(home = process.env.PIPA_HOME || os.homedir()) {
 export async function acquireInstanceLock(file = pipaPaths().lock) {
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temporary, String(process.pid), { mode: 0o600 });
+  const identity = Object.freeze({ pid: process.pid, generation: randomUUID() });
+  await writeFile(temporary, JSON.stringify(identity), { mode: 0o600 });
   try {
     await claimLock(temporary, file);
   } catch (error) {
     if (error?.code !== "EEXIST") throw error;
-    const pid = Number.parseInt(await readFile(file, "utf8").catch(() => ""), 10);
-    if (pid && isRunning(pid)) throw new Error(`Pipa is already running (PID ${pid}).`);
-    await rm(file, { force: true });
+    const previous = await readInstanceLock(file);
+    if (previous && isRunning(previous.pid)) throw new Error(`Pipa is already running (PID ${previous.pid}).`);
+    removeInstanceLock(file, previous);
     await claimLock(temporary, file);
   } finally {
     await rm(temporary, { force: true });
   }
-  return () => rm(file, { force: true });
+  const release = async () => removeInstanceLock(file, identity);
+  release.identity = identity;
+  return release;
 }
 
 export async function stopInstance(file = pipaPaths().lock, kill = process.kill) {
-  const pid = Number.parseInt(await readFile(file, "utf8").catch(() => ""), 10);
+  const identity = await readInstanceLock(file);
+  const pid = identity?.pid;
   if (!pid) return null;
   try {
     kill(pid, "SIGTERM");
     return pid;
   } catch (error) {
-    if (error?.code === "ESRCH") await rm(file, { force: true });
+    if (error?.code === "ESRCH") removeInstanceLock(file, identity);
     else throw error;
     return null;
+  }
+}
+
+export async function readInstanceLock(file = pipaPaths().lock) {
+  try {
+    return parseInstanceLock(await readFile(file, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function parseInstanceLock(text) {
+  const value = JSON.parse(text);
+  const identity = typeof value === "number" ? { pid: value, generation: null } : value;
+  if (!Number.isSafeInteger(identity?.pid) || identity.pid <= 0
+    || (identity.generation !== null && !/^[a-f0-9-]{36}$/u.test(identity.generation ?? ""))) {
+    throw new Error("Invalid Pipa instance lock.");
+  }
+  return identity;
+}
+
+function removeInstanceLock(file, identity) {
+  try {
+    // No await between checking ownership and unlinking; repeated old releases are harmless.
+    const current = parseInstanceLock(readFileSync(file, "utf8"));
+    if (current.pid === identity?.pid && current.generation === identity?.generation) unlinkSync(file);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
   }
 }
 
@@ -203,7 +236,7 @@ function validateBotName(value) {
   return name;
 }
 
-function isRunning(pid) {
+export function isRunning(pid) {
   try {
     process.kill(pid, 0);
     return true;

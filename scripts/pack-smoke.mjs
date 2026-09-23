@@ -20,6 +20,8 @@ try {
   const installedRoot = path.join(directory, "install", "node_modules", "@usepipa", "pipa");
   const packedRuntime = await import(pathToFileURL(path.join(installedRoot, "src", "opencode.mjs")).href);
   if (typeof packedRuntime.createOpenCodeExecutor !== "function") throw new Error("Packed OpenCode executor is unavailable.");
+  const packedRestart = await import(pathToFileURL(path.join(installedRoot, "src", "restart.mjs")).href);
+  if (typeof packedRestart.startRestartWatcher !== "function" || typeof packedRestart.runRestartWorker !== "function") throw new Error("Packed restart worker is unavailable.");
   const installedCli = path.join(installedRoot, "bin", "pipa.mjs");
 
   const home = path.join(directory, "home");
@@ -88,6 +90,11 @@ if (process.argv[2] === "--version") {
 
   const cancelledHome = path.join(directory, "cancelled-home");
   await mkdir(cancelledHome);
+  const restartHelp = await run(process.execPath, [installedCli, "restart", "--help"], { ...process.env, PIPA_HOME: cancelledHome });
+  if (!restartHelp.stdout.includes("pipa restart [--status]")) throw new Error("Packed restart help is unavailable.");
+  const restartStatus = await run(process.execPath, [installedCli, "restart", "--status"], { ...process.env, PIPA_HOME: cancelledHome });
+  if (!restartStatus.stdout.includes("No restart requested")) throw new Error("Packed restart status is unavailable.");
+  if (await readFile(path.join(cancelledHome, ".pipa", "pipa.lock"), "utf8").then(() => true, () => false)) throw new Error("Packed restart status mutated state.");
   const cancelled = await run(process.execPath, [installedCli, "init"], {
     ...process.env,
     PIPA_HOME: cancelledHome,

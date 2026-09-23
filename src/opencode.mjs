@@ -21,7 +21,10 @@ export class PipaStoppedError extends Error {
 }
 
 export function cleanChildEnvironment(environment = process.env) {
-  return Object.fromEntries(Object.entries(environment).filter(([key]) => !SLACK_SECRET_ENV_KEY.test(key)));
+  return {
+    ...Object.fromEntries(Object.entries(environment).filter(([key]) => !SLACK_SECRET_ENV_KEY.test(key))),
+    PIPA_HOME: path.resolve(environment.PIPA_HOME || os.homedir()),
+  };
 }
 
 export async function startSocketOpenCodeServer(config, options = {}) {
@@ -297,8 +300,20 @@ export function startOpenCodeServer(config, options = {}) {
   const exit = waitForExit(child).then((code) => {
     if (!stopping) throw new Error(`OpenCode server exited unexpectedly with code ${code}.`);
   });
+  void exit.catch(() => undefined);
 
   return {
+    async ready() {
+      const controller = new AbortController();
+      const hostname = config.openCodeHostname.includes(":") && !config.openCodeHostname.startsWith("[") ? `[${config.openCodeHostname}]` : config.openCodeHostname;
+      try {
+        await Promise.race([
+          waitForWorkspace(`http://${hostname}:${config.openCodePort}`, config.workingDirectory,
+            options.fetch ?? fetch, authenticationHeaders(options.environment ?? process.env), options.startupTimeoutMs ?? 30_000, controller.signal),
+          exit.then(() => { throw new Error("OpenCode stopped before workspace readiness."); }),
+        ]);
+      } finally { controller.abort(); }
+    },
     wait: () => exit,
     stop(signal) {
       if (stopping) return;
@@ -368,6 +383,7 @@ function promptBody(prompt, files, contextEnvironment, artifactDirectory) {
   const parts = [{ type: "text", text: prompt }, ...files.map((file) => ({ type: "file", ...file }))];
   const context = Object.entries(contextEnvironment).filter(([, value]) => value !== undefined && value !== null && String(value));
   const instructions = ["For scheduling requests, consult `pipa routine --help`, convert timezone wording to an IANA timezone, preview first, show the normalized details, and create only after user confirmation."];
+  instructions.push(`When asked to restart Pipa, run \`pipa restart\`; existing messaging authorization is sufficient. It requests a detached restart and may end this turn. Use \`pipa restart --status\` to inspect the durable outcome; do not claim completion from the request alone. Both commands must run on the Pipa host, not a remote attached OpenCode host. If you lack command access to the Pipa host, explain that limitation instead of running them remotely. The Pipa profile home on that host is ${JSON.stringify(path.resolve(process.env.PIPA_HOME || os.homedir()))}; ensure PIPA_HOME has this value in the command environment. Do not use sequential stop/start or OpenCode /instance/dispose: that disposes an instance, not restarts the server.`);
   if (context.length) instructions.push(`Slack context for this turn (provided here, not as shell environment variables):\n${context.map(([key, value]) => `${key}=${value}`).join("\n")}`);
   if (contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack") {
     instructions.push("Keep naturally short answers inline. For deeper work or larger deliverables, keep the Slack response concise and use the most suitable artifact format.");
@@ -519,13 +535,13 @@ function externalServer(baseUrl) {
   };
 }
 
-async function waitForWorkspace(baseUrl, workingDirectory, fetchImpl, headers, timeoutMs) {
+async function waitForWorkspace(baseUrl, workingDirectory, fetchImpl, headers, timeoutMs, signal) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
       const status = await fetchImpl(serverUrl(baseUrl, "/session/status", workingDirectory), {
         headers,
-        signal: AbortSignal.timeout(Math.min(5_000, Math.max(1, deadline - Date.now()))),
+        signal: AbortSignal.any([AbortSignal.timeout(Math.min(5_000, Math.max(1, deadline - Date.now()))), ...(signal ? [signal] : [])]),
       });
       const sessions = status.ok ? await status.json() : null;
       if (sessions && typeof sessions === "object" && !Array.isArray(sessions)
@@ -533,7 +549,7 @@ async function waitForWorkspace(baseUrl, workingDirectory, fetchImpl, headers, t
     } catch {
       // OpenCode can accept its socket before the configured workspace is ready.
     }
-    await delay(Math.min(250, Math.max(0, deadline - Date.now())));
+    await delay(Math.min(250, Math.max(0, deadline - Date.now())), signal);
   }
   throw new Error("OpenCode workspace readiness check timed out.");
 }

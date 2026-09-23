@@ -116,12 +116,31 @@ Use `pipa routine list`, `show`, `edit`, `run`, and `delete` for the lifecycle. 
 
 Routines run only while the Socket Mode `pipa start` process is running and the machine is awake. Restart skips missed scheduled occurrences instead of backfilling them. Explicit run requests survive restart, but can repeat if the process crashes after agent side effects or Slack delivery and before completion is saved. Managed profiles do not execute routines. Run `pipa routine --help` for the complete syntax and JSON contract.
 
+### Restarting Pipa
+
+Ask Pipa to restart, or run:
+
+```sh
+pipa restart
+pipa restart --status
+```
+
+Anyone allowed by the existing Slack user and channel controls can request a restart; there is no separate restart approval. The first command reports **requested**, not completed. The read-only status command shows the latest request ID, state (`requested`, `running`, `completed`, `failed`, or `unconfirmed`), phase, and any failure guidance. An expired handoff is unconfirmed, never assumed successful. Private records under `.pipa/restarts` remain available after the initiating turn exits.
+
+The running Pipa launches a detached worker before stopping intake, cleaning up, and releasing its instance lock. The worker waits for the original process and lock to disappear, then starts a detached replacement and confirms workspace readiness (and Slack readiness for Socket Mode). The replacement continues in the background without terminal output; use `pipa stop` to stop it. This works for Socket and Managed profiles on supported macOS, Linux, and Windows systems. Attached OpenCode servers remain externally owned and are never stopped by Pipa.
+
+Do not chain `pipa stop` and `pipa start` inside an agent turn: stopping owned OpenCode also kills that turn. OpenCode's `/instance/dispose` disposes an instance; it does not restart the server.
+
+Commands must use the same `PIPA_HOME` (the parent of `.pipa`) as the running profile. Pipa passes the resolved absolute home to its owned OpenCode and restart processes. With an attached server, ensure the agent's command environment uses that home; a remote server needs command access to the Pipa host. An older running Pipa needs one manual stop/start after upgrading. If status reports failure or an unconfirmed handoff, inspect the reported phase and current instance before attempting a manual start.
+
 ## Commands
 
 ```text
 pipa init       Configure Slack and the local working directory
 pipa start      Start the configured Slack runtime
 pipa stop       Stop the running local Pipa process
+pipa restart    Request a detached restart
+pipa restart --status  Inspect the latest durable restart outcome
 pipa routine    Create and manage local scheduled routines
 pipa --version  Print the installed version
 ```

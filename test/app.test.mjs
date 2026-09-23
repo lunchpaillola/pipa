@@ -1143,6 +1143,47 @@ test("startup cleans up Chat when restored subscription setup fails", async () =
   assert.deepEqual(events, ["stopped", "shutdown"]);
 });
 
+for (const pauseAt of ["auth", "slack"]) {
+  test(`Socket startup cancellation during ${pauseAt} prevents later work`, async () => {
+    const controller = new AbortController();
+    const entered = Promise.withResolvers();
+    const resume = Promise.withResolvers();
+    const events = [];
+    const pause = async (phase) => {
+      if (phase === pauseAt) { entered.resolve(); await resume.promise; }
+    };
+    const starting = startPipa({
+      signal: controller.signal,
+      config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+      checkSlackToken: async () => { await pause("auth"); return { ok: true }; },
+      sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+      state: { connect: async () => undefined },
+      chat: {
+        onNewMention() {}, onSubscribedMessage() {},
+        async initialize() { events.push("slack-start"); await pause("slack"); },
+        async shutdown() { events.push("slack-stop"); },
+      },
+      startServer: async () => {
+        events.push("server-start");
+        return { baseUrl: "http://127.0.0.1:1", stop() { events.push("server-stop"); }, wait: async () => undefined };
+      },
+      createExecutor: () => ({ runTurn: async () => undefined, stopAll() { events.push("executor-stop"); } }),
+      createRoutineScheduler: () => ({ start() { events.push("scheduler-start"); }, stop() {}, drain: async () => undefined }),
+    });
+    await entered.promise;
+    const rejected = assert.rejects(starting, /cancelled startup/);
+    controller.abort(new Error("cancelled startup"));
+    resume.resolve();
+    await rejected;
+    assert.equal(events.includes("scheduler-start"), false);
+    if (pauseAt === "auth") assert.deepEqual(events, []);
+    else {
+      assert.equal(events.includes("server-stop"), true);
+      assert.equal(events.includes("slack-stop"), true);
+    }
+  });
+}
+
 test("startup timeout shuts Chat down", async () => {
   const events = [];
   const chat = {
