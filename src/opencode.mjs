@@ -387,7 +387,7 @@ function promptBody(prompt, files, contextEnvironment, artifactDirectory) {
   if (context.length) instructions.push(`Slack context for this turn (provided here, not as shell environment variables):\n${context.map(([key, value]) => `${key}=${value}`).join("\n")}`);
   if (contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack") {
     instructions.push("Keep naturally short answers inline. For deeper work or larger deliverables, keep the Slack response concise and use the most suitable artifact format.");
-    if (artifactDirectory) instructions.push(`To attach files, copy up to 10 top-level files (100 MB total) to this private artifact directory: ${artifactDirectory}\nEnd with exactly one final line: ${ARTIFACT_MARKER} [\"report.csv\",\"brief.pdf\"]`);
+    if (artifactDirectory) instructions.push(`To attach files, copy up to 10 top-level files (100 MB total) to this private artifact directory: ${artifactDirectory}\nOnly if you created files, end your response with exactly one final line in this format: ${ARTIFACT_MARKER} [\"report.csv\",\"brief.pdf\"]\nDo not emit ${ARTIFACT_MARKER} otherwise.`);
   }
   return {
     parts,
@@ -397,10 +397,16 @@ function promptBody(prompt, files, contextEnvironment, artifactDirectory) {
 
 function parseArtifactDeclaration(text) {
   const lines = text.split(/\r?\n/u);
-  const declarations = lines.map((line, index) => line.startsWith(ARTIFACT_MARKER) ? { line, index } : null).filter(Boolean);
-  const cleanText = lines.filter((line) => !line.startsWith(ARTIFACT_MARKER)).join("\n").trim();
+  const declarations = lines.map((line, index) => {
+    const markerIndex = line.indexOf(ARTIFACT_MARKER);
+    return markerIndex < 0 ? null : { line: line.slice(markerIndex), index, markerIndex };
+  }).filter(Boolean);
+  const cleanText = lines.map((line) => {
+    const markerIndex = line.indexOf(ARTIFACT_MARKER);
+    return markerIndex < 0 ? line : line.slice(0, markerIndex).trimEnd();
+  }).join("\n").trim();
   const lastNonblank = lines.findLastIndex((line) => line.trim());
-  if (declarations.length !== 1 || declarations[0].index !== lastNonblank) return { text: cleanText };
+  if (declarations.length !== 1 || declarations[0].index !== lastNonblank || declarations[0].markerIndex !== 0) return { text: cleanText };
   const declaration = declarations[0].line;
   if (!declaration.startsWith(`${ARTIFACT_MARKER} `) || Buffer.byteLength(declaration) > MAX_ARTIFACT_DECLARATION_BYTES) return { text: cleanText };
   let paths;

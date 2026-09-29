@@ -874,6 +874,8 @@ test("Slack turns request concise delivery and return declared binary artifacts"
   assert.equal(path.basename(artifactDirectory), "ses_1");
   assert.match(system, new RegExp(artifactDirectory.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
   assert.match(system, /copy up to 10 top-level files \(100 MB total\)/u);
+  assert.match(system, /Only if you created files/u);
+  assert.match(system, /Do not emit PIPA_ARTIFACTS: otherwise/u);
   assert.match(system, /PIPA_ARTIFACTS: \["report\.csv","brief\.pdf"\]/u);
   assert.match(system, /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
   assert.equal(result.text, "Ready for review.");
@@ -974,6 +976,8 @@ test("short Slack answers stay inline and remote attached servers get no local a
 
 test("malformed or non-private artifact declarations are stripped and upload nothing", async () => {
   const cases = [
+    "Yes. PIPA_ARTIFACTS: []",
+    'Yes. PIPA_ARTIFACTS: ["ok.txt"]',
     'Before.\nPIPA_ARTIFACTS: ["ok.txt"]\nAfter.',
     'PIPA_ARTIFACTS: ["ok.txt"]\nPIPA_ARTIFACTS: ["ok.txt"]',
     "PIPA_ARTIFACTS: nope",
@@ -992,7 +996,7 @@ test("malformed or non-private artifact declarations are stripped and upload not
       await writeFile(path.join(directory, "same.txt"), "same");
       return `Summary.\n${declaration}`;
     } });
-    assert.doesNotMatch(result.text, /^PIPA_ARTIFACTS:/mu);
+    assert.doesNotMatch(result.text, /PIPA_ARTIFACTS:/u);
     assert.equal(result.files, undefined);
   }
 });
