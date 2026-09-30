@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { checkSlackAppToken, checkSlackToken, createConversationRunner, createPendingInteractions, initializePipa, postResult, slackDestinationId, startPipa as startPipaRuntime } from "../src/app.mjs";
-import { PipaStoppedError } from "../src/opencode.mjs";
+import { PipaRestartingError, PipaStoppedError } from "../src/opencode.mjs";
 import { createRoutineScheduler, normalizeRoutine } from "../src/routines.mjs";
 import { createSessionStore, pipaPaths, writePrivateJson } from "../src/state.mjs";
 
@@ -243,7 +243,7 @@ test("conversation runner interrupts one thread, reuses its session, and overlap
   const first = runner.enqueue("A", { prompt: "one", deliver: (result) => delivered.push(result.text), deliverFailure: (error) => failed.push(error) });
   const other = runner.enqueue("B", { prompt: "other" });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(events, ["start:one:null", "start:other:null"]);
+  assert.deepEqual(events, ["start:one:null", "save:A:ses_A", "start:other:null", "save:B:ses_other"]);
   const second = runner.enqueue("A", { prompt: "two", deliver: (result) => delivered.push(result.text) });
   await new Promise((resolve) => setImmediate(resolve));
   assert.match(events.join("|"), /abort:ses_A\|start:two:ses_A/u);
@@ -861,8 +861,83 @@ test("reports an intentional stop for an active Slack turn", async () => {
   app.stop();
   await app.shutdown();
 
-  assert.deepEqual(posts, ["Piper stopped before finishing this request."]);
+  assert.deepEqual(posts, ["Piper was stopped. It won't respond until it starts again."]);
   assert.deepEqual(reactions, ["add:eyes", "remove:eyes"]);
+});
+
+test("restores a restarting thread and continues its session", async () => {
+  const firstHandlers = {};
+  const posts = [];
+  const sessions = new Map();
+  const sessionStore = {
+    keys: () => [...sessions.keys()],
+    get: (key) => sessions.get(key) ?? null,
+    set: async (key, value) => sessions.set(key, value),
+  };
+  let rejectTurn;
+  const thread = {
+    id: "slack:C1:1.0",
+    adapter: { addReaction: async () => undefined, removeReaction: async () => undefined },
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async (text) => posts.push(text),
+  };
+  const firstApp = await startPipa({
+    chat: {
+      onNewMention(handler) { firstHandlers.mention = handler; },
+      onSubscribedMessage() {},
+      thread: () => thread,
+      async initialize() {},
+      async shutdown() {},
+    },
+    executor: {
+      runTurn: async ({ onSession }) => {
+        await onSession("ses_restart");
+        return new Promise((_, reject) => rejectTurn = reject);
+      },
+      stopAll(reason) { rejectTurn?.(reason); },
+    },
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore,
+    config: { botName: "Chopper", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work", allowedSlackChannelIds: ["C1"] },
+  });
+
+  await firstHandlers.mention(thread, { id: "1", text: "@U1 restart", author: { userId: "U1" }, raw: {} });
+  await waitFor(() => rejectTurn);
+  firstApp.stop(new PipaRestartingError());
+  await firstApp.shutdown();
+
+  const replacementHandlers = {};
+  const restored = [];
+  const resumed = [];
+  const replacement = await startPipa({
+    chat: {
+      onNewMention() {},
+      onSubscribedMessage(handler) { replacementHandlers.subscribed = handler; },
+      thread: () => ({ ...thread, subscribe: async () => restored.push(thread.id) }),
+      async initialize() {},
+      async shutdown() {},
+    },
+    executor: {
+      async runTurn({ sessionId }) {
+        resumed.push(sessionId);
+        return { text: "Feeling good.", sessionId };
+      },
+      stopAll() {},
+    },
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore,
+    config: { botName: "Chopper", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work", allowedSlackChannelIds: ["C1"] },
+  });
+  await replacement.postRestartReady({ channelId: "C1", threadTs: "1.0" });
+  assert.throws(() => replacement.postRestartReady({ channelId: "C2", threadTs: "1.0" }), /not allowed/u);
+  await replacementHandlers.subscribed(thread, { id: "2", text: "how are ya feeling", author: { userId: "U1" }, raw: {} });
+  await waitFor(() => posts.length === 3);
+
+  assert.deepEqual(restored, [thread.id]);
+  assert.deepEqual(resumed, ["ses_restart"]);
+  assert.deepEqual(posts, ["Chopper is restarting. I'll post here when it's ready.", "Chopper restarted and is ready.", { markdown: "Feeling good." }]);
+  await replacement.shutdown();
 });
 
 test("ignores mentions from unauthorized users or channels", async () => {

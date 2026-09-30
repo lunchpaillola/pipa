@@ -21,7 +21,7 @@ test("restart requests rather than claims success and status survives the caller
     encoding: "utf8", env: { ...process.env, PIPA_HOME: home },
   });
   assert.match(invoke("--status").stdout, /No restart/u);
-  const requested = invoke();
+  const requested = invoke("--channel", "C123", "--thread", "123.456");
   assert.equal(requested.status, 0, requested.stderr);
   assert.match(requested.stdout, /Restart requested/u);
   assert.doesNotMatch(requested.stdout, /completed|success/iu);
@@ -29,6 +29,8 @@ test("restart requests rather than claims success and status survives the caller
   assert.equal(status.status, 0, status.stderr);
   assert.match(status.stdout, /requested/u);
   assert.match(status.stdout, new RegExp(release.identity.generation, "u"));
+  const saved = JSON.parse(await readFile(path.join(home, ".pipa", "restarts", `${release.identity.generation}.request.json`), "utf8"));
+  assert.deepEqual(saved.destination, { channelId: "C123", threadTs: "123.456" });
   assert.notEqual(invoke("--bogus").status, 0);
 });
 

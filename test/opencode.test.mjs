@@ -172,7 +172,7 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
     prompt,
     sessionId: "ses_1",
     workingDirectory: "/work",
-    contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack", PIPA_CURRENT_SLACK_CHANNEL_ID: "C1" },
+    contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack", PIPA_CURRENT_SLACK_CHANNEL_ID: "C1", PIPA_CURRENT_SLACK_THREAD_TS: "123.456" },
     attachments: [attachment],
   });
 
@@ -183,7 +183,7 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
   assert.match(promptBody.system, /PIPA_MESSAGE_CHANNEL=slack/u);
   assert.match(promptBody.system, /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
   assert.match(promptBody.system, /consult `pipa routine --help`/u);
-  assert.match(promptBody.system, /run `pipa restart`/u);
+  assert.match(promptBody.system, /run `pipa restart --channel C1 --thread 123\.456`/u);
   assert.match(promptBody.system, /existing messaging authorization is sufficient/u);
   assert.match(promptBody.system, /pipa restart --status/u);
   assert.match(promptBody.system, /ensure PIPA_HOME/u);

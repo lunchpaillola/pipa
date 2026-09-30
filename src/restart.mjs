@@ -52,17 +52,24 @@ async function publish(file, value) {
 function validRequest(request, identity) {
   return request && validId(request.id) && request.id === request.generation
     && same(request, identity) && Number.isFinite(request.createdAt)
-    && request.expiresAt === request.createdAt + ACCEPT_MS;
+    && request.expiresAt === request.createdAt + ACCEPT_MS
+    && (!request.destination || (typeof request.destination.channelId === "string"
+      && /^[A-Z][A-Z0-9]+$/u.test(request.destination.channelId)
+      && (request.destination.threadTs === undefined || /^\d+\.\d+$/u.test(request.destination.threadTs))));
 }
 
 // Generation is identity, not a grant: local execution keeps the existing local-user authority.
-export async function requestRestart({ home, running = isRunning, now = Date.now } = {}) {
+export async function requestRestart({ home, running = isRunning, now = Date.now, destination } = {}) {
   home = homePath(home);
   const identity = await readInstanceLock(pipaPaths(home).lock);
   if (!identity || !running(identity.pid)) throw new Error("Pipa is not running.");
   if (!identity.generation) throw new Error("This Pipa needs one manual stop/start before restart is available.");
   const createdAt = now();
-  const request = { ...identity, id: identity.generation, createdAt, expiresAt: createdAt + ACCEPT_MS };
+  if (destination && (!/^[A-Z][A-Z0-9]+$/u.test(destination.channelId ?? "")
+    || (destination.threadTs !== undefined && !/^\d+\.\d+$/u.test(destination.threadTs)))) {
+    throw new Error("Invalid restart destination.");
+  }
+  const request = { ...identity, id: identity.generation, createdAt, expiresAt: createdAt + ACCEPT_MS, ...(destination ? { destination } : {}) };
   const file = fileFor(home, request.id, "request");
   const created = await publish(file, request);
   const stored = await readOptional(file);
@@ -160,6 +167,8 @@ function send(peer, message, timeoutMs) {
 function spawnOptions(home, environment) {
   const env = cleanChildEnvironment(environment);
   delete env.PIPA_RESTART_ID;
+  delete env.PIPA_RESTART_CHANNEL_ID;
+  delete env.PIPA_RESTART_THREAD_TS;
   return { detached: true, shell: false, stdio: ["ignore", "ignore", "ignore", "ipc"],
     env: { ...env, PIPA_HOME: home }, windowsHide: true };
 }
@@ -251,6 +260,10 @@ export async function runRestartWorker({ home, id, peer = process, spawn: spawnI
     await writePrivateJson(file, statusRecord(id, "running", phase, Date.now() + timing.readyMs));
     const options = spawnOptions(home, environment);
     options.env.PIPA_RESTART_ID = id;
+    if (request.destination) {
+      options.env.PIPA_RESTART_CHANNEL_ID = request.destination.channelId;
+      options.env.PIPA_RESTART_THREAD_TS = request.destination.threadTs ?? "";
+    }
     child = spawnImpl(process.execPath, [CLI, "start"], options);
     const ready = await receive(child, "ready", id, timing.readyMs);
     const replacement = await readInstanceLock(pipaPaths(home).lock);

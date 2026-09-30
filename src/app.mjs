@@ -4,7 +4,7 @@ import { Chat, Modal, TextInput } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { canonicalWorkingDirectory, createManifest, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
-import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
+import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaRestartingError, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
 import { assertRoutineDestinationAllowed, createRoutineScheduler, loadRoutineState } from "./routines.mjs";
 
 class RoutineDeniedError extends Error {}
@@ -200,8 +200,10 @@ export async function startPipa(options = {}) {
         onPermissionsReconciled: interactions.onPermissionsReconciled,
         startTyping: () => thread.startTyping("Working on it..."),
         deliver: (result, signal) => postResult(thread, result, signal),
-        deliverFailure: (error) => thread.post(error instanceof PipaStoppedError
-          ? `${config.botName} stopped before finishing this request.`
+        deliverFailure: (error) => thread.post(error instanceof PipaRestartingError
+          ? `${config.botName} is restarting. I'll post here when it's ready.`
+          : error instanceof PipaStoppedError
+          ? `${config.botName} was stopped. It won't respond until it starts again.`
           : `${config.botName} failed: ${safeError(error)}`),
       });
       if (result.superseded) return;
@@ -257,7 +259,11 @@ export async function startPipa(options = {}) {
         throw error;
       }
     },
-    stop: () => stop(),
+    stop,
+    postRestartReady(destination) {
+      assertRoutineDestinationAllowed(destination, config.allowedSlackChannelIds ?? []);
+      return chat.thread(slackDestinationId(destination)).post(`${config.botName} restarted and is ready.`);
+    },
     async shutdown() {
       options.signal?.removeEventListener("abort", cancelled);
       stop();
@@ -632,6 +638,7 @@ export function createConversationRunner({ sessionStore, runTurn, abortTurn = as
         sessionId: current.sessionId,
         onSession: async (sessionId) => {
           current.sessionId = sessionId;
+          if (isLatest()) await sessionStore.set(conversationKey, sessionId);
           await onSession?.(sessionId);
         },
       });

@@ -11,7 +11,7 @@ import { Writable } from "node:stream";
 import { stdin, stdout } from "node:process";
 import { acquireInstanceLock, createManifest, createManifestUrl, loadConfig, stopInstance } from "../src/state.mjs";
 import { initializePipa, startPipa } from "../src/app.mjs";
-import { startOpenCodeServer } from "../src/opencode.mjs";
+import { PipaRestartingError, startOpenCodeServer } from "../src/opencode.mjs";
 import { createRoutine, deleteRoutine, editRoutine, loadRoutineState, requestRoutineRun } from "../src/routines.mjs";
 import { requestRestart, restartStatus, startRestartWatcher, reportRestartReady, reportRestartFailure } from "../src/restart.mjs";
 
@@ -35,16 +35,24 @@ async function main(argv = process.argv.slice(2), io = { input: stdin, output: s
 
 async function restart(argv, io) {
   if (argv.length === 1 && ["--help", "-h"].includes(argv[0])) {
-    io.output.write("Usage: pipa restart [--status]\nRequest a detached restart, or inspect its latest durable outcome.\n");
+    io.output.write("Usage: pipa restart [--status] [--channel <id> [--thread <ts>]]\nRequest a detached restart, or inspect its latest durable outcome.\n");
     return;
   }
-  if (argv.length && (argv.length !== 1 || argv[0] !== "--status")) throw new Error("Usage: pipa restart [--status]");
   if (argv[0] === "--status") {
+    if (argv.length !== 1) throw new Error("Usage: pipa restart [--status] [--channel <id> [--thread <ts>]]");
     const status = await restartStatus();
     io.output.write(status ? `${JSON.stringify(status, null, 2)}\n` : "No restart requested.\n");
     return;
   }
-  const request = await requestRestart();
+  let channelId;
+  let threadTs;
+  for (let index = 0; index < argv.length; index += 2) {
+    if (argv[index] === "--channel" && argv[index + 1]) channelId = argv[index + 1];
+    else if (argv[index] === "--thread" && argv[index + 1]) threadTs = argv[index + 1];
+    else throw new Error("Usage: pipa restart [--status] [--channel <id> [--thread <ts>]]");
+  }
+  if (threadTs && !channelId) throw new Error("Usage: pipa restart [--status] [--channel <id> [--thread <ts>]]");
+  const request = await requestRestart({ destination: channelId ? { channelId, ...(threadTs ? { threadTs } : {}) } : undefined });
   io.output.write(`Restart requested (${request.id}). Check \`pipa restart --status\` for the outcome.\n`);
 }
 
@@ -390,10 +398,10 @@ async function start(io) {
   let stopping = false;
   let ready = false;
   let workspaceReady = true;
-  const stop = (termination = "SIGTERM") => {
+  const stop = (termination = "SIGTERM", reason) => {
     stopping = true;
+    app?.stop(reason);
     startup.abort();
-    app?.stop();
     server?.stop(termination);
     signal.resolve();
   };
@@ -435,11 +443,17 @@ async function start(io) {
     if (!stopping && workspaceReady) {
       watcher = startRestartWatcher({
         identity: releaseLock.identity,
-        shutdown: () => { stop(); return finished.promise; },
+        shutdown: () => { stop("SIGTERM", new PipaRestartingError()); return finished.promise; },
         onError: () => process.stderr.write("Pipa could not inspect restart requests.\n"),
       });
       await reportRestartReady(releaseLock.identity);
       ready = true;
+      if (app && process.env.PIPA_RESTART_CHANNEL_ID) {
+        await app.postRestartReady({
+          channelId: process.env.PIPA_RESTART_CHANNEL_ID,
+          ...(process.env.PIPA_RESTART_THREAD_TS ? { threadTs: process.env.PIPA_RESTART_THREAD_TS } : {}),
+        }).catch(() => process.stderr.write("Pipa could not post restart readiness to Slack.\n"));
+      }
     }
     await Promise.race([signal.promise, lifetime]);
   } catch (error) {

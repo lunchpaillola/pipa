@@ -78,7 +78,8 @@ test("replacement readiness requires worker acceptance before detachment", async
 
 test("real watcher/worker chain orders cleanup, process clearance and detached readiness", async (t) => {
   const { home, release } = await fixture(t);
-  const request = await requestRestart({ home });
+  const request = await requestRestart({ home, destination: { channelId: "C123", threadTs: "123.456" } });
+  assert.deepEqual(request.destination, { channelId: "C123", threadTs: "123.456" });
   const [worker, workerPeer] = peers();
   const [replacement, replacementPeer] = peers();
   replacement.pid = 4242;
@@ -86,7 +87,8 @@ test("real watcher/worker chain orders cleanup, process clearance and detached r
   let originalRunning = true;
   let finished;
   let workers = 0;
-  const environment = { PATH: "test", PIPA_SLACK_BOT_TOKEN: "secret", Slack_Client_Secret: "secret", PIPA_HOME: "wrong" };
+  const environment = { PATH: "test", PIPA_SLACK_BOT_TOKEN: "secret", Slack_Client_Secret: "secret", PIPA_HOME: "wrong",
+    PIPA_RESTART_CHANNEL_ID: "COLD", PIPA_RESTART_THREAD_TS: "999.999" };
   const watcher = startRestartWatcher({ home, identity: release.identity, environment, limits,
     shutdown: async () => {
       events.push("cleanup");
@@ -111,6 +113,8 @@ test("real watcher/worker chain orders cleanup, process clearance and detached r
           assert.deepEqual(args.slice(1), ["start"]);
           assert.equal(options.detached, true);
           assert.equal(options.env.PIPA_HOME, home);
+          assert.equal(options.env.PIPA_RESTART_CHANNEL_ID, "C123");
+          assert.equal(options.env.PIPA_RESTART_THREAD_TS, "123.456");
           assert.equal(options.env.PIPA_SLACK_BOT_TOKEN, undefined);
           assert.equal(options.env.Slack_Client_Secret, undefined);
           void (async () => {
