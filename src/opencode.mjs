@@ -20,8 +20,13 @@ export class PipaStoppedError extends Error {
   }
 }
 
+export class PipaRestartingError extends PipaStoppedError {}
+
 export function cleanChildEnvironment(environment = process.env) {
-  return Object.fromEntries(Object.entries(environment).filter(([key]) => !SLACK_SECRET_ENV_KEY.test(key)));
+  return {
+    ...Object.fromEntries(Object.entries(environment).filter(([key]) => !SLACK_SECRET_ENV_KEY.test(key))),
+    PIPA_HOME: path.resolve(environment.PIPA_HOME || os.homedir()),
+  };
 }
 
 export async function startSocketOpenCodeServer(config, options = {}) {
@@ -33,7 +38,7 @@ export async function startSocketOpenCodeServer(config, options = {}) {
 
   if (attachUrl) {
     const baseUrl = normalizeBaseUrl(attachUrl);
-    await waitForWorkspace(baseUrl, config.workingDirectory, fetchImpl, headers, startupTimeoutMs);
+    await waitForWorkspace(baseUrl, config.workingDirectory, fetchImpl, headers, startupTimeoutMs, options.signal);
     return externalServer(baseUrl);
   }
 
@@ -60,7 +65,7 @@ export async function startSocketOpenCodeServer(config, options = {}) {
     child.stdout?.resume();
     child.stderr?.resume();
     await Promise.race([
-      waitForWorkspace(baseUrl, config.workingDirectory, fetchImpl, headers, startupTimeoutMs),
+      waitForWorkspace(baseUrl, config.workingDirectory, fetchImpl, headers, startupTimeoutMs, options.signal),
       exit.then((code) => { throw new Error(`OpenCode server exited before startup with code ${code}.`); }),
     ]);
     return ownedServer(baseUrl, child, exit, platform);
@@ -297,8 +302,20 @@ export function startOpenCodeServer(config, options = {}) {
   const exit = waitForExit(child).then((code) => {
     if (!stopping) throw new Error(`OpenCode server exited unexpectedly with code ${code}.`);
   });
+  void exit.catch(() => undefined);
 
   return {
+    async ready() {
+      const controller = new AbortController();
+      const hostname = config.openCodeHostname.includes(":") && !config.openCodeHostname.startsWith("[") ? `[${config.openCodeHostname}]` : config.openCodeHostname;
+      try {
+        await Promise.race([
+          waitForWorkspace(`http://${hostname}:${config.openCodePort}`, config.workingDirectory,
+            options.fetch ?? fetch, authenticationHeaders(options.environment ?? process.env), options.startupTimeoutMs ?? 30_000, controller.signal),
+          exit.then(() => { throw new Error("OpenCode stopped before workspace readiness."); }),
+        ]);
+      } finally { controller.abort(); }
+    },
     wait: () => exit,
     stop(signal) {
       if (stopping) return;
@@ -368,10 +385,14 @@ function promptBody(prompt, files, contextEnvironment, artifactDirectory) {
   const parts = [{ type: "text", text: prompt }, ...files.map((file) => ({ type: "file", ...file }))];
   const context = Object.entries(contextEnvironment).filter(([, value]) => value !== undefined && value !== null && String(value));
   const instructions = ["For scheduling requests, consult `pipa routine --help`, convert timezone wording to an IANA timezone, preview first, show the normalized details, and create only after user confirmation."];
+  const restartCommand = contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack" && contextEnvironment.PIPA_CURRENT_SLACK_CHANNEL_ID
+    ? `pipa restart --channel ${contextEnvironment.PIPA_CURRENT_SLACK_CHANNEL_ID}${contextEnvironment.PIPA_CURRENT_SLACK_THREAD_TS ? ` --thread ${contextEnvironment.PIPA_CURRENT_SLACK_THREAD_TS}` : ""}`
+    : "pipa restart";
+  instructions.push(`When asked to restart Pipa, run \`${restartCommand}\`; existing messaging authorization is sufficient. It requests a detached restart and may end this turn. Use \`pipa restart --status\` to inspect the durable outcome; do not claim completion from the request alone. Both commands must run on the Pipa host, not a remote attached OpenCode host. If you lack command access to the Pipa host, explain that limitation instead of running them remotely. The Pipa profile home on that host is ${JSON.stringify(path.resolve(process.env.PIPA_HOME || os.homedir()))}; ensure PIPA_HOME has this value in the command environment. Do not use sequential stop/start or OpenCode /instance/dispose: that disposes an instance, not restarts the server.`);
   if (context.length) instructions.push(`Slack context for this turn (provided here, not as shell environment variables):\n${context.map(([key, value]) => `${key}=${value}`).join("\n")}`);
   if (contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack") {
     instructions.push("Keep naturally short answers inline. For deeper work or larger deliverables, keep the Slack response concise and use the most suitable artifact format.");
-    if (artifactDirectory) instructions.push(`To attach files, copy up to 10 top-level files (100 MB total) to this private artifact directory: ${artifactDirectory}\nEnd with exactly one final line: ${ARTIFACT_MARKER} [\"report.csv\",\"brief.pdf\"]`);
+    if (artifactDirectory) instructions.push(`To attach files, copy up to 10 top-level files (100 MB total) to this private artifact directory: ${artifactDirectory}\nOnly if you created files, end your response with exactly one final line in this format: ${ARTIFACT_MARKER} [\"report.csv\",\"brief.pdf\"]\nDo not emit ${ARTIFACT_MARKER} otherwise.`);
   }
   return {
     parts,
@@ -381,10 +402,16 @@ function promptBody(prompt, files, contextEnvironment, artifactDirectory) {
 
 function parseArtifactDeclaration(text) {
   const lines = text.split(/\r?\n/u);
-  const declarations = lines.map((line, index) => line.startsWith(ARTIFACT_MARKER) ? { line, index } : null).filter(Boolean);
-  const cleanText = lines.filter((line) => !line.startsWith(ARTIFACT_MARKER)).join("\n").trim();
+  const declarations = lines.map((line, index) => {
+    const markerIndex = line.indexOf(ARTIFACT_MARKER);
+    return markerIndex < 0 ? null : { line: line.slice(markerIndex), index, markerIndex };
+  }).filter(Boolean);
+  const cleanText = lines.map((line) => {
+    const markerIndex = line.indexOf(ARTIFACT_MARKER);
+    return markerIndex < 0 ? line : line.slice(0, markerIndex).trimEnd();
+  }).join("\n").trim();
   const lastNonblank = lines.findLastIndex((line) => line.trim());
-  if (declarations.length !== 1 || declarations[0].index !== lastNonblank) return { text: cleanText };
+  if (declarations.length !== 1 || declarations[0].index !== lastNonblank || declarations[0].markerIndex !== 0) return { text: cleanText };
   const declaration = declarations[0].line;
   if (!declaration.startsWith(`${ARTIFACT_MARKER} `) || Buffer.byteLength(declaration) > MAX_ARTIFACT_DECLARATION_BYTES) return { text: cleanText };
   let paths;
@@ -519,13 +546,13 @@ function externalServer(baseUrl) {
   };
 }
 
-async function waitForWorkspace(baseUrl, workingDirectory, fetchImpl, headers, timeoutMs) {
+async function waitForWorkspace(baseUrl, workingDirectory, fetchImpl, headers, timeoutMs, signal) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
       const status = await fetchImpl(serverUrl(baseUrl, "/session/status", workingDirectory), {
         headers,
-        signal: AbortSignal.timeout(Math.min(5_000, Math.max(1, deadline - Date.now()))),
+        signal: AbortSignal.any([AbortSignal.timeout(Math.min(5_000, Math.max(1, deadline - Date.now()))), ...(signal ? [signal] : [])]),
       });
       const sessions = status.ok ? await status.json() : null;
       if (sessions && typeof sessions === "object" && !Array.isArray(sessions)
@@ -533,7 +560,7 @@ async function waitForWorkspace(baseUrl, workingDirectory, fetchImpl, headers, t
     } catch {
       // OpenCode can accept its socket before the configured workspace is ready.
     }
-    await delay(Math.min(250, Math.max(0, deadline - Date.now())));
+    await delay(Math.min(250, Math.max(0, deadline - Date.now())), signal);
   }
   throw new Error("OpenCode workspace readiness check timed out.");
 }

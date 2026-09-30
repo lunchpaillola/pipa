@@ -22,7 +22,8 @@ test("removes Slack credentials from child environments regardless of casing", (
     Slack_Api_Token: "secret",
     Slack_Client_Secret: "secret",
     Pipa_Slack_App_Token: "secret",
-  }), { PATH: "/bin", PIPA_CURRENT_SLACK_CHANNEL_ID: "C123" });
+  }), { PATH: "/bin", PIPA_CURRENT_SLACK_CHANNEL_ID: "C123", PIPA_HOME: path.resolve(os.homedir()) });
+  assert.equal(cleanChildEnvironment({ PIPA_HOME: "relative-profile" }).PIPA_HOME, path.resolve("relative-profile"));
 });
 
 test("starts one owned loopback server on port 0 and stops it", async () => {
@@ -86,6 +87,31 @@ test("checks an authenticated attached workspace without owning it", async () =>
   assert.ok(requests.every(({ init }) => init.headers.authorization === `Basic ${Buffer.from("pipa:secret").toString("base64")}`));
   server.stop();
   await server.wait();
+});
+
+for (const mode of ["attached", "owned"]) test(`cancels ${mode} Socket workspace readiness`, async () => {
+  const controller = new AbortController();
+  const entered = Promise.withResolvers();
+  const child = childProcess();
+  child.kill = () => {
+    queueMicrotask(() => child.emit("close", 0));
+    return true;
+  };
+  const starting = startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    signal: controller.signal,
+    environment: mode === "attached" ? { PIPA_OPENCODE_ATTACH_URL: "http://localhost:5555" } : {},
+    fetch: async (_url, { signal }) => {
+      entered.resolve();
+      return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    },
+    spawn: () => {
+      queueMicrotask(() => child.stdout.write("opencode server listening on http://127.0.0.1:54321\n"));
+      return child;
+    },
+  });
+  await entered.promise;
+  controller.abort(new Error("cancelled startup"));
+  await assert.rejects(starting, /cancelled startup/u);
 });
 
 test("cleans up an owned child when workspace readiness never succeeds", async () => {
@@ -171,7 +197,7 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
     prompt,
     sessionId: "ses_1",
     workingDirectory: "/work",
-    contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack", PIPA_CURRENT_SLACK_CHANNEL_ID: "C1" },
+    contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack", PIPA_CURRENT_SLACK_CHANNEL_ID: "C1", PIPA_CURRENT_SLACK_THREAD_TS: "123.456" },
     attachments: [attachment],
   });
 
@@ -182,6 +208,10 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
   assert.match(promptBody.system, /PIPA_MESSAGE_CHANNEL=slack/u);
   assert.match(promptBody.system, /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
   assert.match(promptBody.system, /consult `pipa routine --help`/u);
+  assert.match(promptBody.system, /run `pipa restart --channel C1 --thread 123\.456`/u);
+  assert.match(promptBody.system, /existing messaging authorization is sufficient/u);
+  assert.match(promptBody.system, /pipa restart --status/u);
+  assert.match(promptBody.system, /ensure PIPA_HOME/u);
   assert.match(promptBody.system, /IANA timezone/u);
   assert.match(promptBody.system, /preview first/u);
   assert.match(promptBody.system, /create only after user confirmation/u);
@@ -431,6 +461,28 @@ test("Managed server inherits its clean environment and forwards termination sig
     server.stop(signal);
     await server.wait();
     assert.equal(killCount, 1);
+  }
+});
+
+test("Managed readiness checks workspace health, authentication and a bounded deadline", async () => {
+  for (const healthy of [true, false]) {
+    const child = childProcess();
+    child.kill = () => { queueMicrotask(() => child.emit("close", 0)); return true; };
+    let requests = 0;
+    const server = startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "127.0.0.1", openCodePort: 4096 }, {
+      platform: "linux", spawn: () => child, startupTimeoutMs: healthy ? 1_000 : 10,
+      environment: { OPENCODE_SERVER_PASSWORD: "test-password" },
+      fetch: async (url, init) => {
+        requests += 1;
+        assert.equal(String(url), "http://127.0.0.1:4096/session/status?directory=%2Fwork");
+        assert.equal(init.headers.authorization, `Basic ${Buffer.from("opencode:test-password").toString("base64")}`);
+        return jsonResponse(healthy && requests > 1 ? {} : { ok: true });
+      },
+    });
+    try {
+      if (healthy) { await server.ready(); assert.equal(requests, 2); }
+      else await assert.rejects(server.ready(), /workspace readiness check timed out/u);
+    } finally { server.stop(); await server.wait(); }
   }
 });
 
@@ -847,6 +899,8 @@ test("Slack turns request concise delivery and return declared binary artifacts"
   assert.equal(path.basename(artifactDirectory), "ses_1");
   assert.match(system, new RegExp(artifactDirectory.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
   assert.match(system, /copy up to 10 top-level files \(100 MB total\)/u);
+  assert.match(system, /Only if you created files/u);
+  assert.match(system, /Do not emit PIPA_ARTIFACTS: otherwise/u);
   assert.match(system, /PIPA_ARTIFACTS: \["report\.csv","brief\.pdf"\]/u);
   assert.match(system, /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
   assert.equal(result.text, "Ready for review.");
@@ -934,6 +988,8 @@ test("short Slack answers stay inline and remote attached servers get no local a
     response: async (body) => { remoteSystem = body.system; return 'Summary.\nPIPA_ARTIFACTS: ["private.pdf"]'; },
   });
   assert.match(remoteSystem, /For deeper work or larger deliverables/u);
+  assert.match(remoteSystem, /Both commands must run on the Pipa host, not a remote attached OpenCode host/u);
+  assert.match(remoteSystem, /If you lack command access to the Pipa host, explain that limitation/u);
   assert.doesNotMatch(remoteSystem, /PIPA_ARTIFACTS|artifact director|pipa-artifacts-/u);
   assert.deepEqual(remote, { text: "Summary.", sessionId: "ses_1" });
 
@@ -945,6 +1001,8 @@ test("short Slack answers stay inline and remote attached servers get no local a
 
 test("malformed or non-private artifact declarations are stripped and upload nothing", async () => {
   const cases = [
+    "Yes. PIPA_ARTIFACTS: []",
+    'Yes. PIPA_ARTIFACTS: ["ok.txt"]',
     'Before.\nPIPA_ARTIFACTS: ["ok.txt"]\nAfter.',
     'PIPA_ARTIFACTS: ["ok.txt"]\nPIPA_ARTIFACTS: ["ok.txt"]',
     "PIPA_ARTIFACTS: nope",
@@ -963,7 +1021,7 @@ test("malformed or non-private artifact declarations are stripped and upload not
       await writeFile(path.join(directory, "same.txt"), "same");
       return `Summary.\n${declaration}`;
     } });
-    assert.doesNotMatch(result.text, /^PIPA_ARTIFACTS:/mu);
+    assert.doesNotMatch(result.text, /PIPA_ARTIFACTS:/u);
     assert.equal(result.files, undefined);
   }
 });

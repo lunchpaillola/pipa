@@ -4,7 +4,7 @@ import { Chat, Modal, TextInput } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { canonicalWorkingDirectory, createManifest, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
-import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
+import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaRestartingError, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
 import { assertRoutineDestinationAllowed, createRoutineScheduler, loadRoutineState } from "./routines.mjs";
 
 class RoutineDeniedError extends Error {}
@@ -31,11 +31,15 @@ export async function initializePipa(input, options = {}) {
 }
 
 export async function startPipa(options = {}) {
+  options.signal?.throwIfAborted();
   const paths = options.paths ?? pipaPaths();
   const config = options.config ?? await loadConfig(paths.config);
+  options.signal?.throwIfAborted();
   const slackAuth = await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
+  options.signal?.throwIfAborted();
   warnMissingSlackScopes(slackAuth, options.warn);
   const sessionStore = options.sessionStore ?? await createSessionStore(paths.sessions);
+  options.signal?.throwIfAborted();
   const state = options.state ?? createMemoryState();
   const chat = options.chat ?? new Chat({
     adapters: {
@@ -53,9 +57,11 @@ export async function startPipa(options = {}) {
   });
   const server = options.server ?? (options.executor ? null : await (options.startServer ?? startSocketOpenCodeServer)(config, {
     startupTimeoutMs: options.startupTimeoutMs,
+    signal: options.signal,
   }));
   let executor;
   try {
+    options.signal?.throwIfAborted();
     executor = options.executor ?? (options.createExecutor ?? createOpenCodeExecutor)({
       artifactRoot: path.join(config.workingDirectory, ".pipa", "artifacts"),
       baseUrl: server.baseUrl,
@@ -195,8 +201,10 @@ export async function startPipa(options = {}) {
         onPermissionsReconciled: interactions.onPermissionsReconciled,
         startTyping: () => thread.startTyping("Working on it..."),
         deliver: (result, signal) => postResult(thread, result, signal),
-        deliverFailure: (error) => thread.post(error instanceof PipaStoppedError
-          ? `${config.botName} stopped before finishing this request.`
+        deliverFailure: (error) => thread.post(error instanceof PipaRestartingError
+          ? `${config.botName} is restarting. I'll post here when it's ready.`
+          : error instanceof PipaStoppedError
+          ? `${config.botName} was stopped. It won't respond until it starts again.`
           : `${config.botName} failed: ${safeError(error)}`),
       });
       if (result.superseded) return;
@@ -209,14 +217,29 @@ export async function startPipa(options = {}) {
 
   chat.onNewMention((thread, message) => { void handle(thread, message, true); });
   chat.onSubscribedMessage((thread, message) => { void handle(thread, message, false); });
+  const stop = (reason = new PipaStoppedError()) => {
+    if (!accepting) return;
+    accepting = false;
+    routineScheduler?.stop(reason);
+    runner.close(reason);
+    executor.stopAll(reason);
+  };
+  const cancelled = () => stop();
+  options.signal?.addEventListener("abort", cancelled, { once: true });
   try {
+    options.signal?.throwIfAborted();
     await state.connect();
+    options.signal?.throwIfAborted();
     for (const conversationKey of sessionStore.keys()) {
       await chat.thread(conversationKey).subscribe();
+      options.signal?.throwIfAborted();
     }
     await withTimeout(chat.initialize(), options.startupTimeoutMs ?? 30_000, "Slack Socket Mode startup timed out.");
+    options.signal?.throwIfAborted();
     await routineScheduler?.start();
+    options.signal?.throwIfAborted();
   } catch (error) {
+    options.signal?.removeEventListener("abort", cancelled);
     routineScheduler?.stop(error);
     await routineScheduler?.drain();
     await withTimeout(interactions.close(), options.shutdownTimeoutMs ?? 15_000, "Interaction shutdown timed out.").catch(() => undefined);
@@ -226,14 +249,6 @@ export async function startPipa(options = {}) {
     await withTimeout(server?.wait(), options.shutdownTimeoutMs ?? 15_000, "OpenCode shutdown timed out.").catch(() => undefined);
     throw error;
   }
-
-  const stop = (reason = new PipaStoppedError()) => {
-    if (!accepting) return;
-    accepting = false;
-    routineScheduler?.stop(reason);
-    runner.close(reason);
-    executor.stopAll(reason);
-  };
 
   return {
     server: server ? { baseUrl: server.baseUrl, owned: server.owned } : null,
@@ -245,8 +260,13 @@ export async function startPipa(options = {}) {
         throw error;
       }
     },
-    stop: () => stop(),
+    stop,
+    async postRestartReady(destination) {
+      assertRoutineDestinationAllowed(destination, config.allowedSlackChannelIds ?? []);
+      return chat.thread(slackDestinationId(destination)).post(`${config.botName} restarted and is ready.`);
+    },
     async shutdown() {
+      options.signal?.removeEventListener("abort", cancelled);
       stop();
       try {
         await withTimeout((async () => {
@@ -619,6 +639,7 @@ export function createConversationRunner({ sessionStore, runTurn, abortTurn = as
         sessionId: current.sessionId,
         onSession: async (sessionId) => {
           current.sessionId = sessionId;
+          if (isLatest()) await sessionStore.set(conversationKey, sessionId);
           await onSession?.(sessionId);
         },
       });

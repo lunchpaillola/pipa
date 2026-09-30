@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -146,4 +147,35 @@ test("stops the process recorded in the instance lock", async () => {
   let signal;
   assert.equal(await stopInstance(file, (pid, received) => { signal = { pid, received }; }), 12345);
   assert.deepEqual(signal, { pid: 12345, received: "SIGTERM" });
+});
+
+test("lock generations are unique and an old release cannot delete a replacement", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-lock-"));
+  const file = pipaPaths(home).lock;
+  const release = await acquireInstanceLock(file);
+  assert.equal(release.identity.pid, process.pid);
+  assert.ok(release.identity.generation);
+  await release();
+  const replacement = await acquireInstanceLock(file);
+  assert.notEqual(replacement.identity.generation, release.identity.generation);
+  await release();
+  assert.deepEqual(JSON.parse(await readFile(file, "utf8")), replacement.identity);
+  await replacement();
+});
+
+test("stop reads generation locks and ESRCH never removes a changed owner", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-stop-"));
+  const file = pipaPaths(home).lock;
+  const release = await acquireInstanceLock(file);
+  assert.equal(await stopInstance(file, (pid, signal) => {
+    assert.equal(pid, release.identity.pid);
+    assert.equal(signal, "SIGTERM");
+  }), process.pid);
+  const replacement = { pid: 12345, generation: "00000000-0000-0000-0000-000000000000" };
+  assert.equal(await stopInstance(file, () => {
+    writeFileSync(file, JSON.stringify(replacement));
+    throw Object.assign(new Error("gone"), { code: "ESRCH" });
+  }), null);
+  await release();
+  assert.deepEqual(JSON.parse(await readFile(file, "utf8")), replacement);
 });
