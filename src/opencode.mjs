@@ -38,7 +38,7 @@ export async function startSocketOpenCodeServer(config, options = {}) {
 
   if (attachUrl) {
     const baseUrl = normalizeBaseUrl(attachUrl);
-    await waitForWorkspace(baseUrl, config.workingDirectory, fetchImpl, headers, startupTimeoutMs);
+    await waitForWorkspace(baseUrl, config.workingDirectory, fetchImpl, headers, startupTimeoutMs, options.signal);
     return externalServer(baseUrl);
   }
 
@@ -65,7 +65,7 @@ export async function startSocketOpenCodeServer(config, options = {}) {
     child.stdout?.resume();
     child.stderr?.resume();
     await Promise.race([
-      waitForWorkspace(baseUrl, config.workingDirectory, fetchImpl, headers, startupTimeoutMs),
+      waitForWorkspace(baseUrl, config.workingDirectory, fetchImpl, headers, startupTimeoutMs, options.signal),
       exit.then((code) => { throw new Error(`OpenCode server exited before startup with code ${code}.`); }),
     ]);
     return ownedServer(baseUrl, child, exit, platform);

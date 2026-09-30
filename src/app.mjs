@@ -57,6 +57,7 @@ export async function startPipa(options = {}) {
   });
   const server = options.server ?? (options.executor ? null : await (options.startServer ?? startSocketOpenCodeServer)(config, {
     startupTimeoutMs: options.startupTimeoutMs,
+    signal: options.signal,
   }));
   let executor;
   try {
@@ -260,7 +261,7 @@ export async function startPipa(options = {}) {
       }
     },
     stop,
-    postRestartReady(destination) {
+    async postRestartReady(destination) {
       assertRoutineDestinationAllowed(destination, config.allowedSlackChannelIds ?? []);
       return chat.thread(slackDestinationId(destination)).post(`${config.botName} restarted and is ready.`);
     },

@@ -89,6 +89,31 @@ test("checks an authenticated attached workspace without owning it", async () =>
   await server.wait();
 });
 
+for (const mode of ["attached", "owned"]) test(`cancels ${mode} Socket workspace readiness`, async () => {
+  const controller = new AbortController();
+  const entered = Promise.withResolvers();
+  const child = childProcess();
+  child.kill = () => {
+    queueMicrotask(() => child.emit("close", 0));
+    return true;
+  };
+  const starting = startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    signal: controller.signal,
+    environment: mode === "attached" ? { PIPA_OPENCODE_ATTACH_URL: "http://localhost:5555" } : {},
+    fetch: async (_url, { signal }) => {
+      entered.resolve();
+      return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    },
+    spawn: () => {
+      queueMicrotask(() => child.stdout.write("opencode server listening on http://127.0.0.1:54321\n"));
+      return child;
+    },
+  });
+  await entered.promise;
+  controller.abort(new Error("cancelled startup"));
+  await assert.rejects(starting, /cancelled startup/u);
+});
+
 test("cleans up an owned child when workspace readiness never succeeds", async () => {
   let killed = false;
   const child = childProcess();

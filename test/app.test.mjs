@@ -132,6 +132,7 @@ test("complete or unknown Slack scope metadata does not warn", async () => {
 
 test("starts and health-checks OpenCode before Slack, then stops only the owned server", async () => {
   const events = [];
+  const controller = new AbortController();
   let stopServer;
   let failServer;
   let serverStopped = false;
@@ -153,12 +154,17 @@ test("starts and health-checks OpenCode before Slack, then stops only the owned 
     async shutdown() { events.push("slack:stop"); },
   };
   const app = await startPipa({
+    signal: controller.signal,
     chat,
     state: { connect: async () => undefined },
     sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
     checkSlackToken: async () => ({ ok: true }),
     config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
-    startServer: async () => { events.push("server:ready"); return server; },
+    startServer: async (_config, options) => {
+      assert.equal(options.signal, controller.signal);
+      events.push("server:ready");
+      return server;
+    },
     createExecutor: ({ artifactRoot, baseUrl, onFatal }) => {
       events.push(`executor:${baseUrl}`);
       assert.equal(artifactRoot, path.join("/work", ".pipa", "artifacts"));
@@ -930,7 +936,7 @@ test("restores a restarting thread and continues its session", async () => {
     config: { botName: "Chopper", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work", allowedSlackChannelIds: ["C1"] },
   });
   await replacement.postRestartReady({ channelId: "C1", threadTs: "1.0" });
-  assert.throws(() => replacement.postRestartReady({ channelId: "C2", threadTs: "1.0" }), /not allowed/u);
+  await assert.rejects(replacement.postRestartReady({ channelId: "C2", threadTs: "1.0" }), /not allowed/u);
   await replacementHandlers.subscribed(thread, { id: "2", text: "how are ya feeling", author: { userId: "U1" }, raw: {} });
   await waitFor(() => posts.length === 3);
 
