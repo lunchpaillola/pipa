@@ -64,11 +64,14 @@ By default Pipa answers anyone who mentions it in a channel it can see. In a sha
   "slackAppToken": "xapp-...",
   "slackBotToken": "xoxb-...",
   "allowedSlackChannelIds": ["C0BSE2JTYPR"],
-  "allowedSlackUserIds": ["UFWBSCZ54"]
+  "allowedSlackUserIds": ["UFWBSCZ54"],
+  "allowedSlackBotIds": ["B0C6Q27E82X"]
 }
 ```
 
 A mention is only handled when the channel ID is in `allowedSlackChannelIds` **and** the author's user ID is in `allowedSlackUserIds`. Leave a list empty to allow any channel or any user. You can also set them non-interactively during setup with `PIPA_ALLOWED_CHANNEL_IDS` and `PIPA_ALLOWED_USER_IDS` (comma-separated).
+
+By default Pipa ignores messages sent by other Slack apps. List their bot IDs in `allowedSlackBotIds` to let those messages through; an allowed bot only needs its bot ID (e.g. `B0C6Q27E82X`), not an entry in `allowedSlackUserIds`. Bots not on the list stay ignored even when `allowedSlackUserIds` is empty. Set it non-interactively during setup with `PIPA_ALLOWED_BOT_IDS` (comma-separated).
 
 To use an existing OpenCode server instead, set its URL before starting Pipa. Pipa checks that the server can serve the configured workspace but does not start or stop it. If the server uses authentication, also set `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD`:
 

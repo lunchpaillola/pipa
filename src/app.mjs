@@ -19,6 +19,7 @@ export async function initializePipa(input, options = {}) {
     workingDirectory: await canonicalWorkingDirectory(input.workingDirectory),
     allowedSlackChannelIds: normalizeIdList(input.allowedSlackChannelIds),
     allowedSlackUserIds: normalizeIdList(input.allowedSlackUserIds),
+    allowedSlackBotIds: normalizeIdList(input.allowedSlackBotIds),
   };
   const openCodeVersion = await (options.checkOpenCode ?? runOpenCodeVersion)();
   if (!/^v?1(?:\.|$)/u.test(openCodeVersion)) throw new Error(`Pipa requires OpenCode v1; found ${openCodeVersion || "an unknown version"}.`);
@@ -170,7 +171,7 @@ export async function startPipa(options = {}) {
   };
 
   const handle = async (thread, message, subscribe) => {
-    if (!accepting || !isAuthorized(thread, message, config) || shouldIgnore(thread, message)) return;
+    if (!accepting || !isAuthorized(thread, message, config) || shouldIgnore(thread, message, config)) return;
     const messageText = subscribe || message.isMention ? stripMention(message.text) : message.text.trim();
     const missingLinks = (message.links ?? []).map((link) => link.url)
       .filter((url) => typeof url === "string" && !messageText.split(/\s+/u).includes(url));
@@ -714,12 +715,13 @@ export async function checkSlackAppToken(token, fetchImpl = fetch) {
   return result;
 }
 
-function shouldIgnore(thread, message) {
+function shouldIgnore(thread, message, config) {
+  const allowedSubtypes = config.allowedSlackBotIds?.length ? ["file_share", "bot_message"] : ["file_share"];
   return message.author?.isMe
-    || message.author?.isBot
+    || (message.author?.isBot && !config.allowedSlackBotIds?.length)
+    || Boolean(message.raw?.subtype && !allowedSubtypes.includes(message.raw.subtype))
     || thread.channel?.isDM
     || thread.channel?.channelVisibility === "external"
-    || Boolean(message.raw?.subtype && message.raw.subtype !== "file_share")
     || !message.text?.trim();
 }
 
@@ -727,6 +729,7 @@ function isAuthorized(thread, message, config) {
   const channelId = thread.id.split(":")[1];
   const userId = message.author?.userId ?? message.author?.id;
   if (config.allowedSlackChannelIds?.length && !config.allowedSlackChannelIds.includes(channelId)) return false;
+  if (message.author?.isBot) return config.allowedSlackBotIds?.includes(userId) ?? false;
   if (config.allowedSlackUserIds?.length && !config.allowedSlackUserIds.includes(userId)) return false;
   return true;
 }

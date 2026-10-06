@@ -582,6 +582,7 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
     [{ channel: { isDM: false, channelVisibility: "external" } }, {}],
     [{}, { author: { ...human, isMe: true } }],
     [{}, { author: { ...human, isBot: true } }],
+    [{}, { author: { ...human, isBot: true }, raw: { subtype: "bot_message" } }],
     [{}, { raw: { subtype: "message_changed" } }],
     [{}, { text: "  ", attachments: [attachment] }],
   ]) {
@@ -983,6 +984,47 @@ test("ignores mentions from unauthorized users or channels", async () => {
   await waitFor(() => posts.length === 1);
   assert.deepEqual(calls, ["hi"]);
   assert.deepEqual(posts, [{ markdown: "hi" }]);
+  await app.shutdown();
+});
+
+test("handles messages only from allowed Slack bots", async () => {
+  const handlers = {};
+  const posts = [];
+  const chat = {
+    onNewMention(handler) { handlers.mention = handler; },
+    onSubscribedMessage(handler) { handlers.subscribed = handler; },
+    async initialize() {},
+    async shutdown() {},
+  };
+  const calls = [];
+  const executor = {
+    runTurn: async ({ prompt }) => { calls.push(prompt); return { text: prompt, sessionId: "ses_1" }; },
+    stopAll() {},
+  };
+  const config = {
+    botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work",
+    allowedSlackChannelIds: ["C1"], allowedSlackUserIds: ["U1"], allowedSlackBotIds: ["B1"],
+  };
+  const app = await startPipa({
+    chat, executor,
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    config,
+  });
+
+  const bot = { id: "B1", userId: "B1", isMe: false, isBot: true };
+  const otherBot = { id: "B2", userId: "B2", isMe: false, isBot: true };
+  const thread = (id) => ({ id, channel: { isDM: false, channelVisibility: "private" }, subscribe: async () => undefined, adapter: { addReaction: async () => undefined, removeReaction: async () => undefined }, post: async (text) => posts.push(text) });
+
+  await handlers.subscribed(thread("slack:C1:1"), { id: "1", text: "alert fired", author: bot, raw: { subtype: "bot_message" } });
+  await handlers.mention(thread("slack:C1:2"), { id: "2", text: "@U1 triage this", author: bot, raw: { subtype: "bot_message" } });
+  await handlers.subscribed(thread("slack:C1:3"), { id: "3", text: "not for you", author: otherBot, raw: { subtype: "bot_message" } });
+  await handlers.subscribed(thread("slack:C2:4"), { id: "4", text: "wrong channel", author: bot, raw: { subtype: "bot_message" } });
+  await handlers.subscribed(thread("slack:C1:5"), { id: "5", text: "edited", author: bot, raw: { subtype: "message_changed" } });
+
+  await waitFor(() => posts.length === 2);
+  assert.deepEqual(calls, ["alert fired", "triage this"]);
+  assert.deepEqual(posts, [{ markdown: "alert fired" }, { markdown: "triage this" }]);
   await app.shutdown();
 });
 
