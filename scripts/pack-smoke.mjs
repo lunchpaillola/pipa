@@ -64,6 +64,7 @@ if (process.argv[2] === "--version") {
     PIPA_SLACK_BOT_TOKEN: "xoxb-test",
     PIPA_ALLOWED_CHANNEL_IDS: "",
     PIPA_ALLOWED_USER_IDS: "",
+    PIPA_ALLOWED_BOT_IDS: "",
     NODE_OPTIONS: `--import=${pathToFileURL(path.join(directory, "fetch-mock.mjs")).href}`,
     PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
   }, "", workingDirectory);
