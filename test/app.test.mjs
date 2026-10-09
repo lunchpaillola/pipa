@@ -3,6 +3,9 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { createSlackAdapter } from "@chat-adapter/slack";
+import { createMemoryState } from "@chat-adapter/state-memory";
+import { Chat } from "chat";
 import { checkSlackAppToken, checkSlackToken, createConversationRunner, createPendingInteractions, initializePipa, postResult, slackDestinationId, startPipa as startPipaRuntime } from "../src/app.mjs";
 import { PipaRestartingError, PipaStoppedError } from "../src/opencode.mjs";
 import { createRoutineScheduler, normalizeRoutine } from "../src/routines.mjs";
@@ -582,6 +585,7 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
     [{ channel: { isDM: false, channelVisibility: "external" } }, {}],
     [{}, { author: { ...human, isMe: true } }],
     [{}, { author: { ...human, isBot: true } }],
+    [{}, { author: { ...human, isBot: true }, raw: { subtype: "bot_message" } }],
     [{}, { raw: { subtype: "message_changed" } }],
     [{}, { text: "  ", attachments: [attachment] }],
   ]) {
@@ -984,6 +988,91 @@ test("ignores mentions from unauthorized users or channels", async () => {
   assert.deepEqual(calls, ["hi"]);
   assert.deepEqual(posts, [{ markdown: "hi" }]);
   await app.shutdown();
+});
+
+for (const allowedSlackUserIds of [["U1"], []]) test(`handles only allowed Slack bots with user allowlist ${JSON.stringify(allowedSlackUserIds)}`, async (t) => {
+  const handlers = {};
+  const posts = [];
+  const chat = {
+    onNewMention(handler) { handlers.mention = handler; },
+    onSubscribedMessage(handler) { handlers.subscribed = handler; },
+    async initialize() {},
+    async shutdown() {},
+  };
+  const calls = [];
+  const executor = {
+    runTurn: async ({ prompt }) => { calls.push(prompt); return { text: prompt, sessionId: "ses_1" }; },
+    stopAll() {},
+  };
+  const config = {
+    botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work",
+    allowedSlackChannelIds: ["C1"], allowedSlackUserIds, allowedSlackBotIds: ["B1"],
+  };
+  const app = await startPipa({
+    chat, executor,
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    config,
+  });
+  t.after(() => app.shutdown());
+
+  const adapter = createSlackAdapter({ mode: "socket", appToken: "xapp-test", botToken: "xoxb-test", botUserId: "UPIPA" });
+  const message = (ts, text, extra = {}) => adapter.parseMessage({
+    type: "message", channel: "C1", ts, text, subtype: "bot_message", bot_id: "B1", ...extra,
+  });
+  const thread = (id) => ({ id, channel: { isDM: false, channelVisibility: "private" }, subscribe: async () => undefined, adapter: { addReaction: async () => undefined, removeReaction: async () => undefined }, post: async (text) => posts.push(text) });
+
+  const appBotMention = message("2", "<@UPIPA> triage this", { user: "UAPPBOT" });
+  assert.equal(appBotMention.author.userId, "UAPPBOT");
+  await handlers.subscribed(thread("slack:C1:1"), message("1", "alert fired"));
+  await handlers.mention(thread("slack:C1:2"), appBotMention);
+  await handlers.subscribed(thread("slack:C1:3"), message("3", "not for you", { bot_id: "B2", user: "U1" }));
+  await handlers.subscribed(thread("slack:C2:4"), message("4", "wrong channel"));
+  await handlers.subscribed(thread("slack:C1:5"), message("5", "edited", { subtype: "message_changed" }));
+  await handlers.mention(thread("slack:C1:6"), message("6", "<@UPIPA> self", { user: "UPIPA" }));
+  await handlers.subscribed({ ...thread("slack:C1:7"), channel: { isDM: true } }, message("7", "direct message"));
+  await handlers.subscribed({ ...thread("slack:C1:8"), channel: { channelVisibility: "external" } }, message("8", "external channel"));
+
+  await waitFor(() => posts.length === 2);
+  assert.deepEqual(calls, ["alert fired", "triage this"]);
+  assert.deepEqual(posts, [{ markdown: "alert fired" }, { markdown: "triage this" }]);
+});
+
+test("Slack SDK routes allowlisted webhook mentions and subscribed bot replies to Pipa", async (t) => {
+  const adapter = createSlackAdapter({ signingSecret: "test", botToken: "xoxb-test", botUserId: "UPIPA", userName: "Pipa" });
+  const posts = [];
+  // Only outbound Slack delivery is replaced; parsing, routing and authorization are real.
+  adapter.postMessage = async (threadId, text) => { posts.push(text); return { id: "reply", threadId, raw: {} }; };
+  adapter.addReaction = async () => undefined;
+  adapter.removeReaction = async () => undefined;
+  adapter.startTyping = async () => undefined;
+  const chat = new Chat({ adapters: { slack: adapter }, state: createMemoryState(), concurrency: "concurrent", userName: "Pipa", logger: "silent" });
+  const calls = [];
+  const app = await startPipa({
+    chat,
+    executor: { runTurn: async ({ prompt }) => { calls.push(prompt); return { text: prompt, sessionId: "ses_bot" }; }, stopAll() {} },
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work", allowedSlackChannelIds: ["C1"], allowedSlackBotIds: ["B1"] },
+  });
+  t.after(() => app.shutdown());
+  const send = async (ts, text, extra = {}) => {
+    const message = adapter.parseMessage({ type: "message", subtype: "bot_message", channel: "C1", bot_id: "B1", ts, text, ...extra });
+    const pending = [];
+    chat.processMessage(adapter, message.threadId, message, { waitUntil: (promise) => pending.push(promise) });
+    await Promise.all(pending);
+  };
+  await send("1.0", "unmentioned alert");
+  assert.deepEqual(calls, []);
+  await send("2.0", "<@UPIPA> triage this alert");
+  await waitFor(() => posts.length === 1);
+  await send("3.0", "more context", { user: "UAPPBOT", thread_ts: "2.0" });
+  await waitFor(() => posts.length === 2);
+  await send("4.0", "unlisted bot", { bot_id: "B2", thread_ts: "2.0" });
+  await send("5.0", "<@UPIPA> wrong channel", { channel: "C2" });
+  await send("6.0", "<@UPIPA> self", { user: "UPIPA" });
+  assert.deepEqual(calls, ["triage this alert", "more context"]);
+  assert.deepEqual(posts, [{ markdown: "triage this alert" }, { markdown: "more context" }]);
 });
 
 test("routine scheduler uses an exact destination and binds replies to its fresh session", async () => {

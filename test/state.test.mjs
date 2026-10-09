@@ -83,7 +83,7 @@ test("config validates allowed Slack access lists", async () => {
   const writeConfig = (config) => writeFile(file, JSON.stringify(config));
   const base = { botName: "Pipa", workingDirectory: home, slackAppToken: "xapp-test", slackBotToken: "xoxb-test" };
 
-  const valid = { ...base, allowedSlackChannelIds: ["C1", "C2"], allowedSlackUserIds: ["U1"] };
+  const valid = { ...base, allowedSlackChannelIds: ["C1", "C2"], allowedSlackUserIds: ["U1"], allowedSlackBotIds: ["B1"] };
   await writeConfig(valid);
   assert.deepEqual(await loadConfig(file), { ...valid, slackMode: "socket" });
 
@@ -97,6 +97,9 @@ test("config validates allowed Slack access lists", async () => {
     ["allowedSlackUserIds", 42],
     ["allowedSlackUserIds", [null]],
     ["allowedSlackUserIds", [" "]],
+    ["allowedSlackBotIds", "B1"],
+    ["allowedSlackBotIds", [1]],
+    ["allowedSlackBotIds", ["", "B1"]],
   ]) {
     await writeConfig({ ...base, [key]: value });
     await assert.rejects(loadConfig(file), /Invalid Pipa config/u);
