@@ -729,7 +729,7 @@ function isAuthorized(thread, message, config) {
   const channelId = thread.id.split(":")[1];
   const userId = message.author?.userId ?? message.author?.id;
   if (config.allowedSlackChannelIds?.length && !config.allowedSlackChannelIds.includes(channelId)) return false;
-  if (message.author?.isBot) return config.allowedSlackBotIds?.includes(userId) ?? false;
+  if (message.author?.isBot) return config.allowedSlackBotIds?.includes(message.raw?.bot_id) ?? false;
   if (config.allowedSlackUserIds?.length && !config.allowedSlackUserIds.includes(userId)) return false;
   return true;
 }
