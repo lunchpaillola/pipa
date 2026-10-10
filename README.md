@@ -55,7 +55,7 @@ Incoming messages can include up to Slack's 10-file limit, with a maximum size o
 
 ### Access control
 
-By default Pipa answers anyone who mentions it in a channel it can see. In a shared workspace, restrict who can use it by listing the allowed Slack channel and user IDs. `pipa init` asks for these, and they are stored in the config:
+By default Pipa answers any human user who mentions it in a channel it can see, excluding DMs and external channels. In a shared workspace, restrict who can use it by listing the allowed Slack channel and user IDs. `pipa init` asks for these, and they are stored in the config:
 
 ```json
 {
@@ -69,11 +69,39 @@ By default Pipa answers anyone who mentions it in a channel it can see. In a sha
 }
 ```
 
-A mention is only handled when the channel ID is in `allowedSlackChannelIds` **and** the author's user ID is in `allowedSlackUserIds`. Leave a list empty to allow any channel or any user. You can also set them non-interactively during setup with `PIPA_ALLOWED_CHANNEL_IDS` and `PIPA_ALLOWED_USER_IDS` (comma-separated).
+A human user's mention is only handled when the channel and user pass their respective allowlists. An absent or empty `allowedSlackChannelIds` allows any otherwise eligible channel; an absent or empty `allowedSlackUserIds` allows any human user. You can also set them non-interactively during setup with `PIPA_ALLOWED_CHANNEL_IDS` and `PIPA_ALLOWED_USER_IDS` (comma-separated).
 
-By default Pipa ignores messages sent by other Slack apps. List their bot IDs in `allowedSlackBotIds` to let those messages through; an allowed bot only needs its bot ID (e.g. `B0C6Q27E82X`), not an entry in `allowedSlackUserIds`. Bots not on the list stay ignored even when `allowedSlackUserIds` is empty. Set it non-interactively during setup with `PIPA_ALLOWED_BOT_IDS` (comma-separated).
+By default Pipa ignores messages sent by other Slack apps. Unlike the human user and channel lists, an absent or empty `allowedSlackBotIds` disables all other bots. List their bot IDs to let those messages through; an allowed bot only needs its bot ID (e.g. `B0C6Q27E82X`), not an entry in `allowedSlackUserIds`. Bots still must pass the channel allowlist. Bots not on the list stay ignored even when `allowedSlackUserIds` is empty. Set it non-interactively during setup with `PIPA_ALLOWED_BOT_IDS` (comma-separated).
 
-Use the message event's `bot_id` (`B…`), not the app ID (`A…`) or bot user ID (`U…`). After saving the config, restart Pipa. The allowed bot can start a conversation by posting `<@PIPA_BOT_USER_ID> triage this alert` in an allowed channel, or continue one by replying in a thread Pipa has subscribed to. For an incoming webhook, send that mention in the payload's `text` field. Allowlisting a bot does not make Pipa handle every message it posts in the channel; the normal mention/thread routing still applies. Only allow bots whose messages you trust as requests to your agent.
+#### Find the sender's bot ID
+
+Use the message event's `bot_id` (`B…`), not the app ID (`A…`) or bot user ID (`U…`). To look up the sender app's OAuth bot ID:
+
+1. Open the **sender app** at [Slack Apps](https://api.slack.com/apps), not Pipa's app.
+2. Under **OAuth & Permissions**, copy its **Bot User OAuth Token** (`xoxb-…`). If needed, install the app in the workspace via **Install App** first.
+3. Set that token locally in `SLACK_SENDER_BOT_TOKEN`, then call [Slack `auth.test`](https://docs.slack.dev/reference/methods/auth.test/):
+
+```sh
+curl --silent --show-error --request POST \
+  --header "Authorization: Bearer ${SLACK_SENDER_BOT_TOKEN}" \
+  https://slack.com/api/auth.test
+```
+
+No Slack CLI is needed. Keep the token out of config examples, shared output, and commits. A successful response includes fields like:
+
+```json
+{
+  "ok": true,
+  "user_id": "U0123456789",
+  "bot_id": "B0123456789"
+}
+```
+
+Use `bot_id` (`B0123456789`) in `allowedSlackBotIds`; `user_id` identifies the bot's user account and is not the bot allowlist ID.
+
+**Incoming webhooks:** the posted message's `bot_id` can differ from the sender app's OAuth `bot_id` returned by `auth.test`. Allow the actual incoming message/event's `bot_id`. If you do not have the event payload, find the posted message with [Slack `conversations.history`](https://docs.slack.dev/reference/methods/conversations.history/) (or [`conversations.replies`](https://docs.slack.dev/reference/methods/conversations.replies/) for a thread reply), using a token with access to that conversation and the required history scope, and read its `bot_id`.
+
+After saving the config, restart Pipa to load the updated allowlist. The allowed bot can start a conversation by posting `<@PIPA_BOT_USER_ID> triage this alert` in an allowed channel, or continue one by replying in a thread Pipa has subscribed to. For an incoming webhook, send that mention in the payload's `text` field. Allowlisting a bot does not make Pipa handle every message it posts in the channel; the normal mention/thread routing still applies. Only allow bots whose messages you trust as requests to your agent.
 
 To use an existing OpenCode server instead, set its URL before starting Pipa. Pipa checks that the server can serve the configured workspace but does not start or stop it. If the server uses authentication, also set `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD`:
 
