@@ -55,7 +55,7 @@ Incoming messages can include up to Slack's 10-file limit, with a maximum size o
 
 ### Access control
 
-By default Pipa answers any human user who mentions it in a channel it can see. In a shared workspace, restrict who can use it by listing the allowed Slack channel and user IDs. `pipa init` asks for these, and they are stored in the config:
+By default Pipa answers any human user who mentions it in a channel it can see, excluding DMs and external channels. In a shared workspace, restrict who can use it by listing the allowed Slack channel and user IDs. `pipa init` asks for these, and they are stored in the config:
 
 ```json
 {
