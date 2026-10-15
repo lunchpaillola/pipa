@@ -38,11 +38,13 @@ test("config and sessions are stored separately with private permissions", async
   if (process.platform !== "win32") assert.equal((await stat(paths.config)).mode & 0o777, 0o600);
 });
 
-test("routine paths are separate and the atomic JSON writer is reusable", async () => {
+test("routine and OpenCode recovery paths are separate and the atomic JSON writer is reusable", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-state-"));
   const paths = pipaPaths(home);
   assert.equal(paths.routines, path.join(paths.directory, "routines.json"));
   assert.equal(paths.routinesLock, path.join(paths.directory, "routines.lock"));
+  assert.equal(paths.openCodeRecovery, path.join(paths.directory, "opencode-recovery.json"));
+  assert.equal(new Set([paths.config, paths.sessions, paths.routines, paths.openCodeRecovery]).size, 4);
   await writePrivateJson(paths.routines, { version: 1, routines: [] });
   assert.deepEqual(JSON.parse(await readFile(paths.routines, "utf8")), { version: 1, routines: [] });
   if (process.platform !== "win32") assert.equal((await stat(paths.routines)).mode & 0o777, 0o600);

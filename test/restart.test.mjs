@@ -87,7 +87,7 @@ test("real watcher/worker chain orders cleanup, process clearance and detached r
   let originalRunning = true;
   let finished;
   let workers = 0;
-  const environment = { PATH: "test", PIPA_SLACK_BOT_TOKEN: "secret", Slack_Client_Secret: "secret", PIPA_HOME: "wrong",
+  const environment = { PATH: "test", COMPOSIO_API_KEY: "integration-secret", OPENCODE_CONFIG: "private-config", PIPA_SLACK_BOT_TOKEN: "secret", Slack_Client_Secret: "secret", PIPA_HOME: "wrong",
     PIPA_RESTART_CHANNEL_ID: "COLD", PIPA_RESTART_THREAD_TS: "999.999" };
   const watcher = startRestartWatcher({ home, identity: release.identity, environment, limits,
     shutdown: async () => {
@@ -103,7 +103,7 @@ test("real watcher/worker chain orders cleanup, process clearance and detached r
       assert.equal(options.detached, true);
       assert.equal(options.shell, false);
       assert.deepEqual(options.stdio, ["ignore", "ignore", "ignore", "ipc"]);
-      assert.deepEqual(options.env, { PATH: "test", PIPA_HOME: home });
+      assert.deepEqual(options.env, { PATH: "test", COMPOSIO_API_KEY: "integration-secret", OPENCODE_CONFIG: "private-config", PIPA_HOME: home });
       finished = runRestartWorker({ home, id: request.id, peer: workerPeer, environment, limits,
         running: (pid) => pid === 4242 || originalRunning,
         spawn(command, args, options) {
@@ -117,6 +117,8 @@ test("real watcher/worker chain orders cleanup, process clearance and detached r
           assert.equal(options.env.PIPA_RESTART_THREAD_TS, "123.456");
           assert.equal(options.env.PIPA_SLACK_BOT_TOKEN, undefined);
           assert.equal(options.env.Slack_Client_Secret, undefined);
+          assert.equal(options.env.COMPOSIO_API_KEY, "integration-secret");
+          assert.equal(options.env.OPENCODE_CONFIG, "private-config");
           void (async () => {
             const identity = { pid: 4242, generation: randomUUID() };
             await writePrivateJson(pipaPaths(home).lock, identity);

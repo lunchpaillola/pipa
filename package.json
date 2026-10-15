@@ -21,7 +21,9 @@
   "scripts": {
     "test": "node --test",
     "test:pack": "node scripts/pack-smoke.mjs",
-    "test:slack:routines": "node scripts/slack-routine-eval.mjs"
+    "test:engines": "node scripts/test-opencode-matrix.mjs",
+    "test:slack:routines": "node scripts/slack-routine-eval.mjs",
+    "test:slack:release": "node scripts/slack-release-eval.mjs"
   },
   "engines": {
     "node": ">=22"
@@ -42,6 +44,7 @@
   "dependencies": {
     "@chat-adapter/slack": "4.38.1",
     "@chat-adapter/state-memory": "4.38.1",
+    "@opencode/client": "2.0.29",
     "chat": "4.38.1",
     "cross-spawn": "7.0.6",
     "luxon": "3.7.2"

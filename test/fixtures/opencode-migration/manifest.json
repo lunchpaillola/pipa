@@ -1,0 +1,16 @@
+{
+  "schema": "pipa-opencode-migration/v1",
+  "synthetic": true,
+  "sourcePins": ["1.18.35", "1.19.0"],
+  "targetPin": "2.0.29",
+  "historyMarker": "GENERATE_PER_PRIVATE_RUN",
+  "sessions": ["channel-result", "existing-thread-result"],
+  "routineStates": ["active", "inactive", "completed"],
+  "permissionChecks": ["configured-deny-preserved", "remembered-approval-reset", "no-pipa-created-grants"],
+  "sequence": ["seed-v1", "stop-all-writers", "checkpoint-and-copy-with-companions", "preserve-pristine-snapshot", "migrate-disposable-copy", "continue-same-mapped-sessions", "restart-v2-and-continue", "restore-matched-pristine-v1-and-pipa-snapshot", "continue-v1"],
+  "ambientDatabaseAllowed": false,
+  "executor": "scripts/verification/opencode-migration.mjs",
+  "evidenceCases": ["migration-seed", "migration-upgrade", "migration-rollback"],
+  "checkpoint": "Stop all private writers; copy the whole profile including SQLite companions; hash pristine state before and after target attempt",
+  "rollback": "Restore into a different disposable copy; never open v2-written data using v1"
+}

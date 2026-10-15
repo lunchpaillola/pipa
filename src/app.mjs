@@ -4,7 +4,7 @@ import { Chat, Modal, TextInput } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { canonicalWorkingDirectory, createManifest, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
-import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaRestartingError, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
+import { checkOpenCodeConnection, createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, parseOpenCodeVersion, PipaRestartingError, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
 import { assertRoutineDestinationAllowed, createRoutineScheduler, loadRoutineState } from "./routines.mjs";
 
 class RoutineDeniedError extends Error {}
@@ -21,8 +21,10 @@ export async function initializePipa(input, options = {}) {
     allowedSlackUserIds: normalizeIdList(input.allowedSlackUserIds),
     allowedSlackBotIds: normalizeIdList(input.allowedSlackBotIds),
   };
-  const openCodeVersion = await (options.checkOpenCode ?? runOpenCodeVersion)();
-  if (!/^v?1(?:\.|$)/u.test(openCodeVersion)) throw new Error(`Pipa requires OpenCode v1; found ${openCodeVersion || "an unknown version"}.`);
+  const environment = options.environment ?? process.env;
+  const attachUrl = environment.PIPA_OPENCODE_ATTACH_URL?.trim();
+  if (attachUrl) await checkOpenCodeConnection(attachUrl, config.workingDirectory, options);
+  else parseOpenCodeVersion(await (options.checkOpenCode ?? runOpenCodeVersion)(options));
   await (options.checkSlackAppToken ?? checkSlackAppToken)(config.slackAppToken);
   const slackAuth = await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
   warnMissingSlackScopes(slackAuth, options.warn);
@@ -66,8 +68,12 @@ export async function startPipa(options = {}) {
     executor = options.executor ?? (options.createExecutor ?? createOpenCodeExecutor)({
       artifactRoot: path.join(config.workingDirectory, ".pipa", "artifacts"),
       baseUrl: server.baseUrl,
+      connection: server.connection,
+      recoveryFile: paths.openCodeRecovery,
       onFatal: server.fail,
     });
+    await executor.ready?.(config.workingDirectory);
+    options.signal?.throwIfAborted();
   } catch (error) {
     server?.stop();
     await withTimeout(server?.wait(), options.shutdownTimeoutMs ?? 15_000, "OpenCode shutdown timed out.").catch(() => undefined);
@@ -167,7 +173,7 @@ export async function startPipa(options = {}) {
     const pending = pendingReactions.get(conversationKey) ?? [];
     if (pending.at(-1)?.message !== currentMessage) return;
     pendingReactions.delete(conversationKey);
-    for (const entry of pending) await finishReaction(entry.thread, entry.message, entry.message === currentMessage ? emoji : "white_check_mark");
+    for (const entry of pending) await finishReaction(entry.thread, entry.message, entry.message === currentMessage ? emoji : null);
   };
 
   const handle = async (thread, message, subscribe) => {
@@ -180,7 +186,7 @@ export async function startPipa(options = {}) {
     const attachments = message.attachments ?? [];
     if (subscribe) await thread.subscribe();
     if (attachments.some(({ size }) => size !== undefined && (!Number.isSafeInteger(size) || size < 0 || size > MAX_ATTACHMENT_BYTES))) {
-      await thread.post("Pipa can read files up to 100 MB each.");
+      await thread.post("Pipa can read files up to 10 MiB each.");
       return;
     }
     if (!accepting) return;
@@ -304,9 +310,23 @@ export function createPendingInteractions(allowedUserIds = []) {
       threadId: context.thread.id,
       loadAllowedUserIds: context.loadAllowedUserIds,
       authorize: context.authorize,
+      native: typeof interaction.submit === "function",
+    };
+    entry.choose = async (value) => {
+      if (entry.busy || entry.decision !== undefined) return;
+      entry.busy = true;
+      try {
+        await interaction.submit?.(value);
+        if (!interaction.signal.aborted) entry.resolve(value);
+      } catch {
+        if (entry.decision !== undefined || interaction.signal.aborted) return;
+        entry.questionIndex = 0;
+        entry.error = "OpenCode rejected or could not confirm this response. Edit your answer and retry.";
+        await entry.message?.edit();
+      } finally { entry.busy = false; }
     };
     const decision = new Promise((resolve, reject) => {
-      const abort = () => reject(interaction.signal.reason);
+      const abort = () => { entry.decision ??= { type: "stopped" }; reject(interaction.signal.reason); };
       entry.resolve = (value) => {
         if (entry.decision !== undefined) return;
         entry.decision = value;
@@ -316,7 +336,12 @@ export function createPendingInteractions(allowedUserIds = []) {
       if (interaction.signal.aborted) abort();
       else interaction.signal.addEventListener("abort", abort, { once: true });
     });
+    // A queued card can be cancelled before its predecessor releases the thread.
+    void decision.catch(() => undefined);
     pending.set(token, entry);
+    // Native settlement is independent of the responder callback (another client
+    // may answer or a location reload may cancel while this card is queued).
+    interaction.settled?.then(() => entry.resolve({ type: "cancelled" }), () => entry.resolve({ type: "cancelled" }));
     const requestId = interaction.request.requestID ?? interaction.request.requestId ?? interaction.request.id;
     const permissionKey = interaction.type === "permission" && requestId ? `${interaction.sessionId}:${requestId}` : null;
     if (permissionKey) permissionRequests.set(permissionKey, entry);
@@ -337,7 +362,7 @@ export function createPendingInteractions(allowedUserIds = []) {
       await submit(entry, result);
       return result;
     } finally {
-      if (entry.decision === undefined) {
+      if (!entry.submitted) {
         entry.resolve?.({ type: "stopped" });
         await submit(entry, { type: "stopped" }).catch(() => undefined);
       }
@@ -350,12 +375,13 @@ export function createPendingInteractions(allowedUserIds = []) {
 
   function onPermissionReplied({ sessionId, requestId, reply }) {
     const entry = permissionRequests.get(`${sessionId}:${requestId}`);
+    if (entry?.native) return;
     entry?.resolve?.(reply === "reject" ? { type: "reject" } : { type: "reply", reply });
   }
 
   function onPermissionsReconciled({ sessionId, requestIds }) {
     for (const entry of permissionRequests.values()) {
-      if (entry.sessionId === sessionId && !requestIds.has(entry.requestId)) entry.resolve?.({ type: "cancelled" });
+      if (!entry.native && entry.sessionId === sessionId && !requestIds.has(entry.requestId)) entry.resolve?.({ type: "cancelled" });
     }
   }
 
@@ -371,15 +397,16 @@ export function createPendingInteractions(allowedUserIds = []) {
     if (!entry) return;
     if ((event.threadId ?? event.thread?.id) !== entry.threadId) return;
     if (!await canRespond(entry, event.user)) return;
+    if (entry.busy || entry.decision !== undefined || entry.type === "form") return;
     if (event.actionId?.startsWith("pipa_dismiss_")) {
-      entry.resolve?.({ type: "stop" });
+      await entry.choose({ type: "stop" });
       return;
     }
     if (entry.type === "permission") {
       const reply = String(event.value ?? "").split(".")[1];
       if (!["once", "always", "reject"].includes(reply)) return;
       const selectedBy = displayName(event.user?.fullName ?? event.user?.userName);
-      entry.resolve?.(reply === "reject" ? { type: "reject", ...(selectedBy ? { selectedBy } : {}) } : { type: "reply", reply, ...(selectedBy ? { selectedBy } : {}) });
+      await entry.choose(reply === "reject" ? { type: "reject", ...(selectedBy ? { selectedBy } : {}) } : { type: "reply", reply, ...(selectedBy ? { selectedBy } : {}) });
       return;
     }
     if (event.actionId?.startsWith("pipa_custom_")) {
@@ -395,7 +422,7 @@ export function createPendingInteractions(allowedUserIds = []) {
     }
     if (event.actionId?.startsWith("pipa_submit_")) {
       if (!entry.answers[entry.questionIndex]?.length) return;
-      advance(entry, event.user);
+      await advance(entry, event.user);
       return;
     }
   }
@@ -405,16 +432,17 @@ export function createPendingInteractions(allowedUserIds = []) {
     if (!entry) return;
     if (event.relatedThread?.id !== entry.threadId) return;
     if (!await canRespond(entry, event.user)) return;
+    if (entry.busy || entry.decision !== undefined || entry.type !== "question") return;
     const answer = event.values?.answer?.trim();
     if (!answer) return { action: "errors", errors: { answer: "Enter an answer." } };
     entry.answers[entry.questionIndex] = [answer];
-    advance(entry, event.user);
+    await advance(entry, event.user);
   }
 
-  function advance(entry, user) {
+  async function advance(entry, user) {
     if (++entry.questionIndex === (entry.request.questions?.length ?? 1)) {
       const selectedBy = displayName(user?.fullName ?? user?.userName);
-      entry.resolve?.({ type: "answer", answers: entry.answers, ...(selectedBy ? { selectedBy } : {}) });
+      await entry.choose({ type: "answer", answers: entry.answers, ...(selectedBy ? { selectedBy } : {}) });
     }
     else entry.message?.edit();
   }
@@ -480,10 +508,12 @@ async function postInteraction(thread, entry) {
 }
 
 function renderSlackInteraction(entry) {
+  if (entry.type === "form") return [slackHeader(entry.request.title || "OpenCode form"), slackText("This form requires an OpenCode client response. Pipa will remove this notice when it is settled.")];
   if (entry.type === "permission") {
     const resources = entry.request.patterns ?? entry.request.resources ?? [];
     return [
       slackHeader("Permission requested"),
+      ...(entry.error ? [slackText(entry.error)] : []),
       slackText(permissionDetail(entry.request, resources)),
       slackActions([
         slackButton(`pipa_permission_once_${entry.token}`, "Allow once", `${entry.token}.once`, "primary"),
@@ -505,7 +535,7 @@ function renderSlackInteraction(entry) {
     ...(options.length ? [slackButton(`pipa_submit_${entry.token}`, "Submit", entry.token, "primary")] : []),
     slackButton(`pipa_dismiss_${entry.token}`, "Dismiss", entry.token, "danger"),
   ];
-  return [slackHeader(question.header || "Question"), slackText(question.question ?? question.header ?? "Choose an answer."), ...(selector ? [slackActions([selector])] : []), slackActions(actions)];
+  return [slackHeader(question.header || "Question"), ...(entry.error ? [slackText(entry.error)] : []), slackText(question.question ?? question.header ?? "Choose an answer."), ...(selector ? [slackActions([selector])] : []), slackActions(actions)];
 }
 
 function renderSlackSubmitted(entry, decision) {
