@@ -1,13 +1,101 @@
-# Pipa
+<p align="center">
+  <a href="https://www.usepipa.com/opencode-slack">
+    <img src="docs/assets/banner.png" alt="Pipa — run OpenCode from Slack" width="100%">
+  </a>
+</p>
 
-[![CI](https://github.com/lunchpaillola/pipa/actions/workflows/ci.yml/badge.svg)](https://github.com/lunchpaillola/pipa/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/lunchpaillola/pipa/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/lunchpaillola/pipa/ci.yml?branch=main&style=flat-square&label=CI"></a>
+  <a href="https://www.npmjs.com/package/@usepipa/pipa"><img alt="npm" src="https://img.shields.io/npm/v/@usepipa/pipa?style=flat-square&color=2437F5&label=npm"></a>
+  <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-2437F5?style=flat-square">
+  <img alt="Node" src="https://img.shields.io/badge/node-%3E%3D22-171B22?style=flat-square">
+  <img alt="Slack" src="https://img.shields.io/badge/Slack-Socket%20Mode-4A154B?style=flat-square">
+</p>
 
-Pipa runs Slack through one persistent private OpenCode server with no hosted relay, database, public endpoint, or sandbox.
+<p align="center">
+  <strong>Pipa turns a Slack thread into a durable OpenCode session on one private local server.</strong><br>
+  No relay, no database, no public endpoint.
+</p>
 
-[View Pipa on GitHub](https://github.com/lunchpaillola/pipa). If it is useful, star the repo so more people can find it.
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=rlTMdkPWPcA"><strong>Watch the 3-minute setup</strong></a>
+  ·
+  <a href="https://www.usepipa.com/opencode-slack">How it works</a>
+  ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+  ·
+  <a href="https://github.com/lunchpaillola/pipa/issues">Issues</a>
+</p>
 
-**Pipa is in early preview. Features may break unintentionally, and CLI commands, configuration, and Slack behavior may continue to change.**
+> **Early preview.** Features may break unintentionally, and CLI commands, configuration, and Slack behavior may continue to change.
+
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=rlTMdkPWPcA">
+    <img src="docs/assets/demo.png" alt="A Slack thread where Pipa opens a pull request" width="100%">
+  </a>
+</p>
+
+<p align="center"><sub>A thread, a task, a pull request. The same OpenCode session, with no relay.</sub></p>
+
+## Why Pipa
+
+| Capability | What it means |
+| --- | --- |
+| **One persistent server** | Pipa starts one private OpenCode server on `127.0.0.1` and reuses it for every Slack turn. No relay, database, public endpoint, or sandbox. |
+| **Thread-native sessions** | A mention starts a session; replies in that thread continue it. Different threads run independently, and a newer message interrupts only its own thread. |
+| **Routines** | Schedule timezone-aware work that runs through the same agent and delivers to an exact channel or thread. |
+| **Artifacts, not walls of text** | Long work returns as a concise summary with generated files, read from a private per-turn directory and bounded by path, type, identity, and size checks. |
+| **Access control** | Restrict by Slack channel, human user, and bot. Allowlists are rechecked on every turn, interaction, and delivery. |
+| **Restart that survives the turn** | `pipa restart` hands off to a detached worker and reports a durable status. No stop/start dance inside an agent turn. |
+| **Local or Managed** | Run it yourself on macOS, Linux, or Windows. Or have Lunch Pail Labs run and improve it for your team. |
+
+If Pipa is useful, [star the repo](https://github.com/lunchpaillola/pipa) so more people can find it.
+
+## Quickstart
+
+**Requirements:** Node.js 22 or newer, [OpenCode](https://opencode.ai) installed and authenticated, and a Slack workspace where you can create an app.
+
+```sh
+npm install --global @usepipa/pipa
+pipa init
+pipa start
+```
+
+`pipa init` creates the Slack app manifest, opens the install flow, and saves the profile under `~/.pipa`. Invite Pipa to a channel and mention it. The [3-minute setup video](https://www.youtube.com/watch?v=rlTMdkPWPcA) and the [OpenCode Slack integration guide](https://www.usepipa.com/opencode-slack) walk through the same path.
+
+## Security model
+
+Pipa is designed to run on your machine, not behind a relay.
+
+- The OpenCode server binds to `127.0.0.1` on an operating-system-assigned port.
+- Local mode has no hosted relay, database, public endpoint, or sandbox.
+- Slack access is restricted by channel, human user, and bot allowlists, rechecked on every turn and delivery.
+- Slack and provider tokens stay in the local profile with private file permissions and are never posted to Slack.
+- Generated artifacts are read from a private per-turn directory with path, type, identity, and size checks.
+
+Read [SECURITY.md](SECURITY.md) for the full model and how to report a vulnerability.
+
+> **Want someone else to run it?** [Pipa Managed](https://usepipa.com/managed?utm_source=github&utm_medium=repo_readme&utm_campaign=signup&utm_content=readme_managed) sets up a Slack-native operations agent around how your team works, then keeps it running and improving.
+
+<details>
+<summary><strong>Contents</strong></summary>
+
+- [Why Pipa](#why-pipa)
+- [Quickstart](#quickstart)
+- [Security model](#security-model)
+- [Pipa Managed](#pipa-managed)
+- [Local Socket Mode](#local-socket-mode)
+- [Access control](#access-control)
+- [Choosing a model](#choosing-a-model)
+- [Upgrading an existing installation](#upgrading-an-existing-installation)
+- [Routines](#routines)
+- [Restarting Pipa](#restarting-pipa)
+- [Commands](#commands)
+- [Development](#development)
+- [Releases](#releases)
+- [License](#license)
+
+</details>
 
 ## Pipa Managed
 
