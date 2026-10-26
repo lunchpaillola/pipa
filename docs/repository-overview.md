@@ -34,7 +34,7 @@ The public command-line entry point installed by npm.
 
 Long-form repository documentation.
 
-- `docs/assets/`: README banner, Slack demo image, and the GitHub social-preview source. These are presentation assets, not runtime files.
+- `docs/assets/`: README banner and the GitHub social-preview source. These are presentation assets, not runtime files.
 - `docs/repository-overview.md`: This file. It explains the repository structure and how the application works.
 
 ### `scripts/`

@@ -29,22 +29,14 @@
 
 > **Early preview.** Features may break unintentionally, and CLI commands, configuration, and Slack behavior may continue to change.
 
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=rlTMdkPWPcA">
-    <img src="docs/assets/demo.png" alt="A Slack thread where Pipa opens a pull request" width="100%">
-  </a>
-</p>
-
-<p align="center"><sub>A thread, a task, a pull request. The same OpenCode session, with no relay.</sub></p>
-
 ## Why Pipa
 
 | Capability | What it means |
 | --- | --- |
-| **One persistent server** | Pipa starts one private OpenCode server on `127.0.0.1` and reuses it for every Slack turn. No relay, database, public endpoint, or sandbox. |
+| **One persistent server** | In owned local mode, Pipa starts one private OpenCode server on `127.0.0.1` and reuses it for every Slack turn. No relay, database, public endpoint, or sandbox. An attached server is externally owned and follows its own network controls. |
 | **Thread-native sessions** | A mention starts a session; replies in that thread continue it. Different threads run independently, and a newer message interrupts only its own thread. |
 | **Routines** | Schedule timezone-aware work that runs through the same agent and delivers to an exact channel or thread. |
-| **Artifacts, not walls of text** | Long work returns as a concise summary with generated files, read from a private per-turn directory and bounded by path, type, identity, and size checks. |
+| **Artifacts, not walls of text** | In owned local mode, long work returns as a concise summary with generated files from a private per-turn directory, bounded by path, type, identity, and size checks. Attached non-loopback servers use inline text fallback. |
 | **Access control** | Restrict by Slack channel, human user, and bot. Allowlists are rechecked on every turn, interaction, and delivery. |
 | **Restart that survives the turn** | `pipa restart` hands off to a detached worker and reports a durable status. No stop/start dance inside an agent turn. |
 | **Local or Managed** | Run it yourself on macOS, Linux, or Windows. Or have Lunch Pail Labs run and improve it for your team. |
@@ -67,35 +59,13 @@ pipa start
 
 Pipa is designed to run on your machine, not behind a relay.
 
-- The OpenCode server binds to `127.0.0.1` on an operating-system-assigned port.
+- The owned local OpenCode server binds to `127.0.0.1` on an operating-system-assigned port.
 - Local mode has no hosted relay, database, public endpoint, or sandbox.
 - Slack access is restricted by channel, human user, and bot allowlists, rechecked on every turn and delivery.
-- Slack and provider tokens stay in the local profile with private file permissions and are never posted to Slack.
-- Generated artifacts are read from a private per-turn directory with path, type, identity, and size checks.
+- Slack tokens stay in the local profile with private file permissions. OpenCode manages provider credentials through its own credential store or provider environment variables. Pipa never posts credentials to Slack.
+- In owned local mode, generated artifacts are read from a private per-turn directory with path, type, identity, and size checks. Attached non-loopback servers use inline text fallback.
 
 Read [SECURITY.md](SECURITY.md) for the full model and how to report a vulnerability.
-
-> **Want someone else to run it?** [Pipa Managed](https://usepipa.com/managed?utm_source=github&utm_medium=repo_readme&utm_campaign=signup&utm_content=readme_managed) sets up a Slack-native operations agent around how your team works, then keeps it running and improving.
-
-<details>
-<summary><strong>Contents</strong></summary>
-
-- [Why Pipa](#why-pipa)
-- [Quickstart](#quickstart)
-- [Security model](#security-model)
-- [Pipa Managed](#pipa-managed)
-- [Local Socket Mode](#local-socket-mode)
-- [Access control](#access-control)
-- [Choosing a model](#choosing-a-model)
-- [Upgrading an existing installation](#upgrading-an-existing-installation)
-- [Routines](#routines)
-- [Restarting Pipa](#restarting-pipa)
-- [Commands](#commands)
-- [Development](#development)
-- [Releases](#releases)
-- [License](#license)
-
-</details>
 
 ## Pipa Managed
 
@@ -135,7 +105,7 @@ pipa init
 pipa start
 ```
 
-Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. Pipa starts one OpenCode server bound to `127.0.0.1` on an operating-system-assigned port and reuses it for every Slack turn. Port `0` asks the operating system for an available port; no port configuration is required. Pipa replies in a thread, and follow-up messages in that thread reuse the same OpenCode session without another mention. A newer follow-up interrupts an active turn in the same thread, while other threads continue independently. While a turn is active, Pipa shows a typing status in its Slack thread.
+Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. In owned local mode, Pipa starts one OpenCode server bound to `127.0.0.1` on an operating-system-assigned port and reuses it for every Slack turn. Port `0` asks the operating system for an available port; no port configuration is required. Pipa replies in a thread, and follow-up messages in that thread reuse the same OpenCode session without another mention. A newer follow-up interrupts an active turn in the same thread, while other threads continue independently. While a turn is active, Pipa shows a typing status in its Slack thread.
 
 Pipa keeps naturally short answers inline. For deeper work, OpenCode can return a concise summary with suitable generated files, such as documents, spreadsheets, PDFs, or images. Files are read only from a private session directory under `.pipa/artifacts` in the configured working directory. The directory is cleared before each turn, files are validated and limited to 10 files and 100 MB per file or response, and the directory is deleted locally after delivery. If file delivery fails, Pipa retries the declaration-free summary without the files. Attached OpenCode servers on non-loopback hosts use inline text fallback instead of local artifact delivery.
 
