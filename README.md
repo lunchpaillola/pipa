@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://www.usepipa.com/opencode-slack">
+  <a href="https://www.usepipa.com/opencode-slack?utm_source=github&utm_medium=repo_readme&utm_campaign=signup&utm_content=readme_banner">
     <img src="docs/assets/banner.png" alt="Pipa: run OpenCode from Slack" width="100%">
   </a>
 </p>
@@ -17,7 +17,7 @@
 <p align="center">
   <a href="https://www.youtube.com/watch?v=rlTMdkPWPcA"><strong>Watch the 3-minute setup</strong></a>
   ·
-  <a href="https://www.usepipa.com/opencode-slack">How it works</a>
+  <a href="https://www.usepipa.com/opencode-slack?utm_source=github&utm_medium=repo_readme&utm_campaign=signup&utm_content=readme_how_it_works">How it works</a>
   ·
   <a href="CONTRIBUTING.md">Contributing</a>
   ·
@@ -49,7 +49,7 @@ pipa init
 pipa start
 ```
 
-`pipa init` creates the Slack app manifest, opens the install flow, and saves the profile under `~/.pipa`. Invite Pipa to a channel and mention it. The [3-minute setup video](https://www.youtube.com/watch?v=rlTMdkPWPcA) shows the flow, and the [OpenCode Slack integration guide](https://www.usepipa.com/opencode-slack) is the current written path.
+`pipa init` creates the Slack app manifest, opens the install flow, and saves the profile under `~/.pipa`. Invite Pipa to a channel and mention it. The [3-minute setup video](https://www.youtube.com/watch?v=rlTMdkPWPcA) shows the flow, and the [OpenCode Slack integration guide](https://www.usepipa.com/opencode-slack?utm_source=github&utm_medium=repo_readme&utm_campaign=signup&utm_content=readme_install_guide) is the current written path.
 
 ## Security model
 
@@ -59,7 +59,7 @@ Read [SECURITY.md](SECURITY.md) for the full model and reporting path.
 
 ## Pipa Managed
 
-Want Lunch Pail Labs to configure, run, and manage agent workflows for your company? Check out [Pipa Managed](https://usepipa.com/managed?utm_source=github&utm_medium=readme). We set up a Slack-native operations agent for your team, then keep the workflows running.
+Want Lunch Pail Labs to configure, run, and manage agent workflows for your company? Check out [Pipa Managed](https://usepipa.com/managed?utm_source=github&utm_medium=repo_readme&utm_campaign=signup&utm_content=readme_footer). We set up a Slack-native operations agent for your team, then keep the workflows running.
 
 ## Local Socket Mode
 
