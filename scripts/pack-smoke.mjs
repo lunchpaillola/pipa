@@ -67,6 +67,7 @@ if (process.argv[2] === "--version") {
     PIPA_ALLOWED_CHANNEL_IDS: "",
     PIPA_ALLOWED_USER_IDS: "",
     PIPA_ALLOWED_BOT_IDS: "",
+    PIPA_MENTION_ONLY: "true",
     NODE_OPTIONS: `--import=${pathToFileURL(path.join(directory, "fetch-mock.mjs")).href}`,
     PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
   }, "", workingDirectory);
@@ -78,6 +79,7 @@ if (process.argv[2] === "--version") {
   const config = JSON.parse(configText);
   const manifest = JSON.parse(await readFile(path.join(home, ".pipa", "slack-manifest.json"), "utf8"));
   if (config.botName !== "Pack Bot" || config.workingDirectory !== await realpath(workingDirectory)) throw new Error("Packed init wrote invalid config.");
+  if (config.mentionOnly !== true) throw new Error("Packed init did not persist mentionOnly.");
   if (manifest.display_information.name !== "Pack Bot") throw new Error("Packed init wrote invalid manifest.");
   if (!["channels:read", "assistant:write", "commands"].every((scope) => manifest.oauth_config.scopes.bot.includes(scope))) throw new Error("Packed init wrote incomplete Slack bot scopes.");
   if (JSON.stringify(manifest.features.slash_commands.map((entry) => entry.command)) !== JSON.stringify(["/pack-bot", "/pipa"])) throw new Error("Packed manifest omitted named/compatibility commands.");

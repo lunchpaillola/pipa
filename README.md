@@ -121,6 +121,18 @@ A human user's mention is only handled when the channel and user pass their resp
 
 By default Pipa ignores messages sent by other Slack apps. Unlike the human user and channel lists, an absent or empty `allowedSlackBotIds` disables all other bots. List their bot IDs to let those messages through; an allowed bot only needs its bot ID (e.g. `B0C6Q27E82X`), not an entry in `allowedSlackUserIds`. Bots still must pass the channel allowlist. Bots not on the list stay ignored even when `allowedSlackUserIds` is empty. Set it non-interactively during setup with `PIPA_ALLOWED_BOT_IDS` (comma-separated).
 
+#### Mention-only mode
+
+By default, once Pipa is mentioned in a thread it subscribes to that thread and answers every later message in it without another mention. Set `mentionOnly` to `true` to require a direct @-mention for every turn, including in threads Pipa is already in:
+
+```json
+{
+  "mentionOnly": true
+}
+```
+
+`pipa init` asks for this, and you can set it non-interactively with `PIPA_MENTION_ONLY` (`1`, `true`, or `yes`). An absent or `false` value keeps the default thread-following behavior. Routines are unaffected.
+
 #### Find the sender's bot ID
 
 Use the message event's `bot_id` (`B…`), not the app ID (`A…`) or bot user ID (`U…`). To look up the sender app's OAuth bot ID:

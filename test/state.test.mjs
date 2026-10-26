@@ -149,6 +149,26 @@ test("config validates allowed Slack access lists", async () => {
   }
 });
 
+test("config validates the mentionOnly flag", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-config-"));
+  const file = pipaPaths(home).config;
+  await mkdir(path.dirname(file), { recursive: true });
+  const writeConfig = (config) => writeFile(file, JSON.stringify(config));
+  const base = { botName: "Pipa", workingDirectory: home, slackAppToken: "xapp-test", slackBotToken: "xoxb-test" };
+
+  await writeConfig({ ...base, mentionOnly: true });
+  assert.equal((await loadConfig(file)).mentionOnly, true);
+  await writeConfig({ ...base, mentionOnly: false });
+  assert.equal((await loadConfig(file)).mentionOnly, false);
+  await writeConfig(base);
+  assert.equal((await loadConfig(file)).mentionOnly, undefined);
+
+  for (const mentionOnly of ["true", 1, null]) {
+    await writeConfig({ ...base, mentionOnly });
+    await assert.rejects(loadConfig(file), /mentionOnly must be a boolean/u);
+  }
+});
+
 test("malformed session state fails instead of discarding continuity", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-state-"));
   const file = pipaPaths(home).sessions;

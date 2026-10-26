@@ -21,6 +21,7 @@ export async function initializePipa(input, options = {}) {
     allowedSlackChannelIds: normalizeIdList(input.allowedSlackChannelIds),
     allowedSlackUserIds: normalizeIdList(input.allowedSlackUserIds),
     allowedSlackBotIds: normalizeIdList(input.allowedSlackBotIds),
+    mentionOnly: input.mentionOnly === true,
   };
   const openCodeVersion = await (options.checkOpenCode ?? runOpenCodeVersion)();
   if (!/^v?1(?:\.|$)/u.test(openCodeVersion)) throw new Error(`Pipa requires OpenCode v1; found ${openCodeVersion || "an unknown version"}.`);
@@ -181,6 +182,7 @@ export async function startPipa(options = {}) {
 
   const handle = async (thread, message, subscribe) => {
     if (!accepting || !isAuthorized(thread, message, config) || shouldIgnore(thread, message, config)) return;
+    if (config.mentionOnly && !subscribe && !message.isMention) return;
     const messageText = subscribe || message.isMention ? stripMention(message.text) : message.text.trim();
     const missingLinks = (message.links ?? []).map((link) => link.url)
       .filter((url) => typeof url === "string" && !messageText.split(/\s+/u).includes(url));

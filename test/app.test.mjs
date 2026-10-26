@@ -2114,6 +2114,42 @@ test("aborting an interaction removes its Slack card", async () => {
   assert.equal(deleted.length, 1);
 });
 
+test("mentionOnly ignores subscribed messages that do not mention the bot", async () => {
+  const handlers = {};
+  const posts = [];
+  const calls = [];
+  const app = await startPipa({
+    chat: {
+      onNewMention(handler) { handlers.mention = handler; },
+      onSubscribedMessage(handler) { handlers.subscribed = handler; },
+      async initialize() {},
+      async shutdown() {},
+    },
+    executor: { runTurn: async ({ prompt }) => { calls.push(prompt); return { text: prompt, sessionId: "ses_1" }; }, stopAll() {} },
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work", mentionOnly: true },
+  });
+  const thread = {
+    id: "slack:C1:1.0",
+    adapter: { addReaction: async () => undefined, removeReaction: async () => undefined },
+    channel: { isDM: false, channelVisibility: "private" },
+    subscribe: async () => undefined,
+    post: async (text) => posts.push(text),
+  };
+  const author = { userId: "U1" };
+
+  await handlers.mention(thread, { id: "1", text: "@U1 start", author, raw: {} });
+  await waitFor(() => posts.length === 1);
+  await handlers.subscribed(thread, { id: "2", text: "just chatting", author, raw: {} });
+  await handlers.subscribed(thread, { id: "3", text: "<@U1> follow up", author, raw: {}, isMention: true });
+  await waitFor(() => posts.length === 2);
+
+  assert.deepEqual(calls, ["start", "follow up"]);
+  assert.deepEqual(posts, [{ markdown: "start" }, { markdown: "follow up" }]);
+  await app.shutdown();
+});
+
 function slackInteractionThread({ id = "slack:C1:1.0", posted = [], updated = [], deleted = [] } = {}) {
   return {
     id,

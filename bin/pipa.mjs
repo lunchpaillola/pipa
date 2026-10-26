@@ -359,8 +359,11 @@ async function init(io) {
       ?? (await prompt.question("Allowed Slack user IDs (comma-separated, e.g. UFWBSCZ54; leave empty to allow any user): ")).trim();
     const allowedSlackBotIds = process.env.PIPA_ALLOWED_BOT_IDS
       ?? (await prompt.question("Allowed Slack bot IDs (comma-separated, e.g. B0C6Q27E82X; leave empty to ignore bot messages): ")).trim();
+    const mentionOnly = process.env.PIPA_MENTION_ONLY !== undefined
+      ? /^(1|true|yes)$/iu.test(process.env.PIPA_MENTION_ONLY.trim())
+      : /^y(es)?$/iu.test((await prompt.question("Only respond when @-mentioned, even in threads Pipa is already in? [y/N]: ")).trim());
     io.output.write("\nChecking OpenCode and Slack credentials...\n");
-    const result = await initializePipa({ botName, workingDirectory, slackAppToken, slackBotToken, allowedSlackChannelIds, allowedSlackUserIds, allowedSlackBotIds });
+    const result = await initializePipa({ botName, workingDirectory, slackAppToken, slackBotToken, allowedSlackChannelIds, allowedSlackUserIds, allowedSlackBotIds, mentionOnly });
     io.output.write(`✓ Credentials validated.\n\nSaved config to ${result.paths.config}. Run \`pipa start\`.\n`);
   } finally {
     prompt.close();
