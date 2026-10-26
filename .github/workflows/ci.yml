@@ -24,5 +24,5 @@ jobs:
       # windows runners (different test each run). Serializing costs ~8s locally
       # and removes that contention.
       - name: Test
-        run: npm test -- --test-concurrency=1 --test-retries=1
+        run: npm test -- --test-concurrency=1
       - run: npm run test:pack
