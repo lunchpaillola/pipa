@@ -61,7 +61,7 @@ pipa init
 pipa start
 ```
 
-`pipa init` creates the Slack app manifest, opens the install flow, and saves the profile under `~/.pipa`. Invite Pipa to a channel and mention it. The [3-minute setup video](https://www.youtube.com/watch?v=rlTMdkPWPcA) and the [OpenCode Slack integration guide](https://www.usepipa.com/opencode-slack) walk through the same path.
+`pipa init` creates the Slack app manifest, opens the install flow, and saves the profile under `~/.pipa`. Invite Pipa to a channel and mention it. The [3-minute setup video](https://www.youtube.com/watch?v=rlTMdkPWPcA) shows the end-to-end flow, and the [OpenCode Slack integration guide](https://www.usepipa.com/opencode-slack) is the current written path.
 
 ## Security model
 
