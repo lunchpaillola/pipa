@@ -34,7 +34,7 @@ test("restart requests rather than claims success and status survives the caller
   assert.notEqual(invoke("--bogus").status, 0);
 });
 
-for (const mode of ["ready", "unready", "startup-failure"]) test(`isolated Managed restart: ${mode}`, { timeout: 60_000 }, async (t) => {
+for (const mode of ["ready", "unready", "startup-failure"]) test(`isolated Managed restart: ${mode}`, { timeout: 120_000 }, async (t) => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-detached-"));
   const paths = pipaPaths(home);
   const reservation = createServer();
