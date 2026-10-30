@@ -190,12 +190,12 @@ If the model window cannot open, its private error distinguishes saved-settings 
 
 **An npm upgrade updates local code only. It does not update the installed Slack app, register commands, or grant scopes.** Existing mentions and thread replies still work without model-command registration. Do not rerun `pipa init` or replace credentials to add this feature.
 
-After `0.5.5` is published, use the same `PIPA_HOME` as your existing installation (leave it unset for the default `~/.pipa` profile):
+To upgrade to `0.5.6`, use the same `PIPA_HOME` as your existing installation (leave it unset for the default `~/.pipa` profile):
 
 ```sh
-npm install --global @usepipa/pipa@0.5.5
+npm install --global @usepipa/pipa@0.5.6
 pipa --version
-pipa manifest > "$HOME/pipa-slack-manifest-0.5.5.json"
+pipa manifest > "$HOME/pipa-slack-manifest-0.5.6.json"
 ```
 
 `pipa manifest` reads the existing profile and prints the current **local template** without tokens. It does not write config, sessions, routines, or the cached manifest, call Slack, or run inference. It is not an export of your app's current remote/custom configuration.
