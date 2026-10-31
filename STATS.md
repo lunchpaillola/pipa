@@ -56,3 +56,4 @@ These are npm package downloads for `@usepipa/pipa`, not installs, users, active
 | 2026-10-27 | 2975 | 16 |
 | 2026-10-28 | 2989 | 14 |
 | 2026-10-29 | 2997 | 8 |
+| 2026-10-30 | 2997 | 0 |
