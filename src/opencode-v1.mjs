@@ -1,10 +1,24 @@
 import { setTimeout as delay } from "node:timers/promises";
+import { normalizeModel } from "./state.mjs";
 
 // The facade owns files, controllers and caller callbacks; this adapter owns v1 wire data.
 export function createV1Adapter({ request, baseUrl, fetchImpl, headers, pollIntervalMs }) {
   let blocked;
   return {
     async ready() { if (blocked) throw blocked; },
+    async listModels(workingDirectory, signal) {
+      const catalog = await request("/config/providers", { method: "GET" }, workingDirectory, { signal }, [200], false);
+      if (!Array.isArray(catalog?.providers)) throw new Error("OpenCode returned an invalid model catalog.");
+      const models = catalog.providers.flatMap((provider) => {
+        if (!provider?.models || typeof provider.models !== "object" || Array.isArray(provider.models)) throw new Error("Invalid provider models.");
+        return Object.entries(provider.models).map(([id, model]) => {
+          const selected = normalizeModel({ providerID: provider.id, modelID: model?.id ?? id });
+          return { providerID: selected.providerID, id: selected.modelID, name: typeof model?.name === "string" ? model.name : id, variants: ["default"] };
+        });
+      });
+      const selected = models.find((model) => catalog.default?.[model.providerID] === model.id);
+      return { models, defaultModel: selected ? { providerID: selected.providerID, id: selected.id, variant: "default" } : null };
+    },
     async resolveSession(sessionId, workingDirectory, controller) {
       let messages = [];
       if (sessionId) {
@@ -35,9 +49,13 @@ export function createV1Adapter({ request, baseUrl, fetchImpl, headers, pollInte
         messages = [];
       }
       if (!Array.isArray(messages)) throw new Error("OpenCode returned an invalid message projection.");
-      return { sessionId, baseline: new Set(messages.map((message) => message?.info?.id).filter(Boolean)) };
+      const last = messages.at(-1)?.info;
+      const threadModel = last?.role === "user" ? last.model
+        : last?.providerID && last?.modelID ? { providerID: last.providerID, modelID: last.modelID } : null;
+      return { sessionId, threadModel, baseline: new Set(messages.map((message) => message?.info?.id).filter(Boolean)) };
     },
-    async execute({ sessionId, baseline, workingDirectory, controller, prompt, files, instructions, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
+    async execute({ sessionId, baseline, threadModel, model, defaultModel, workingDirectory, controller, prompt, files, instructions, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
+      const selectedModel = normalizeModel(model ?? threadModel ?? defaultModel);
       let dismissed = false;
       let permissionRejected = false;
       let watcher;
@@ -57,7 +75,7 @@ export function createV1Adapter({ request, baseUrl, fetchImpl, headers, pollInte
         const timeout = setTimeout(() => admission.abort(new Error("OpenCode prompt admission timed out.")), 5_000);
         try {
           await request(`/session/${encodeURIComponent(sessionId)}/prompt_async`, {
-            method: "POST", body: JSON.stringify({ parts: [{ type: "text", text: prompt }, ...files.map((file) => ({ type: "file", ...file }))], system: instructions }),
+            method: "POST", body: JSON.stringify({ parts: [{ type: "text", text: prompt }, ...files.map((file) => ({ type: "file", ...file }))], system: instructions, ...(selectedModel ? { model: selectedModel } : {}) }),
           }, workingDirectory, admission, [204]);
         } catch (cause) {
           if (cause.status === undefined) {
@@ -76,7 +94,22 @@ export function createV1Adapter({ request, baseUrl, fetchImpl, headers, pollInte
           const message = messages.findLast((message) => message?.info?.id && !baseline.has(message.info.id) && message.info.role === "assistant");
           const status = statuses?.[sessionId]?.type;
           if (dismissed && status !== "busy" && status !== "retry") return "";
-          if (["error", "failed", "cancelled"].includes(status) || message?.info.error) throw new Error("OpenCode failed to complete the turn.");
+          if (message?.info.error) {
+            const error = message.info.error;
+            const providerID = message.info.providerID ?? selectedModel?.providerID;
+            const provider = typeof providerID === "string" && /^[a-z0-9][a-z0-9._-]{0,63}$/iu.test(providerID) ? `provider "${providerID}"` : "selected provider";
+            const statusCode = error.data?.statusCode;
+            const http = Number.isInteger(statusCode) && statusCode >= 400 && statusCode <= 599 ? ` (HTTP ${statusCode})` : "";
+            // Classify failures without forwarding upstream credentials or bodies.
+            if (statusCode === 401 || error.name === "ProviderAuthError") {
+              const expiredKey = statusCode === 401 && typeof error.data?.message === "string" && /\bAPI key (?:has )?expired\b/iu.test(error.data.message);
+              throw new Error(expiredKey
+                ? `OpenCode ${provider} API key has expired. Replace that provider's API key in OpenCode, or choose another provider with your installation's model command, then start a new thread.`
+                : `OpenCode ${provider} authentication failed${http}. Reconnect that provider in OpenCode, or choose another provider with your installation's model command, then start a new thread.`);
+            }
+            throw new Error(`OpenCode ${provider} ${http ? `failed${http}` : "failed to complete the turn"}.`);
+          }
+          if (["error", "failed", "cancelled"].includes(status)) throw new Error("OpenCode failed to complete the turn.");
           const completed = typeof message?.info.time?.completed === "number";
           if (message && ((status !== "retry" && completed && message.info.finish === "stop") || status === "idle" || (!status && completed))) {
             const text = message.parts.filter((part) => part.type === "text" && typeof part.text === "string" && part.text).map((part) => part.text).join("\n").trim();

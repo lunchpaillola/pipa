@@ -7,6 +7,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createV1Adapter } from "./opencode-v1.mjs";
 import { createV2Adapter } from "./opencode-v2.mjs";
+import { normalizeModel } from "./state.mjs";
 
 const SLACK_SECRET_ENV_KEY = /(?:^|_)SLACK(?:_[A-Z0-9]+)*_(?:TOKEN|SECRET)$/iu;
 const LISTENING_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+/u;
@@ -114,7 +115,7 @@ export function createOpenCodeExecutor(options = {}) {
     readiness ??= (async () => {
       const connection = options.connection ?? await checkOpenCodeConnection(baseUrl, workingDirectory, { ...options, environment, fetch: fetchImpl });
       headers = connection.headers ?? headers;
-      capabilities = Object.freeze({ modelDiscovery: connection.major === 2, liveModelSwitch: connection.major === 2 });
+      capabilities = Object.freeze({ modelDiscovery: true, liveModelSwitch: connection.major === 2 });
       adapter = connection.major === 2
         ? createV2Adapter({ ...options, baseUrl, fetch: fetchImpl, headers, environment, pollIntervalMs })
         : createV1Adapter({ request, baseUrl, fetchImpl, headers, pollIntervalMs });
@@ -160,11 +161,13 @@ export function createOpenCodeExecutor(options = {}) {
     }
   }
 
-  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
+  async function runTurn({ prompt, sessionId, model, defaultModel, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     if (stopReason) throw stopReason;
     if (sessionId && activeSessions.has(sessionId)) throw new Error("OpenCode attribution conflict: the session already has an active writer.");
     let temporaryDirectory;
+    const selectedModel = normalizeModel(model);
+    const newThreadModel = normalizeModel(defaultModel);
     const slackTurn = contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack";
     const controller = new AbortController();
     const abort = () => controller.abort(signal.reason);
@@ -199,7 +202,7 @@ export function createOpenCodeExecutor(options = {}) {
           } catch {}
         }
 
-        const text = await adapter.execute({ ...prepared, workingDirectory, controller, prompt, files,
+        const text = await adapter.execute({ ...prepared, model: selectedModel, defaultModel: newThreadModel, workingDirectory, controller, prompt, files,
           instructions: turnInstructions(contextEnvironment, artifactDirectory), onInteraction, onPermissionReplied, onPermissionsReconciled });
         const parsed = slackTurn ? parseArtifactDeclaration(text) : { text };
         const artifacts = artifactDirectory && parsed.paths ? await readArtifacts(artifactDirectory, parsed.paths, options.onArtifactOpened) : [];
@@ -241,21 +244,25 @@ export function createOpenCodeExecutor(options = {}) {
     get capabilities() { return capabilities; },
     ready,
     runTurn,
-    async listModels({ workingDirectory, signal } = {}) {
+    async listModels(input = {}) {
+      const flat = typeof input === "string";
+      const { workingDirectory, signal } = flat ? { workingDirectory: input } : input;
       if (stopReason) throw stopReason;
       const controller = new AbortController();
       const abort = () => controller.abort(signal.reason);
       if (signal?.aborted) abort();
       else signal?.addEventListener("abort", abort, { once: true });
       active.add(controller);
+      const timer = setTimeout(() => controller.abort(new Error("Model discovery timed out.")), 1_500);
       try {
-        await ready(workingDirectory);
+        await abortable(ready(workingDirectory), controller.signal);
         controller.signal.throwIfAborted();
         if (!capabilities.modelDiscovery) throw new Error("OpenCode model discovery is not supported by this adapter.");
-        const catalog = await adapter.listModels(workingDirectory, controller.signal);
+        const catalog = await abortable(adapter.listModels(workingDirectory, controller.signal), controller.signal);
         controller.signal.throwIfAborted();
-        return catalog;
+        return flat ? catalog.models.map((model) => ({ providerID: model.providerID, modelID: model.id, name: model.name })) : catalog;
       } finally {
+        clearTimeout(timer);
         controller.abort();
         active.delete(controller);
         signal?.removeEventListener("abort", abort);

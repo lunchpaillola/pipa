@@ -28,11 +28,13 @@ try {
     const adapter = await import(pathToFileURL(path.join(installedRoot, "src", file)).href);
     if (typeof adapter[name] !== "function") throw new Error(`Packed ${file} is unavailable.`);
   }
+  const packedModels = await import(pathToFileURL(path.join(installedRoot, "src", "models.mjs")).href);
+  if (typeof packedModels.createModelPicker !== "function") throw new Error("Packed model picker is unavailable.");
   const packedRestart = await import(pathToFileURL(path.join(installedRoot, "src", "restart.mjs")).href);
   if (typeof packedRestart.startRestartWatcher !== "function" || typeof packedRestart.runRestartWorker !== "function") throw new Error("Packed restart worker is unavailable.");
   const installedCli = path.join(installedRoot, "bin", "pipa.mjs");
 
-  for (const version of ["1.19.0", "2.0.29"]) await smoke(version, installedCli, stdout.trim());
+  for (const version of ["1.19.0", "2.0.29", "2.2.5"]) await smoke(version, installedCli, stdout.trim());
 } finally {
   await runtime.teardown();
 }
@@ -89,6 +91,7 @@ if (process.argv[2] === "--version") {
     PIPA_ALLOWED_CHANNEL_IDS: "",
     PIPA_ALLOWED_USER_IDS: "",
     PIPA_ALLOWED_BOT_IDS: "",
+    PIPA_MENTION_ONLY: "true",
     NODE_OPTIONS: `--import=${pathToFileURL(path.join(directory, "fetch-mock.mjs")).href}`,
     PATH: `${fakeBin}${path.delimiter}${runtime.env.PATH}`,
   }, "", workingDirectory);
@@ -100,14 +103,24 @@ if (process.argv[2] === "--version") {
   const config = JSON.parse(configText);
   const manifest = JSON.parse(await readFile(path.join(home, ".pipa", "slack-manifest.json"), "utf8"));
   if (config.botName !== "Pack Bot" || config.workingDirectory !== await realpath(workingDirectory)) throw new Error("Packed init wrote invalid config.");
+  if (config.mentionOnly !== true) throw new Error("Packed init did not persist mentionOnly.");
   if (manifest.display_information.name !== "Pack Bot") throw new Error("Packed init wrote invalid manifest.");
-  if (!["channels:read", "assistant:write"].every((scope) => manifest.oauth_config.scopes.bot.includes(scope))) throw new Error("Packed init wrote incomplete Slack bot scopes.");
+  if (!["channels:read", "assistant:write", "commands"].every((scope) => manifest.oauth_config.scopes.bot.includes(scope))) throw new Error("Packed init wrote incomplete Slack bot scopes.");
+  if (JSON.stringify(manifest.features.slash_commands.map((entry) => entry.command)) !== JSON.stringify(["/pack-bot", "/pipa"])) throw new Error("Packed manifest omitted named/compatibility commands.");
+  config.defaultModel = { providerID: "openai", modelID: "pack-model" };
+  await writeFile(path.join(home, ".pipa", "config.json"), JSON.stringify(config));
+  const beforeExport = await readFile(path.join(home, ".pipa", "config.json"), "utf8");
+  const exported = await run(process.execPath, [installedCli, "manifest"], { ...process.env, PIPA_HOME: home });
+  if (JSON.stringify(JSON.parse(exported.stdout)) !== JSON.stringify(manifest)) throw new Error("Packed manifest export did not use the existing profile.");
+  if (/xapp-test|xoxb-test/u.test(exported.stdout)) throw new Error("Packed manifest export exposed credentials.");
+  if (await readFile(path.join(home, ".pipa", "config.json"), "utf8") !== beforeExport) throw new Error("Packed manifest export changed config.");
 
   const preview = await run(process.execPath, [installedCli, "routine", "create", "--prompt", "Pack preview", "--timezone", "America/New_York", "--channel", "C123", "--every", "1d", "--times", "05:00", "--preview", "--json"], {
     ...runtime.env,
     PIPA_HOME: home,
   }, "", workingDirectory);
   const previewJson = JSON.parse(preview.stdout);
+  if (JSON.stringify(previewJson.routine.model) !== JSON.stringify(config.defaultModel)) throw new Error("Packed routine preview lost the model snapshot.");
   if (!previewJson.ok || !previewJson.preview || previewJson.routine.schedule.frequency !== "daily" || previewJson.routine.schedule.times[0] !== "05:00") {
     throw new Error("Packed routine preview returned invalid normalized JSON.");
   }

@@ -1,19 +1,80 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 import { access, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { createRuntimeFixture, waitFor, FIXTURE_TEARDOWN_TIMEOUT_MS } from "../../test/helpers/runtime-fixture.mjs";
 import { assertTurnOutcome } from "../../test/helpers/opencode-contract.mjs";
 import { assertPin, compatibilityExit, selectGate, recordCase, finishCell, CELL_WORKER_TIMEOUT_MS, PINS, MODES } from "../test-opencode-matrix.mjs";
-import { observeRuntimeReadiness, observeNativeAdmissions, assertRestartRoutineAdmission, releaseCases, runCell } from "./opencode-release-cases.mjs";
+import { observeRuntimeReadiness, observeNativeAdmissions, assertRestartRoutineAdmission, releaseCases, runCell, protectedToolCommand, recordSharedCase } from "./opencode-release-cases.mjs";
 import { checkOpenCodeConnection } from "../../src/opencode.mjs";
 import { createWireFixture, loadWireFixture } from "../../test/helpers/opencode-contract.mjs";
 import { createProvider } from "./opencode-provider.mjs";
 import { command } from "../test-opencode-matrix.mjs";
 import { fileURLToPath } from "node:url";
 import { journal, windowsTree } from "../../test/helpers/runtime-ownership.mjs";
+import { MIGRATION_TARGET_PIN, selectMigrationTarget } from "./opencode-migration.mjs";
 
 const facade = { checkOpenCodeConnection };
+
+test("protected shell admission accepts only loopback bypasses without exposing environment values", () => {
+  const sentinel = { PIPA_INTEGRATION_SENTINEL: "matrix-integration" };
+  const marker = "SYNTHETIC_ENV_OK";
+  const probe = (env) => spawnSync(protectedToolCommand(marker), { shell: true, env, encoding: "utf8", timeout: 5000 });
+  for (const env of [sentinel, ...["localhost", "127.0.0.1", "::1", "[::1]", "localhost,127.0.0.1,::1,[::1]", " localhost , 127.0.0.1 "].map(value => ({ ...sentinel, NO_PROXY: value, no_proxy: value }))]) {
+    const result = probe(env);
+    assert.equal(result.status, 0, "Loopback-only tool environment must be admitted");
+    assert.equal(result.stdout, `${marker}\n`);
+    assert.equal(result.stderr, "");
+  }
+  const rejected = [
+    {}, { PIPA_INTEGRATION_SENTINEL: "mutated" },
+    ...["NODE_OPTIONS", "HTTP_PROXY", "https_proxy", "ALL_PROXY", "CUSTOM_PROXY", "SLACK_BOT_TOKEN", "PIPA_SLACK_APP_SECRET", "PIPA_OPENCODE_ATTACH_URL"].map(key => ({ ...sentinel, [key]: key === "NODE_OPTIONS" ? "--no-warnings" : "synthetic-private-value" })),
+    ...["NO_PROXY", "no_proxy"].flatMap(key => ["", " ", "*", "localhost,", ",127.0.0.1", "localhost,,::1", "localhost,example.com", "127.0.0.2", ".localhost", "localhost:80", "127.0.0.1/8"].map(value => ({ ...sentinel, [key]: value }))),
+    { ...sentinel, NO_PROXY: "localhost", no_proxy: "*" },
+  ];
+  for (const env of rejected) {
+    const result = probe(env);
+    assert.equal(result.status, 23, "Unsafe tool environment must be rejected");
+    assert.equal(result.stdout, "", "Rejection must not print environment values");
+    assert.equal(result.stderr, "");
+  }
+});
+
+test("shared cell failure retains both diagnostics, blocks pending-work contamination, and still stops and cleans up", async () => {
+  let server;
+  const provider = await createProvider({ listen: async (listener) => {
+    server = listener;
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+    return `http://127.0.0.1:${server.address().port}`;
+  } });
+  const cell = { cases: [] };
+  let pending = false;
+  let nextRan = false;
+  let stopped = false;
+  let cleaned = false;
+  try {
+    await recordSharedCase(cell.cases, { id: "questions-permissions-tools" }, async () => {
+      pending = true;
+      assert.equal((await fetch(`${provider.url}/unknown`)).status, 500);
+      throw new Error("Observer timed out with work pending");
+    }, provider);
+    await recordSharedCase(cell.cases, { id: "artifact-bytes" }, async () => {
+      nextRan = true;
+      assert.equal(pending, false, "Artifact staging contaminated by pending work");
+    }, provider);
+    await recordSharedCase(cell.cases, { id: "stop-ownership" }, async () => { pending = false; stopped = true; }, provider);
+  } finally {
+    await finishCell(cell, { teardown: async () => {
+      pending = false;
+      server.closeAllConnections();
+      await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+      cleaned = true;
+    } });
+  }
+  assert.deepEqual({ statuses: cell.cases.map(row => row.status), primary: cell.cases[0].observed.includes("Observer timed out with work pending"), provider: cell.cases[0].observed.includes("Unexpected provider method"), initiatingId: cell.cases[1].observed.includes("questions-permissions-tools"), nextRan, stopped, cleaned, pending, cleanup: cell.cleanup.status },
+    { statuses: ["FAIL", "BLOCKED", "PASS"], primary: true, provider: true, initiatingId: true, nextRan: false, stopped: true, cleaned: true, pending: false, cleanup: "PASS" });
+});
 
 test("restarted native routine receipts reject trimmed/mutated prompt bytes and wrong attribution", async () => {
   const prompt = "  MATRIX_routine_nonce\nexact saved prompt  \n";
@@ -45,9 +106,30 @@ test("restarted native routine receipts reject trimmed/mutated prompt bytes and 
 });
 
 test("wrong reported pin fails, including prefixed output", () => {
+  assert.deepEqual(PINS, ["1.18.35", "1.19.0", "2.0.29", "2.2.5"]);
   assertPin("OpenCode 2.0.29", "2.0.29");
+  assertPin("OpenCode 2.2.5", "2.2.5");
+  assert.throws(() => assertPin("2.0.29", "2.2.5"));
+  assert.throws(() => assertPin("2.2.5", "2.0.29"));
   assert.throws(() => assertPin("1.19.0", "1.18.35"));
   assert.throws(() => assertPin("2.0.29\n1.18.35", "2.0.29"));
+});
+
+test("migration selects exact 2.2.5 target without falling back to historical 2.0.29", () => {
+  assert.equal(MIGRATION_TARGET_PIN, "2.2.5");
+  const binaries = Object.fromEntries(PINS.map((pin) => [pin, `/synthetic/${pin}/opencode`]));
+  for (const sourcePin of ["1.18.35", "1.19.0"]) {
+    assert.equal(selectMigrationTarget(binaries, sourcePin), "2.2.5");
+    const withoutHistorical = { ...binaries };
+    delete withoutHistorical["2.0.29"];
+    assert.equal(selectMigrationTarget(withoutHistorical, sourcePin), "2.2.5");
+    const withoutTarget = { ...binaries };
+    delete withoutTarget["2.2.5"];
+    assert.throws(() => selectMigrationTarget(withoutTarget, sourcePin), /target 2\.2\.5/u);
+    const withoutSource = { ...binaries };
+    delete withoutSource[sourcePin];
+    assert.throws(() => selectMigrationTarget(withoutSource, sourcePin), /verified source/u);
+  }
 });
 
 test("native readiness observer validates generation, auth, migration and configured workspace", async () => {

@@ -7,9 +7,12 @@ and [testing procedure](pipa-testing.md) before choosing a deployment pin.
 ## Versions and capabilities
 
 Pipa requires Node 22 or newer and automatically selects a native v1 or v2 HTTP
-adapter. The candidate pins `@opencode/client` to **2.0.29**. Native qualification
-pins are **1.18.35, 1.19.0 and 2.0.29**, not a claim that all releases from those
-versions onward are supported. No minimum version is release-qualified yet.
+adapter. The candidate keeps `@opencode/client` pinned to **2.0.29** pending real
+qualification. Native qualification pins are **1.18.35, 1.19.0, 2.0.29 and 2.2.5**;
+**2.2.5** is the current v2 target and **2.0.29** is a historical comparison pin.
+These pins are not passing results or a claim that all releases from those
+versions onward are supported. Historical reports retain their recorded versions
+and do not qualify 2.2.5. No minimum version is release-qualified yet.
 The parser accepts major 1 or 2, including newer patch versions, then validates
 the actual connection's required contracts; other majors fail before intake.
 
@@ -22,7 +25,16 @@ the actual connection's required contracts; other majors fail before intake.
 | Model discovery | Available through executor capability API | Connected providers, variants and native defaults |
 | Live model switching | Explicitly unsupported | Existing-session native switch; affects subsequent provider work |
 | Reset model | No live switch | Selects the current native default explicitly; does not inherit future default changes |
-| Slack model picker | Deferred | Deferred |
+| Slack model picker | Installation default for new/empty sessions | Installation default for new/empty sessions |
+
+Main's shipped Slack model picker is preserved by this integration. The named
+installation command (for example `/chopper model`) and `/pipa model` open the
+same private picker; Slack command registration and authorization still apply.
+Saving changes Pipa's installation default, not an existing session's native
+model. Existing threads retain their model across replies and restarts; routine
+create/preview snapshots the default and dispatch uses that saved model. Native
+v2 live switching/reset is a separate executor capability, not the Slack picker's
+Save behavior. Preserving the picker does not establish native qualification.
 
 Generic numeric, conditional or external forms require an OpenCode client.
 Pipa displays a notice and reconciles external settlement rather than inventing
@@ -66,7 +78,9 @@ to create another app. Never run two Socket consumers for the selected app.
 ## Journey B: deliberately adopt v2
 
 First complete Journey A's inventory, drain and matched snapshot. The Pipa
-upgrade does not install or upgrade OpenCode automatically.
+upgrade does not install or upgrade OpenCode automatically. The current synthetic
+migration target is each pinned v1 release (**1.18.35 / 1.19.0**) to native
+**2.2.5**; historical v1-to-2.0.29 reports remain historical evidence only.
 
 1. Inventory required providers, credentials, MCP servers, file definitions and
    plugins privately. A required integration without a working v2 port blocks
@@ -74,7 +88,8 @@ upgrade does not install or upgrade OpenCode automatically.
 2. Stop **all** writers to the source OpenCode storage, including independent
    clients/services. Copy the stopped complete profile/storage to a disposable
    target, leaving the pristine v1 snapshot immutable.
-3. Select the exact v2 executable in the candidate's private PATH, or select an
+3. Select the exact **2.2.5** executable for the current qualification rehearsal in
+   the candidate's private PATH, or select an
    independently managed v2 server. Preserve Pipa's config, session mappings and
    routine state; OpenCode owns schema/history migration. Wait for completed
    migration and configured-location readiness before dispatching work.
@@ -118,8 +133,8 @@ The reproducible synthetic rehearsal is:
 npm run test:engines -- --migration --gate=deterministic
 ```
 
-This seeds each old pin with histories, mappings, routine states, configured deny
-rules and a remembered approval; stops writers; migrates only a copy; then
+This seeds each pinned v1 release with histories, mappings, routine states, configured deny
+rules and a remembered approval; stops writers; migrates only a copy to native **2.2.5**; then
 continues a separate pristine v1 rollback copy. It does not touch a live profile
 or establish private operator/plugin compatibility.
 
@@ -169,6 +184,7 @@ from `npm run test:slack:release -- --plan`. Missing evidence blocks qualificati
 | --- | --- |
 | Existing profile | Same Slack app/config, mappings and routine definitions; new and existing threads work |
 | Providers | Every required credential/provider/model makes a real request; variants/defaults match intended configuration |
+| Slack model picker | Named/alias loading, Save/reopen/Cancel, authorization, completed provider/model metadata, existing-thread retention after default changes/restart, and immutable routine model snapshots |
 | MCP | Invoke a real required tool and verify its returned result, authentication and working directory |
 | Definitions | Execute a file skill, agent and command, checking returned markers/history rather than listing files |
 | Plugins | Every required v2 port loads; invoke its hook, reload and confirm one new registration/result |

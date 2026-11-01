@@ -121,8 +121,8 @@ test("v1 baseline: exact prompt, trusted context and persisted-session continuat
   const current = await fixture(t);
   const { runtime, document, wire, executor, input } = current;
   await executor.ready(runtime.workspace);
+  assert.equal(executor.capabilities.modelDiscovery, true);
   assert.equal(executor.capabilities.liveModelSwitch, false);
-  await assert.rejects(executor.listModels({ workingDirectory: runtime.workspace }), /not supported/u);
   await assert.rejects(executor.switchModel({ sessionId: input.sessionId, model: null, workingDirectory: runtime.workspace }), /not supported/u);
   const store = await createSessionStore(pipaPaths(runtime.home).sessions);
   await store.set("slack:C1:1.0", document.expected.sessionId);
@@ -147,6 +147,167 @@ test("v1 baseline: exact prompt, trusted context and persisted-session continuat
   wire.assertComplete();
 });
 
+test("v1 models: discovery supports the shipped flat picker and native object catalog without inference", async (t) => {
+  const { runtime, document, executor, wire } = await fixture(t);
+  document.routes.push({ method: "GET", path: "/config/providers", query: { directory: runtime.workspace }, repeatLast: true,
+    responses: [{ json: { providers: [{ id: "connected", models: { shared: { name: "Shared", apiKey: "private-provider-secret" } } },
+      { id: "other", models: { shared: { id: "shared", name: "Other" } } }], default: { connected: "shared" } } }] });
+  assert.deepEqual(await executor.listModels(runtime.workspace), [
+    { providerID: "connected", modelID: "shared", name: "Shared" }, { providerID: "other", modelID: "shared", name: "Other" },
+  ]);
+  assert.deepEqual(await executor.listModels({ workingDirectory: runtime.workspace }), {
+    models: [{ providerID: "connected", id: "shared", name: "Shared", variants: ["default"] }, { providerID: "other", id: "shared", name: "Other", variants: ["default"] }],
+    defaultModel: { providerID: "connected", id: "shared", variant: "default" },
+  });
+  assert.ok(wire.calls.every((call) => call.method === "GET"));
+  wire.assertComplete();
+});
+
+for (const selection of ["explicit", "assistant", "interrupted", "new", "empty"]) test(`v1 models: ${selection} resolves model before one native prompt admission`, async (t) => {
+  const { document, executor, input, wire } = await fixture(t);
+  const model = { providerID: "selected", modelID: "a" };
+  const defaultModel = { providerID: "default", modelID: "b" };
+  const messages = document.routes.find((route) => route.path.endsWith("/message"));
+  if (selection === "interrupted") messages.responses[0].json[0].info = { id: "msg_old", role: "user", model };
+  if (["assistant", "explicit"].includes(selection)) Object.assign(messages.responses[0].json[0].info, model);
+  if (selection === "empty") messages.responses[0].json = [];
+  if (selection === "new") messages.responses.shift();
+  await executor.runTurn({ ...input, ...(selection === "new" ? { sessionId: undefined } : {}), defaultModel,
+    ...(selection === "explicit" ? { model: defaultModel } : {}) });
+  const admissions = wire.calls.filter((call) => call.path.endsWith("/prompt_async"));
+  assert.equal(admissions.length, 1);
+  assert.deepEqual(admissions[0].body.model, ["explicit", "new", "empty"].includes(selection) ? defaultModel : model);
+  wire.assertComplete();
+});
+
+for (const selection of ["new", "missing", "existing", "explicit", "unset"]) test(`v2 models: ${selection} bridges defaults/overrides through native switching without duplicate prompts`, async (t) => {
+  const { runtime, document, executor, input, wire } = await fixture(t, "v2");
+  const defaultModel = { providerID: "default", modelID: "b" };
+  const model = { providerID: "snapshot", modelID: "a" };
+  const shouldSwitch = ["new", "missing", "explicit"].includes(selection);
+  if (selection === "existing") {
+    const history = { id: "msg_history", type: "assistant", model: { providerID: "native", id: "retained", variant: "measured" }, time: { created: 0, completed: 1 }, finish: "stop", content: [] };
+    for (const response of document.routes.find((route) => route.path.endsWith("/message")).responses) response.json.data.unshift(history);
+  }
+  if (selection === "missing") document.routes.find((route) => route.path === "/api/session/ses_contract").responses.unshift({ status: 404, json: { _tag: "SessionNotFoundError", sessionID: input.sessionId } });
+  document.routes.push({ method: "POST", path: "/api/session/ses_contract/model", required: shouldSwitch, responses: [{ status: 204 }] });
+  await executor.runTurn({ ...input, ...(selection === "new" ? { sessionId: undefined } : {}),
+    ...(selection === "unset" ? {} : { defaultModel }), ...(selection === "explicit" ? { model } : {}) });
+  const switches = wire.calls.filter((call) => call.path.endsWith("/model"));
+  assert.equal(switches.length, shouldSwitch ? 1 : 0);
+  if (shouldSwitch) {
+    const selected = selection === "explicit" ? model : defaultModel;
+    assert.deepEqual(switches[0].body, { model: { providerID: selected.providerID, id: selected.modelID, variant: "default" } });
+    assert.ok(wire.calls.indexOf(switches[0]) < wire.calls.findIndex((call) => call.path.endsWith("/prompt")));
+  }
+  assert.equal(wire.calls.filter((call) => call.path.endsWith("/prompt")).length, 1);
+  assert.equal(wire.calls.filter((call) => call.path === "/api/session").length, ["new", "missing"].includes(selection) ? 1 : 0);
+  assert.deepEqual(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records, []);
+  wire.assertComplete();
+});
+
+for (const boundary of ["before-selection", "after-selection"]) test(`v2 default recovery: cancellation ${boundary} preserves the mapped empty session's model semantics`, async (t) => {
+  const controller = new AbortController();
+  const firstDefault = { providerID: "installation", modelID: "first" };
+  const nextDefault = { providerID: "installation", modelID: "next" };
+  const current = await fixture(t, "v2", { onRequest: (call) => {
+    if (boundary === "after-selection" && call.path.endsWith("/model")) {
+      current.document.routes.find((route) => route.path === "/api/session/ses_contract").responses[0].json.data.model = call.body.model;
+      controller.abort(new Error("cancel after native selection"));
+    }
+  } });
+  const { document, executor, input, wire, runtime } = current;
+  document.routes.find((route) => route.path.endsWith("/message")).responses.unshift({ json: { data: [], cursor: { previous: null, next: null } } });
+  document.routes.push({ method: "POST", path: "/api/session/ses_contract/model", repeatLast: true, responses: [{ status: 204 }] });
+  let persisted;
+  await assert.rejects(executor.runTurn({ ...input, sessionId: undefined, defaultModel: firstDefault, signal: controller.signal,
+    onSession: (id) => {
+      persisted = id;
+      if (boundary === "before-selection") controller.abort(new Error("cancel before native selection"));
+    },
+  }), /cancel (?:before|after) native selection/u);
+  assert.equal(persisted, input.sessionId);
+  assert.equal(wire.calls.filter((call) => call.path.endsWith("/prompt")).length, 0);
+  await executor.runTurn({ ...input, sessionId: persisted, defaultModel: nextDefault });
+  const switches = wire.calls.filter((call) => call.path.endsWith("/model"));
+  assert.equal(switches.length, 1, "an unselected empty session needs its default; an acknowledged native choice must not be replaced");
+  assert.deepEqual(switches[0].body.model, { providerID: "installation", id: boundary === "before-selection" ? "next" : "first", variant: "default" });
+  assert.equal(wire.calls.filter((call) => call.path === "/api/session").length, 1);
+  assert.equal(wire.calls.filter((call) => call.path.endsWith("/prompt")).length, 1);
+  assert.deepEqual(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records, []);
+  wire.assertComplete();
+});
+
+for (const selection of ["empty-native-choice", "model-switch-history"]) test(`v2 default recovery: retains ${selection} without applying the installation default`, async (t) => {
+  const { document, executor, input, wire } = await fixture(t, "v2");
+  const model = { providerID: "native", id: "user-choice", variant: "measured" };
+  if (selection === "empty-native-choice") document.routes.find((route) => route.path === "/api/session/ses_contract").responses[0].json.data.model = model;
+  else {
+    const selected = { id: "msg_selected", type: "model-switched", model, time: { created: 1 } };
+    for (const response of document.routes.find((route) => route.path.endsWith("/message")).responses) response.json.data.unshift(selected);
+  }
+  await executor.runTurn({ ...input, defaultModel: { providerID: "installation", modelID: "default" } });
+  assert.equal(wire.calls.filter((call) => call.path.endsWith("/model")).length, 0);
+  assert.equal(wire.calls.filter((call) => call.path.endsWith("/prompt")).length, 1);
+  wire.assertComplete();
+});
+
+for (const [label, error, providerID, expected] of [
+  ["HTTP 401", { type: "provider.auth", status: 401, message: "invalid key private-message-secret" }, "connected", /provider "connected" authentication failed \(HTTP 401\)\. Reconnect that provider/u],
+  ["expired key", { type: "provider.auth", status: 401, message: "This API key has expired. private-message-secret" }, "connected", /provider "connected" API key has expired\. Replace that provider's API key/u],
+  ["native auth", { type: "provider.auth", message: "private-message-secret" }, "connected", /provider "connected" authentication failed\. Reconnect that provider/u],
+  ["HTTP 429", { type: "provider.rate-limit", status: 429, message: "private-message-secret" }, "connected", /provider "connected" failed \(HTTP 429\)/u],
+  ["unsafe provider", { type: "provider.auth", status: 401, message: "private-message-secret" }, "connected\nprivate-provider-secret", /selected provider authentication failed \(HTTP 401\)/u],
+  ["unsafe type and misleading message", { type: "private-type-secret", status: 429, message: "HTTP 401 API key has expired private-message-secret" }, "connected", /provider "connected" failed \(HTTP 429\)/u],
+]) test(`v2 provider diagnostics: ${label} uses only safe native structured fields`, async (t) => {
+  const { document, executor, input, wire, runtime } = await fixture(t, "v2");
+  const timeline = document.routes.find((route) => route.path.endsWith("/message")).responses.at(-1).json.data;
+  Object.assign(timeline.find((message) => message.type === "assistant"), {
+    model: { providerID, id: "native" }, finish: "error", error: { ...error, response: { body: "API key has expired private-response-secret" } },
+  });
+  timeline.find((message) => message.type === "idle").outcome = "failed";
+  await assert.rejects(executor.runTurn(input), (failure) => {
+    assert.match(failure.message, expected);
+    assert.doesNotMatch(failure.message, /private-(?:message|response|provider|type)-secret/u);
+    if (error.status === 401 || error.type === "provider.auth") assert.match(failure.message, /choose another provider with your installation's model command, then start a new thread/u);
+    if (label !== "expired key") assert.doesNotMatch(failure.message, /expired/u);
+    return true;
+  });
+  assert.equal(wire.calls.filter((call) => call.path.endsWith("/prompt")).length, 1);
+  assert.deepEqual(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records, []);
+  wire.assertComplete();
+});
+
+for (const generation of ["v1", "v2"]) test(`${generation} models: picker discovery is bounded at 1.5s and aborts native reads`, async (t) => {
+  const signals = [];
+  const { runtime, executor } = await fixture(t, generation, { transport: async (url, init, nativeFetch) => {
+    if (["/config/providers", "/api/model", "/api/model/default"].includes(new URL(url).pathname)) {
+      signals.push(init.signal);
+      return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+    }
+    return nativeFetch(url, init);
+  } });
+  await assert.rejects(bounded(executor.listModels(runtime.workspace), { timeoutMs: 2500 }), /Model discovery timed out/u);
+  assert.equal(signals.length, generation === "v1" ? 1 : 2);
+  assert.ok(signals.every((signal) => signal.aborted));
+});
+
+for (const [error, expected] of [
+  [{ name: "APIError", data: { statusCode: 401, message: "API key has expired private-secret" } }, /API key has expired/u],
+  [{ name: "ProviderAuthError", data: { message: "private-secret" } }, /authentication failed/u],
+  [{ name: "APIError", data: { statusCode: 429, message: "private-secret" } }, /failed \(HTTP 429\)/u],
+]) test(`v1 provider failures preserve safe ${error.name}/${error.data.statusCode ?? "auth"} diagnostics`, async (t) => {
+  const { document, executor, input } = await fixture(t);
+  const messages = document.routes.find((route) => route.path.endsWith("/message"));
+  Object.assign(messages.responses[1].json[0].info, { providerID: "connected", error });
+  await assert.rejects(executor.runTurn(input), (failure) => {
+    assert.match(failure.message, /provider "connected"/u);
+    assert.match(failure.message, expected);
+    assert.doesNotMatch(failure.message, /private-secret/u);
+    return true;
+  });
+});
+
 test("v2 models: provider-qualified discovery, native default reset and validation before mutation", async (t) => {
   const { runtime, document, wire, executor, input } = await fixture(t, "v2");
   const location = { directory: runtime.workspace };
@@ -160,6 +321,7 @@ test("v2 models: provider-qualified discovery, native default reset and validati
   const catalog = await executor.listModels({ workingDirectory: runtime.workspace });
   assert.equal(executor.capabilities.liveModelSwitch, true);
   assert.deepEqual(catalog, { models: ["connected", "other"].map((providerID) => ({ providerID, id: "shared", name: "Shared", variants: ["default", "measured"] })), defaultModel: { providerID: "connected", id: "shared", variant: "default" } });
+  assert.deepEqual(await executor.listModels(runtime.workspace), ["connected", "other"].map((providerID) => ({ providerID, modelID: "shared", name: "Shared" })));
   const select = (model) => executor.switchModel({ sessionId: input.sessionId, model, workingDirectory: runtime.workspace });
   for (const invalid of [{ providerID: "missing", id: "shared" }, { providerID: "connected", id: "disabled" }, { ...model, variant: "absent" }, { ...model, variant: "" }, undefined]) await assert.rejects(select(invalid), /unavailable|Invalid/u);
   assert.equal(wire.calls.filter((call) => call.method === "POST" && call.path.endsWith("/model")).length, 0);
@@ -1066,7 +1228,7 @@ for (const failure of ["malformed response", "malformed envelope", "provider fai
     : { json: [{ info: { id: "msg_failed", role: "assistant", error: { name: "APIError" } }, parts: [{ type: "text", text: "must not deliver" }] }] };
   await assert.rejects(runTurnContract({ executor, input, expected: document.expected, caseName: failure }), failure === "malformed response" ? /malformed response: OpenCode returned an invalid response/u
     : failure === "malformed envelope" ? /malformed envelope:/u
-    : /provider failure: OpenCode failed to complete/u);
+    : /provider failure: OpenCode selected provider failed to complete the turn\./u);
   if (failure === "malformed envelope") assert.throws(() => wire.assertComplete(), /malformed message envelope/u);
   else wire.assertComplete();
 });

@@ -12,6 +12,7 @@ const MANIFEST = {
     long_description: "Pippette connects Slack to the OpenCode installed on your computer. Send text requests from Slack and receive replies in threads for the local folder you choose. OpenCode runs locally, and your Slack credentials stay on your machine. Learn more at usepipa.com.",
   },
   features: {
+    slash_commands: [{ description: "Configure this Pipa installation", usage_hint: "model", should_escape: false }],
     bot_user: {
       display_name: "Pippette",
       always_online: true,
@@ -21,6 +22,7 @@ const MANIFEST = {
     scopes: {
       user: ["files:read", "files:write"],
       bot: [
+        "commands",
         "files:read",
         "app_mentions:read",
         "assistant:write",
@@ -133,7 +135,19 @@ export function createManifest(botName) {
   manifest.display_information.description = manifest.display_information.description.replaceAll("Pippette", name);
   manifest.display_information.long_description = manifest.display_information.long_description.replaceAll("Pippette", name);
   manifest.features.bot_user.display_name = name;
+  const commandTemplate = manifest.features.slash_commands[0];
+  manifest.features.slash_commands = slackCommandNames(name).map((command) => ({ ...commandTemplate, command }));
   return manifest;
+}
+
+export function slackCommandName(botName) {
+  const slug = validateBotName(botName).normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase()
+    .replace(/[^a-z0-9]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 31).replace(/-+$/u, "");
+  return slug ? `/${slug}` : "/pipa";
+}
+
+export function slackCommandNames(botName) {
+  return [...new Set([slackCommandName(botName), "/pipa"])];
 }
 
 export function createManifestUrl(manifest) {
@@ -170,7 +184,39 @@ export async function loadConfig(file = pipaPaths().config) {
       throw new Error(`Invalid Pipa config: ${key} must be a list of non-empty Slack IDs.`);
     }
   }
+  if (config.mentionOnly !== undefined && typeof config.mentionOnly !== "boolean") {
+    throw new Error("Invalid Pipa config: mentionOnly must be a boolean.");
+  }
+  normalizeModel(config.defaultModel);
   return { ...config, slackMode };
+}
+
+export function normalizeModel(value) {
+  if (value == null) return null;
+  if (typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).some((key) => !["providerID", "modelID"].includes(key))
+    || ![value.providerID, value.modelID].every((id) => typeof id === "string" && id.trim() === id && id.length > 0 && id.length <= 500 && !/[\u0000-\u001f\u007f]/u.test(id))) {
+    throw new Error("Invalid model: expected providerID and modelID.");
+  }
+  return { providerID: value.providerID, modelID: value.modelID };
+}
+
+export function createModelSetting(file = pipaPaths().config, writeJson = writePrivateJson) {
+  let tail = Promise.resolve();
+  return {
+    async save(model, authorize = () => undefined) {
+      const selected = normalizeModel(model);
+      if (!selected) return Promise.reject(new Error("A model selection is required."));
+      const write = tail.then(async () => {
+        const current = await loadConfig(file);
+        await authorize(current);
+        await writeJson(file, { ...current, defaultModel: selected });
+        return selected;
+      });
+      tail = write.catch(() => undefined);
+      return write;
+    },
+  };
 }
 
 export async function saveConfig(config, paths = pipaPaths(), manifest = createManifest(config.botName)) {

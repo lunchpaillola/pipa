@@ -5,9 +5,17 @@ import path from "node:path";
 import { createRuntimeFixture, bounded } from "../../test/helpers/runtime-fixture.mjs";
 import { assertTurnOutcome } from "../../test/helpers/opencode-contract.mjs";
 
+export const MIGRATION_TARGET_PIN = "2.2.5";
+
+export function selectMigrationTarget(binaries, sourcePin) {
+  assert.ok(binaries[sourcePin] && binaries[MIGRATION_TARGET_PIN], `Migration requires verified source ${sourcePin} and target ${MIGRATION_TARGET_PIN} pins from runner`);
+  return MIGRATION_TARGET_PIN;
+}
+
 // A stopped whole-profile copy includes SQLite companions and upstream storage.
 // Rollback never opens the copy offered to v2, even when v2 startup fails.
 export async function createMigrationJourney({ runtime, binaries, sourcePin, facade, state, routines, provider, config }) {
+  const targetPin = selectMigrationTarget(binaries, sourcePin);
   const source = await createRuntimeFixture({ timeoutMs: 180_000 });
   runtime.defer(() => source.teardown(), `migration ${sourcePin} source resources`);
   Object.assign(source.env, { OPENCODE_SERVER_PASSWORD: "synthetic-loopback-only", OPENCODE_PASSWORD: "synthetic-loopback-only", OPENCODE_PURE: "1", OPENCODE_DISABLE_DEFAULT_PLUGINS: "1", OPENCODE_DISABLE_EXTERNAL_SKILLS: "1", OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "1" });
@@ -58,7 +66,6 @@ export async function createMigrationJourney({ runtime, binaries, sourcePin, fac
   }
   return {
     async seed() {
-      assert.ok(binaries[sourcePin] && binaries["2.0.29"], "Migration requires verified source and target pins from runner");
       await writeFile(source.env.OPENCODE_CONFIG, JSON.stringify({ ...config, permission: { bash: { "*": "ask", pwd: "deny" }, read: "deny" } }));
       await state.writePrivateJson(state.pipaPaths(source.home).config, profile);
       await start(sourcePin, source.root);
@@ -82,12 +89,12 @@ export async function createMigrationJourney({ runtime, binaries, sourcePin, fac
       await cp(snapshot, target, { recursive: true, errorOnExist: true, force: false });
       assert.deepEqual(await hashes(target), pristineHashes);
       seeded = { sessions, permissionSession: permission.sessionId };
-      return { observed: "Seeded real v1 history, thread mappings, three routine states and remembered approval; stopped writers and copied entire private profile", evidence: { sourcePin, sessionIds: Object.values(sessions), checkpointFiles: Object.keys(pristineHashes), configuredDeny: true, rememberedApproval: true } };
+      return { observed: "Seeded real v1 history, thread mappings, three routine states and remembered approval; stopped writers and copied entire private profile", evidence: { sourcePin, targetPin, sessionIds: Object.values(sessions), checkpointFiles: Object.keys(pristineHashes), configuredDeny: true, rememberedApproval: true } };
     },
     async upgrade() {
       if (!seeded) return { status: "BLOCKED", observed: "Migration seed case failed; no snapshot is offered to v2" };
       try {
-        const env = await start("2.0.29", target);
+        const env = await start(targetPin, target);
         assert.deepEqual(JSON.parse(await readFile(state.pipaPaths(env.PIPA_HOME).sessions, "utf8")), seeded.sessions);
         assert.deepEqual((await routines.loadRoutineState(state.pipaPaths(env.PIPA_HOME).routines)).routines.map((item) => item.status), ["active", "inactive", "completed"]);
         await run(`V2_DENY_${marker}`, null, { tool: denialTool }, async () => { assert.fail("Migrated configured deny became an approval request"); });
@@ -96,9 +103,9 @@ export async function createMigrationJourney({ runtime, binaries, sourcePin, fac
         assert.deepEqual(reset, ["permission"], "Native v2 remembered-approval reset was not observed");
         for (const [index, id] of Object.values(seeded.sessions).entries()) await run(`${marker}_v2_${index}`, id, { verify: (messages) => assert.ok(JSON.stringify(messages).includes(marker), "Migrated history missing") });
         await stop();
-        await start("2.0.29", target);
+        await start(targetPin, target);
         await run(`${marker}_v2_restart`, Object.values(seeded.sessions)[0], { verify: (messages) => assert.ok(JSON.stringify(messages).includes(marker)) });
-        return { observed: "Disposable v2 copy continued the mapped history before and after engine restart" };
+        return { observed: `Disposable v2 ${targetPin} copy continued the mapped history before and after engine restart`, evidence: { sourcePin, targetPin } };
       } finally { await stop(); assert.deepEqual(await hashes(snapshot), pristineHashes, "Pristine v1 snapshot changed during v2 attempt"); }
     },
     async rollback() {

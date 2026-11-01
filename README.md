@@ -1,17 +1,65 @@
-# Pipa
+<p align="center">
+  <a href="https://www.usepipa.com/opencode-slack?utm_source=github&utm_medium=repo_readme&utm_campaign=signup&utm_content=readme_banner">
+    <img src="docs/assets/banner.png" alt="Pipa: run OpenCode from Slack" width="100%">
+  </a>
+</p>
 
-[![CI](https://github.com/lunchpaillola/pipa/actions/workflows/ci.yml/badge.svg)](https://github.com/lunchpaillola/pipa/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/lunchpaillola/pipa/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/lunchpaillola/pipa/ci.yml?branch=main&style=flat-square&label=CI"></a>
+  <a href="https://www.npmjs.com/package/@usepipa/pipa"><img alt="npm" src="https://img.shields.io/npm/v/@usepipa/pipa?style=flat-square&color=2437F5&label=npm"></a>
+</p>
 
-Pipa runs Slack through one persistent private OpenCode server with no hosted relay, database, public endpoint, or sandbox.
+<p align="center">
+  <strong>Pipa turns a Slack thread into a durable OpenCode session on one private server, local by default.</strong><br>
+  No relay, no database, no public endpoint.
+</p>
 
-[View Pipa on GitHub](https://github.com/lunchpaillola/pipa). If it is useful, star the repo so more people can find it.
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=rlTMdkPWPcA"><strong>Watch the 3-minute setup</strong></a>
+  ·
+  <a href="https://www.usepipa.com/opencode-slack?utm_source=github&utm_medium=repo_readme&utm_campaign=signup&utm_content=readme_how_it_works">How it works</a>
+  ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+  ·
+  <a href="https://github.com/lunchpaillola/pipa/issues">Issues</a>
+</p>
 
-**Pipa is in early preview. Features may break unintentionally, and CLI commands, configuration, and Slack behavior may continue to change.**
+> **Early preview.** Features may break unintentionally, and CLI commands, configuration, and Slack behavior may continue to change.
+
+## Why Pipa
+
+| What it does | What that means |
+| --- | --- |
+| **One server** | In local mode, Pipa starts one private OpenCode server on `127.0.0.1` and reuses it for every Slack turn. Attached servers follow their own network controls. |
+| **Thread sessions** | A mention starts a session; replies in that thread continue it. Different threads run independently, and a newer message interrupts only its own thread. |
+| **Routines** | Schedule timezone-aware work that runs through the same agent and delivers to an exact channel or thread. |
+| **Generated files** | In local mode, long work returns as a concise summary with generated files from a private per-turn directory. Attached non-loopback servers return inline text. |
+| **Access control** | Restrict by Slack channel, human user, and bot. Allowlists are rechecked on every turn, interaction, and delivery. |
+| **Restart** | `pipa restart` hands off to a detached worker and reports a durable status. |
+
+If Pipa is useful, [star the repo](https://github.com/lunchpaillola/pipa).
+
+## Quickstart
+
+**Runs on** macOS, Linux, and Windows. **Requires** Node.js 22 or newer, [OpenCode](https://opencode.ai) installed and authenticated, and a Slack workspace where you can create an app.
+
+```sh
+npm install --global @usepipa/pipa
+pipa init
+pipa start
+```
+
+`pipa init` creates the Slack app manifest, opens the install flow, and saves the profile under `~/.pipa`. Invite Pipa to a channel and mention it. The [3-minute setup video](https://www.youtube.com/watch?v=rlTMdkPWPcA) shows the flow, and the [OpenCode Slack integration guide](https://www.usepipa.com/opencode-slack?utm_source=github&utm_medium=repo_readme&utm_campaign=signup&utm_content=readme_install_guide) is the current written path.
+
+## Security model
+
+In local mode, Pipa runs on your machine, not behind a relay. The local OpenCode server binds to `127.0.0.1` on an operating-system-assigned port; attached servers follow their own network controls. Slack access is limited by channel, user, and bot allowlists, rechecked on every turn. Tokens stay in the local profile with private file permissions, and OpenCode manages provider credentials.
+
+Read [SECURITY.md](SECURITY.md) for the full model and reporting path.
 
 ## Pipa Managed
 
-Want someone to configure, run, and manage agent workflows for your company? Check out [Pipa Managed](https://usepipa.com/managed). We set up a Slack-native operations agent around how your team works, then keep its workflows running and improving over time.
+Want Lunch Pail Labs to configure, run, and manage agent workflows for your company? Check out [Pipa Managed](https://usepipa.com/managed?utm_source=github&utm_medium=repo_readme&utm_campaign=signup&utm_content=readme_footer). We set up a Slack-native operations agent for your team, then keep the workflows running.
 
 ## Local Socket Mode
 
@@ -41,7 +89,7 @@ npm install --global @usepipa/pipa
 pipa init
 ```
 
-`pipa init` guides you through creating and installing the Slack app and saving its local configuration. The generated manifest includes `channels:read` and `assistant:write`. If an existing installation has not granted a recommended scope, `pipa init` and `pipa start` print reauthorization guidance but continue running.
+`pipa init` guides you through creating and installing the Slack app and saving its local configuration. The generated manifest includes `channels:read`, `assistant:write`, and `commands`, plus a slash command derived from your configured bot name (`Chopper` gets `/chopper`) and a `/pipa` compatibility alias. For `Pipa`, these are the same command and appear only once. Review the alias collision guidance below before installing multiple apps in one workspace. Known missing scopes produce upgrade guidance without blocking startup.
 
 3. Start Pipa:
 
@@ -49,9 +97,9 @@ pipa init
 pipa start
 ```
 
-Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. Pipa starts one OpenCode server bound to `127.0.0.1` on an operating-system-assigned port and reuses it for every Slack turn. Port `0` asks the operating system for an available port; no port configuration is required. Pipa replies in a thread, and follow-up messages in that thread reuse the same OpenCode session without another mention. A newer follow-up interrupts an active turn in the same thread, while other threads continue independently. While a turn is active, Pipa shows a typing status in its Slack thread.
+Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. In owned local mode, Pipa starts one OpenCode server bound to `127.0.0.1` on an operating-system-assigned port and reuses it for every Slack turn. Port `0` asks the operating system for an available port; no port configuration is required. Pipa replies in a thread, and follow-up messages in that thread reuse the same OpenCode session without another mention. A newer follow-up interrupts an active turn in the same thread, while other threads continue independently. While a turn is active, Pipa shows a typing status in its Slack thread.
 
-Pipa keeps naturally short answers inline. For deeper work, OpenCode can return a concise summary with suitable generated files, such as documents, spreadsheets, PDFs, or images. Files are read only from a private session directory under `.pipa/artifacts` in the configured working directory. The directory is cleared before each turn, files are validated and limited to 10 files and 100 MB per file or response, and the directory is deleted locally after delivery. If file delivery fails, Pipa retries the declaration-free summary without the files. Attached OpenCode servers on non-loopback hosts use inline text fallback instead of local artifact delivery.
+Pipa keeps naturally short answers inline. For deeper work, OpenCode can return a concise summary with suitable generated files, such as documents, spreadsheets, PDFs, or images. Files are read only from a private session directory under `.pipa/artifacts` in the configured working directory. The directory is cleared before each turn, files are validated and limited to 10 files and 100 MB total, and the directory is deleted locally after delivery. If file delivery fails, Pipa retries the declaration-free summary without the files. Attached OpenCode servers on non-loopback hosts use inline text fallback instead of local artifact delivery.
 
 Incoming messages can include up to Slack's 10-file limit, with a maximum size of 10 MiB (10,485,760 bytes) per file. Pipa checks both declared size and downloaded bytes before sending the prompt. Attachments require a text prompt and are copied to a temporary directory only for the duration of the turn. Outgoing artifact limits remain 10 files and 100 MB per file or response.
 
@@ -82,6 +130,18 @@ By default Pipa answers any human user who mentions it in a channel it can see, 
 A human user's mention is only handled when the channel and user pass their respective allowlists. An absent or empty `allowedSlackChannelIds` allows any otherwise eligible channel; an absent or empty `allowedSlackUserIds` allows any human user. You can also set them non-interactively during setup with `PIPA_ALLOWED_CHANNEL_IDS` and `PIPA_ALLOWED_USER_IDS` (comma-separated).
 
 By default Pipa ignores messages sent by other Slack apps. Unlike the human user and channel lists, an absent or empty `allowedSlackBotIds` disables all other bots. List their bot IDs to let those messages through; an allowed bot only needs its bot ID (e.g. `B0C6Q27E82X`), not an entry in `allowedSlackUserIds`. Bots still must pass the channel allowlist. Bots not on the list stay ignored even when `allowedSlackUserIds` is empty. Set it non-interactively during setup with `PIPA_ALLOWED_BOT_IDS` (comma-separated).
+
+#### Mention-only mode
+
+By default, once Pipa is mentioned in a thread it subscribes to that thread and answers every later message in it without another mention. Set `mentionOnly` to `true` to require a direct @-mention for every turn, including in threads Pipa is already in:
+
+```json
+{
+  "mentionOnly": true
+}
+```
+
+`pipa init` asks for this, and you can set it non-interactively with `PIPA_MENTION_ONLY` (`1`, `true`, or `yes`). An absent or `false` value keeps the default thread-following behavior. Routines are unaffected.
 
 #### Find the sender's bot ID
 
@@ -119,6 +179,58 @@ To use an existing OpenCode server instead, set its URL before starting Pipa. Pi
 export PIPA_OPENCODE_ATTACH_URL=http://localhost:5555
 pipa start
 ```
+
+### Choosing a model
+
+Type your installation's command followed by `model` in an allowed Slack channel: `/chopper model` for `Chopper`, `/pipwick model` for `Pipwick`, or the `/pipa model` compatibility alias when registered to that app. Both forms use the same private native modal, authorization checks, and setting. A loading window opens before catalog discovery, then fills with models grouped by provider. Browse or type to filter, choose a model, and Save. Save closes the window promptly; a private channel message confirms success only after fresh validation and persistence, or explains a failure. Wait for that confirmation before testing the new selection. Cancel leaves the setting unchanged. Existing channel and human-user allowlists are rechecked after discovery, on Save, during persistence, and before delivering the private result.
+
+The command is computed from your configured `botName`, not a hardcoded list of bot names. Pipa decomposes accented Latin characters, removes combining marks, lowercases the name, replaces runs of spaces/punctuation/other non-ASCII characters with `-`, trims edge hyphens, and limits the part after `/` to 31 characters (trimming any resulting trailing hyphen). For example, `Workshop "Bot"` becomes `/workshop-bot` and `Café 🧪` becomes `/cafe`. A valid display name with no usable ASCII slug, such as `🤖` or `東京`, falls back to `/pipa` so this optional feature cannot prevent an old profile from starting. Existing display-name validation still applies. Generated commands use a conservative lowercase-letter/digit/hyphen subset within Slack's 32-character limit including `/`.
+
+**Alias collision:** [Slack slash commands are not namespaced](https://docs.slack.dev/interactivity/implementing-slash-commands/#naming_your_command). If multiple apps register `/pipa`, Slack routes it to the most recently installed app; Pipa cannot redirect it to another installation. In a multi-app workspace, keep distinct named commands and omit the generic alias from other apps' Slack manifests, or assign `/pipa` to exactly one app. Fallback-only installations also share `/pipa`; use a name with an ASCII slug if you need a distinct command. Check the installation name shown in the modal before saving. Case, punctuation, or truncation can also make different names normalize identically; choose distinct resulting names.
+
+The default for new threads is stored as optional `defaultModel: { "providerID": "openai", "modelID": "your-model-id" }` in the existing `.pipa/config.json`. It takes effect without restarting Pipa. Existing threads keep the model recorded in their OpenCode conversation history, including across restarts, so different threads can use different models. New or empty sessions use the current default; when unset, OpenCode chooses its default. If a saved OpenCode session is no longer available, its replacement is a new session and uses the current default. This setting does not select models for separate subagents or external clients.
+
+New routines snapshot the selection when created; preview JSON shows that snapshot. Existing routines and their saved model are unchanged by later saves or routine edits. A routine with no saved model uses OpenCode's default, never the current installation setting. Human replies to routine results retain the model recorded in that conversation. If a thread's provider stops working, reconnect it or choose a different default and start a new thread.
+
+The picker preloads the configured OpenCode model catalog into a native Slack dropdown, grouped by provider. Open the dropdown to browse immediately, or type to filter models; no search callback is needed. Groups contain up to 100 models each, with at most 100 groups. Empty catalogs or catalogs exceeding Slack's limits get a private explanation instead of an empty or truncated list. A listed model may still lack credentials or quota; saving never runs inference to check it. The provider shown beneath each result identifies the connection: `opencode` and `openai` use separate credentials, even for similarly named models. Turn failures identify the provider and HTTP status when available; authentication failures give reconnection guidance, and an explicitly expired API key is reported as expired. Raw upstream errors and credentials are not posted, and Pipa never silently switches models. Abandoned pickers expire after 30 minutes; reopen your installation's model command to continue.
+
+If the model window cannot open, its private error distinguishes saved-settings problems, model-catalog loading, configured access restrictions, and Slack window failures. It confirms that the saved model is unchanged; it does not expose raw upstream errors or credentials.
+
+### Upgrading an existing installation
+
+**An npm upgrade updates local code only. It does not update the installed Slack app, register commands, or grant scopes.** Existing mentions and thread replies still work without model-command registration. Do not rerun `pipa init` or replace credentials to add this feature.
+
+To upgrade to `0.5.6`, use the same `PIPA_HOME` as your existing installation (leave it unset for the default `~/.pipa` profile):
+
+```sh
+npm install --global @usepipa/pipa@0.5.6
+pipa --version
+pipa manifest > "$HOME/pipa-slack-manifest-0.5.6.json"
+```
+
+`pipa manifest` reads the existing profile and prints the current **local template** without tokens. It does not write config, sessions, routines, or the cached manifest, call Slack, or run inference. It is not an export of your app's current remote/custom configuration.
+
+1. Open your **existing app** in [Slack App Management](https://api.slack.com/apps). Keep a copy of its current remote manifest.
+2. In **App Manifest**, merge the generated `features.slash_commands` entries you want (the named command and optionally `/pipa`) and add `commands` to `oauth_config.scopes.bot`. Preserve unrelated remote settings, existing commands, scopes, Socket Mode, and interactivity. **Do not replace a customized remote manifest wholesale with the local template.** Alternatively, add the matching commands under **Slash Commands** and add the bot scope under **OAuth & Permissions**.
+3. Save, then reinstall or reauthorize that same app. Retain your current tokens unless Slack rotates them; if it does, update the existing local config securely rather than reinitializing the profile.
+4. Restart the same profile to load the upgraded runtime:
+
+```sh
+pipa restart
+pipa restart --status
+```
+
+Restart reports **requested** first; inspect status for completion. Then try `/chopper model` (for configured `Chopper`) and `/pipa model` if the alias is registered to that app. Merely recognizing an alias in Pipa cannot bypass missing Slack registration. A known missing `commands` scope produces a warning at startup; scope metadata alone cannot verify command registration, and an absent warning does not prove it is installed.
+
+Before npm publication, preview the feature branch from this repo without reinstalling or reinitializing your profile:
+
+```sh
+npm ci
+node bin/pipa.mjs --version
+node bin/pipa.mjs manifest > "$HOME/pipa-slack-manifest-preview.json"
+```
+
+For running the unpublished branch, use the separate test app/profile procedure in `CONTRIBUTING.md`; do not start a second Socket listener with a running installation's credentials. Renaming an app/bot in Slack alone does not update command registration or Pipa's local `botName`. A local name change needs matching Slack registration and an installation restart.
 
 ### Routines
 
@@ -187,6 +299,7 @@ pipa stop       Stop the running local Pipa process
 pipa restart [--channel <id> [--thread <ts>]]  Request a detached restart
 pipa restart --status  Inspect the latest durable restart outcome
 pipa routine    Create and manage local scheduled routines
+pipa manifest   Print the current local Slack manifest template for an existing profile
 pipa --version  Print the installed version
 ```
 

@@ -82,8 +82,8 @@ test("restart requests rather than claims success and status survives the caller
   assert.notEqual(invoke("--bogus").status, 0);
 });
 
-for (const version of ["1.19.0", "2.0.29"]) for (const mode of ["ready", "unready", "startup-failure", "authentication", "wrong-generation"]) test(`isolated Managed restart ${version}: ${mode}`, { timeout: 60_000 }, async (t) => {
-  const runtime = await createRuntimeFixture({ timeoutMs: 59000 });
+for (const version of ["1.19.0", "2.0.29"]) for (const mode of ["ready", "unready", "startup-failure", "authentication", "wrong-generation"]) test(`isolated Managed restart ${version}: ${mode}`, { timeout: 120_000 }, async (t) => {
+  const runtime = await createRuntimeFixture({ timeoutMs: 119000 });
   const home = runtime.home;
   const paths = pipaPaths(home);
   const reservation = createServer();
@@ -254,12 +254,41 @@ function json(result) {
   return JSON.parse(result.stdout);
 }
 
+test("manifest exports the current existing-profile template without secrets or state writes", async () => {
+  const { home, paths } = await setup();
+  const config = JSON.parse(await readFile(paths.config, "utf8"));
+  await writePrivateJson(paths.config, { ...config, botName: "Chopper", defaultModel: { providerID: "openai", modelID: "a" }, managementSecret: "must-not-be-exported" });
+  await writePrivateJson(paths.manifest, { customCachedManifest: true });
+  await writePrivateJson(paths.sessions, { "slack:C123:1.0": "ses_saved" });
+  await writePrivateJson(paths.routines, { version: 1, routines: [] });
+  const files = [paths.config, paths.manifest, paths.sessions, paths.routines];
+  const before = await Promise.all(files.map((file) => readFile(file, "utf8")));
+  const invoke = (...args) => spawnSync(process.execPath, [cli, "manifest", ...args], { encoding: "utf8", env: { ...process.env, PIPA_HOME: home } });
+  const result = invoke();
+  assert.equal(result.status, 0, result.stderr);
+  const manifest = JSON.parse(result.stdout);
+  assert.deepEqual(manifest.features.slash_commands.map((entry) => entry.command), ["/chopper", "/pipa"]);
+  assert.ok(manifest.oauth_config.scopes.bot.includes("commands"));
+  assert.equal(manifest.display_information.name, "Chopper");
+  assert.doesNotMatch(result.stdout, /test-app-token|test-bot-token|must-not-be-exported|defaultModel|ses_saved/u);
+  assert.notEqual(invoke("--apply").status, 0);
+  assert.deepEqual(await Promise.all(files.map((file) => readFile(file, "utf8"))), before);
+  await assert.rejects(readFile(paths.lock), { code: "ENOENT" });
+  const help = spawnSync(process.execPath, [cli, "manifest", "--help"], { encoding: "utf8", env: { ...process.env, PIPA_HOME: path.join(home, "unconfigured") } });
+  assert.equal(help.status, 0, help.stderr);
+  assert.match(help.stdout, /does not update Slack/iu);
+});
+
 test("preview normalizes schedules without writing state", async () => {
   const { home, paths } = await setup();
+  const config = JSON.parse(await readFile(paths.config, "utf8"));
+  config.defaultModel = { providerID: "openai", modelID: "model-a" };
+  await writePrivateJson(paths.config, config);
   const result = json(run(home, "create", "--prompt", "brief", "--timezone", "America/New_York", "--channel", "C123", "--every", "1d", "--times", "05:00", "--preview", "--json"));
   assert.equal(result.ok, true);
   assert.equal(result.preview, true);
   assert.equal(result.routine.prompt, "brief");
+  assert.deepEqual(result.routine.model, config.defaultModel);
   assert.deepEqual(result.routine.schedule, { type: "recurring", frequency: "daily", interval: 1, times: ["05:00"], weekdays: [], until: null });
   assert.deepEqual(result.routine.destination, { channelId: "C123", threadTs: null });
   await assert.rejects(readFile(paths.routines), { code: "ENOENT" });
@@ -299,6 +328,21 @@ test("create, list, show, edit, run, and delete preserve lifecycle fields", asyn
   assert.ok(active.nextRunAt);
   assert.equal(json(run(home, "delete", created.id, "--json")).deleted, created.id);
   assert.deepEqual(json(run(home, "list", "--json")).routines, []);
+});
+
+test("routine creation snapshots A or unset and edits never adopt live B", async () => {
+  const { home, paths } = await setup();
+  const config = JSON.parse(await readFile(paths.config, "utf8"));
+  const create = () => json(run(home, "create", "--prompt", "daily", "--timezone", "UTC", "--channel", "C123", "--every", "30m", "--json")).routine;
+  const unset = create();
+  assert.equal(unset.model, null);
+  const a = { providerID: "openai", modelID: "a" };
+  await writePrivateJson(paths.config, { ...config, defaultModel: a });
+  const selected = create();
+  assert.deepEqual(selected.model, a);
+  await writePrivateJson(paths.config, { ...config, defaultModel: { providerID: "fireworks-ai", modelID: "b" } });
+  assert.deepEqual(json(run(home, "edit", selected.id, "--prompt", "changed", "--json")).routine.model, a);
+  assert.equal(json(run(home, "edit", unset.id, "--prompt", "changed", "--json")).routine.model, null);
 });
 
 test("reactivating a stale one-time routine requires a new future schedule", async () => {

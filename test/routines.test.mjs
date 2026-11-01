@@ -19,6 +19,20 @@ import { pipaPaths, writePrivateJson } from "../src/state.mjs";
 
 const NOW = "2026-08-29T12:00:00.000Z";
 
+test("routine model snapshots survive edits and legacy missing/null stay valid", async () => {
+  const paths = pipaPaths(await mkdtemp(path.join(os.tmpdir(), "pipa-routine-model-")));
+  for (const model of [undefined, null, { providerID: "openai", modelID: "model-a" }]) {
+    const input = candidate(model === undefined ? {} : { model });
+    const routine = normalizeRoutine(input, NOW);
+    assert.deepEqual(routine.model, model);
+    await writePrivateJson(paths.routines, { version: 1, routines: [routine] });
+    const edited = await editRoutine(routine.id, { prompt: "updated" }, { paths, now: NOW });
+    assert.deepEqual(edited.model, model);
+    assert.deepEqual((await loadRoutineState(paths.routines)).routines[0].model, model);
+  }
+  assert.throws(() => normalizeRoutine(candidate({ model: { providerID: "", modelID: "a" } }), NOW), /model/u);
+});
+
 function candidate(overrides = {}) {
   return {
     id: "morning-brief",

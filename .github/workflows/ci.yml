@@ -19,5 +19,10 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm test
+      # Test files run in parallel by default. Several spawn child processes and
+      # wait on 20-45s readiness timeouts, which intermittently fails on 2-core
+      # windows runners (different test each run). Serializing costs ~8s locally
+      # and removes that contention.
+      - name: Test
+        run: npm test -- --test-concurrency=1
       - run: npm run test:pack

@@ -292,9 +292,9 @@ export function createV2Adapter(options) {
     },
     async resolveSession(sessionId, workingDirectory, controller) {
       const signal = controller.signal;
-      if (sessionId && !await lookup(sessionId, workingDirectory, signal)) sessionId = null;
-      if (!sessionId) {
-        const session = await client.session.create({ location: { directory: workingDirectory } }, { signal });
+      let session = sessionId ? await lookup(sessionId, workingDirectory, signal) : null;
+      if (!session) {
+        session = await client.session.create({ location: { directory: workingDirectory } }, { signal });
         if (typeof session?.id !== "string" || session.location?.directory !== workingDirectory) throw new Error("OpenCode did not create a session in the configured workspace.");
         sessionId = session.id;
       }
@@ -305,11 +305,20 @@ export function createV2Adapter(options) {
       ]);
       if (!Array.isArray(inbox) || !active || typeof active !== "object") throw new Error("OpenCode returned invalid session projections.");
       if (inbox.length || active[sessionId] || turns.has(sessionId)) throw new Error("OpenCode attribution conflict: the session already has an active writer.");
-      return { sessionId, baseline: baseline.map((message) => message.id) };
+      // onSession can persist the mapping before selection. Retry defaults only
+      // while neither native session metadata nor history establishes a choice.
+      return { sessionId, defaultEligible: !session.model && !baseline.length, baseline: baseline.map((message) => message.id) };
     },
-    async execute({ sessionId, baseline, workingDirectory, controller, prompt, files, instructions, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
+    async execute({ sessionId, defaultEligible, baseline, model, defaultModel, workingDirectory, controller, prompt, files, instructions, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
       if (blocked) throw blocked;
       const signal = controller.signal;
+      const selectedModel = model ?? (defaultEligible ? defaultModel : null);
+      if (selectedModel) {
+        signal.throwIfAborted();
+        // Prompt has no model field in the native client. Select once before
+        // admission, retaining native session selection on ordinary continuations.
+        await client.session.switchModel({ sessionID: sessionId, model: { providerID: selectedModel.providerID, id: selectedModel.modelID, variant: "default" } }, { signal });
+      }
       const record = { sessionId, workingDirectory, baseline, id: options.inputId?.() ?? `msg_${randomUUID().replaceAll("-", "")}`,
         key: `${prefix}${randomUUID()}`, phase: "prepared", instruction: "absent" };
       turns.set(sessionId, record);
@@ -564,7 +573,23 @@ export function createV2Adapter(options) {
           if (state.dismissed) return "";
           if (state.idle) {
             if (dismissed) return "";
-            if (state.idle.outcome !== "succeeded" || state.assistant?.error || state.assistant?.finish !== "stop"
+            if (state.assistant?.error) {
+              const error = state.assistant.error;
+              const providerID = state.assistant.model?.providerID ?? selectedModel?.providerID;
+              const provider = typeof providerID === "string" && /^[a-z0-9][a-z0-9._-]{0,63}$/iu.test(providerID) ? `provider "${providerID}"` : "selected provider";
+              const status = error.status;
+              const http = Number.isInteger(status) && status >= 400 && status <= 599 ? ` (HTTP ${status})` : "";
+              // Native errors use type/status/message, not v1's name/data.
+              // Classify only; never forward messages, response bodies or types.
+              if (status === 401 || error.type === "provider.auth") {
+                const expiredKey = status === 401 && typeof error.message === "string" && /\bAPI key (?:has )?expired\b/iu.test(error.message);
+                throw new Error(expiredKey
+                  ? `OpenCode ${provider} API key has expired. Replace that provider's API key in OpenCode, or choose another provider with your installation's model command, then start a new thread.`
+                  : `OpenCode ${provider} authentication failed${http}. Reconnect that provider in OpenCode, or choose another provider with your installation's model command, then start a new thread.`);
+              }
+              throw new Error(`OpenCode ${provider} ${http ? `failed${http}` : "failed to complete the turn"}.`);
+            }
+            if (state.idle.outcome !== "succeeded" || state.assistant?.finish !== "stop"
               || typeof state.assistant.time?.completed !== "number" || state.assistant.retry) throw new Error("OpenCode failed to complete the turn.");
             const text = state.assistant.content.filter((part) => part.type === "text" && typeof part.text === "string").map((part) => part.text).join("\n").trim();
             if (!text && permissionRejected) return "Stopped after a permission was rejected.";

@@ -6,8 +6,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRuntimeFixture, bounded } from "../test/helpers/runtime-fixture.mjs";
 import { releaseCases, runCell } from "./verification/opencode-release-cases.mjs";
+import { MIGRATION_TARGET_PIN } from "./verification/opencode-migration.mjs";
 
-export const PINS = ["1.18.35", "1.19.0", "2.0.29"];
+export const PINS = ["1.18.35", "1.19.0", "2.0.29", MIGRATION_TARGET_PIN];
 export const MODES = ["socket-owned", "attached", "managed"];
 export const CELL_WORKER_TIMEOUT_MS = 9 * 60_000;
 const self = fileURLToPath(import.meta.url);

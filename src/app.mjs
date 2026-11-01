@@ -3,7 +3,8 @@ import path from "node:path";
 import { Chat, Modal, TextInput } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
-import { canonicalWorkingDirectory, createManifest, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
+import { canonicalWorkingDirectory, createManifest, createModelSetting, createSessionStore, loadConfig, pipaPaths, saveConfig, slackCommandNames } from "./state.mjs";
+import { createModelPicker } from "./models.mjs";
 import { checkOpenCodeConnection, createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, parseOpenCodeVersion, PipaRestartingError, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
 import { assertRoutineDestinationAllowed, createRoutineScheduler, loadRoutineState } from "./routines.mjs";
 
@@ -20,6 +21,7 @@ export async function initializePipa(input, options = {}) {
     allowedSlackChannelIds: normalizeIdList(input.allowedSlackChannelIds),
     allowedSlackUserIds: normalizeIdList(input.allowedSlackUserIds),
     allowedSlackBotIds: normalizeIdList(input.allowedSlackBotIds),
+    mentionOnly: input.mentionOnly === true,
   };
   const environment = options.environment ?? process.env;
   const attachUrl = environment.PIPA_OPENCODE_ATTACH_URL?.trim();
@@ -37,6 +39,8 @@ export async function startPipa(options = {}) {
   options.signal?.throwIfAborted();
   const paths = options.paths ?? pipaPaths();
   const config = options.config ?? await loadConfig(paths.config);
+  const commands = slackCommandNames(config.botName);
+  const loadCurrentConfig = options.loadCurrentConfig ?? (() => loadConfig(paths.config));
   options.signal?.throwIfAborted();
   const slackAuth = await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
   options.signal?.throwIfAborted();
@@ -46,7 +50,7 @@ export async function startPipa(options = {}) {
   const state = options.state ?? createMemoryState();
   const chat = options.chat ?? new Chat({
     adapters: {
-      slack: createSlackAdapter({
+      slack: createPipaSlackAdapter({
         appToken: config.slackAppToken,
         botToken: config.slackBotToken,
         mode: "socket",
@@ -79,7 +83,10 @@ export async function startPipa(options = {}) {
     await withTimeout(server?.wait(), options.shutdownTimeoutMs ?? 15_000, "OpenCode shutdown timed out.").catch(() => undefined);
     throw error;
   }
-  const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn, abortTurn: executor.abortTurn });
+  const runner = createConversationRunner({ sessionStore, abortTurn: executor.abortTurn, runTurn: async (input) => {
+    const currentConfig = await loadCurrentConfig();
+    return executor.runTurn({ ...input, ...(currentConfig.defaultModel ? { defaultModel: currentConfig.defaultModel } : {}) });
+  } });
   let accepting = true;
   const interactions = createPendingInteractions(config.allowedSlackUserIds);
   const pendingReactions = new Map();
@@ -125,6 +132,7 @@ export async function startPipa(options = {}) {
       try {
         result = await executor.runTurn({
           prompt: snapshot.prompt,
+          ...(snapshot.model ? { model: snapshot.model } : {}),
           sessionId: null,
           workingDirectory: config.workingDirectory,
           contextEnvironment: {
@@ -166,6 +174,8 @@ export async function startPipa(options = {}) {
       return { status: "succeeded" };
     },
   }) : null;
+  const modelPicker = createModelPicker({ chat, botName: config.botName, commands, loadConfig: loadCurrentConfig,
+    listModels: () => executor.listModels(config.workingDirectory), setting: createModelSetting(paths.config) });
   chat.onAction?.(interactions.onAction);
   chat.onModalSubmit?.("pipa_custom", interactions.onCustomAnswer);
 
@@ -178,6 +188,7 @@ export async function startPipa(options = {}) {
 
   const handle = async (thread, message, subscribe) => {
     if (!accepting || !isAuthorized(thread, message, config) || shouldIgnore(thread, message, config)) return;
+    if (config.mentionOnly && !subscribe && !message.isMention) return;
     const messageText = subscribe || message.isMention ? stripMention(message.text) : message.text.trim();
     const missingLinks = (message.links ?? []).map((link) => link.url)
       .filter((url) => typeof url === "string" && !messageText.split(/\s+/u).includes(url));
@@ -227,6 +238,7 @@ export async function startPipa(options = {}) {
   const stop = (reason = new PipaStoppedError()) => {
     if (!accepting) return;
     accepting = false;
+    modelPicker.close();
     routineScheduler?.stop(reason);
     runner.close(reason);
     executor.stopAll(reason);
@@ -247,6 +259,7 @@ export async function startPipa(options = {}) {
     options.signal?.throwIfAborted();
   } catch (error) {
     options.signal?.removeEventListener("abort", cancelled);
+    modelPicker.close();
     routineScheduler?.stop(error);
     await routineScheduler?.drain();
     await withTimeout(interactions.close(), options.shutdownTimeoutMs ?? 15_000, "Interaction shutdown timed out.").catch(() => undefined);
@@ -278,6 +291,7 @@ export async function startPipa(options = {}) {
       try {
         await withTimeout((async () => {
           await interactions.close();
+          await modelPicker.drain();
           await routineScheduler?.drain();
           await runner.drain();
           await chat.shutdown();
@@ -289,6 +303,58 @@ export async function startPipa(options = {}) {
       }
     },
   };
+}
+
+export function createPipaSlackAdapter(options, drainTimeoutMs = 3_000) {
+  const adapter = createSlackAdapter(options);
+  const slashCommand = adapter.handleSlashCommand.bind(adapter);
+  const commands = slackCommandNames(options.userName ?? "Pipa");
+  adapter.handleSlashCommand = async (params, context) => {
+    if (!adapter.chat || !commands.includes(params.get("command")) || params.get("text")?.trim() !== "model") return slashCommand(params, context);
+    // The pinned SDK awaits users.info before dispatch. Picker authorization needs
+    // only envelope IDs; optional profile enrichment must not expire the trigger.
+    const userId = params.get("user_id") ?? "";
+    adapter.chat.processSlashCommand({
+      command: params.get("command"), text: params.get("text"),
+      user: { userId, userName: params.get("user_name") || userId, fullName: params.get("user_name") || userId, isBot: false, isMe: false },
+      adapter, raw: Object.fromEntries(params), triggerId: params.get("trigger_id") || undefined,
+      channelId: params.get("channel_id") ? `slack:${params.get("channel_id")}` : "",
+    }, context);
+    return new Response("", { status: 200 });
+  };
+  const route = adapter.routeSocketEvent.bind(adapter);
+  const disconnect = adapter.disconnect.bind(adapter);
+  const pending = new Set();
+  let disconnecting;
+  // The pinned adapter's async EventEmitter listener neither observes route
+  // rejections nor drains acknowledgments before closing its Socket Mode client.
+  adapter.routeSocketEvent = (...args) => {
+    if (disconnecting) return Promise.resolve();
+    const task = (async () => {
+      try {
+        await route(...args);
+      } catch {
+        // SDK errors can contain payloads/tokens; keep diagnostics credential-free.
+        adapter.logger.error("Pipa Slack Socket Mode event failed.");
+      }
+    })();
+    pending.add(task);
+    void task.then(() => pending.delete(task));
+    return task;
+  };
+  adapter.disconnect = () => disconnecting ??= (async () => {
+    // Stop ingress before draining; otherwise a new envelope can arrive while
+    // SocketModeClient.disconnect() is closing the WebSocket and fail its ack.
+    adapter.socketClient?.removeAllListeners("slack_event");
+    try {
+      await withTimeout(Promise.all([...pending]), drainTimeoutMs, "Slack acknowledgment drain timed out.");
+    } catch {
+      adapter.logger.error("Pipa Slack acknowledgment drain timed out.");
+    } finally {
+      await disconnect();
+    }
+  })();
+  return adapter;
 }
 
 export function createPendingInteractions(allowedUserIds = []) {
@@ -789,10 +855,10 @@ function normalizeGrantedScopes(value) {
 function warnMissingSlackScopes(auth, warn = (message) => process.stderr.write(`${message}\n`)) {
   if (!Array.isArray(auth?.grantedScopes)) return;
   const missing = ["channels:read", "assistant:write"].filter((scope) => !auth.grantedScopes.includes(scope));
-  if (!missing.length) return;
   const scopes = missing.join(", ");
   try {
-    warn(`Pipa warning: Slack bot token is missing recommended ${missing.length === 1 ? "scope" : "scopes"} ${scopes}. Add ${missing.length === 1 ? "it" : "them"} and reinstall or reauthorize the Slack app.`);
+    if (missing.length) warn(`Pipa warning: Slack bot token is missing recommended ${missing.length === 1 ? "scope" : "scopes"} ${scopes}. Add ${missing.length === 1 ? "it" : "them"} and reinstall or reauthorize the Slack app.`);
+    if (!auth.grantedScopes.includes("commands")) warn("Pipa warning: Slack bot token is missing the commands scope. Model slash commands are unavailable until matching commands are registered and granted in Slack. Run `pipa manifest` for the local template, merge the command definitions and commands scope into your existing Slack app, then reinstall or reauthorize it. Existing mentions and thread replies can continue; do not rerun `pipa init`.");
   } catch {}
 }
 

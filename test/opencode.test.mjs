@@ -416,9 +416,11 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
     workingDirectory: "/work",
     contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack", PIPA_CURRENT_SLACK_CHANNEL_ID: "C1", PIPA_CURRENT_SLACK_THREAD_TS: "123.456" },
     attachments: [attachment],
+    model: { providerID: "openai", modelID: "gpt-test" },
   });
 
   assert.deepEqual(result, { text: "first\nsecond", sessionId: "ses_1" });
+  assert.deepEqual(promptBody.model, { providerID: "openai", modelID: "gpt-test" });
   assert.deepEqual(promptBody.parts[0], { type: "text", text: prompt });
   assert.deepEqual(promptBody.parts[1], { type: "file", mime: "text/plain", filename: "notes.txt", url: temporaryFile.href });
   assert.match(promptBody.system, /not as shell environment variables/u);
@@ -435,6 +437,44 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
   await assert.rejects(access(temporaryFile));
 });
 
+test("new threads use the default while existing threads retain their model across executor restarts", async () => {
+  const a = { providerID: "openai", modelID: "a" };
+  const b = { providerID: "fireworks-ai", modelID: "b" };
+  const history = new Map();
+  const prompts = [];
+  const fetch = async (url, init = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/session/status") return jsonResponse({});
+    if (pathname === "/session") {
+      const id = `ses_${history.size}`;
+      history.set(id, []);
+      return jsonResponse({ id });
+    }
+    const [, , id, action] = pathname.split("/");
+    if (id === "ses_missing" && !action) return jsonResponse({ error: "not found" }, 404);
+    if (action === "message") return history.has(id) ? jsonResponse(history.get(id)) : jsonResponse({ error: "not found" }, 404);
+    if (action === "prompt_async") {
+      const body = JSON.parse(init.body);
+      prompts.push(body.model);
+      history.set(id, [{ info: { id: `msg_${prompts.length}`, role: "assistant", ...body.model, time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }]);
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const run = (input) => createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 })
+    .runTurn({ prompt: "hello", workingDirectory: "/work", ...input });
+  const first = await run({ defaultModel: a });
+  await run({ sessionId: first.sessionId, defaultModel: b });
+  await run({ defaultModel: b });
+  // An interrupted turn may leave a user message as the latest history entry.
+  history.set(first.sessionId, [{ info: { id: "user", role: "user", model: a }, parts: [] }]);
+  await run({ sessionId: first.sessionId, defaultModel: b });
+  await run({ sessionId: first.sessionId });
+  await run({ sessionId: "ses_missing", defaultModel: b });
+  await run({});
+  assert.deepEqual(prompts, [a, a, b, a, a, b, undefined]);
+});
+
 test("rejects an all-whitespace prompt before creating a session", async () => {
   let requested = false;
   const executor = createOpenCodeExecutor({
@@ -448,15 +488,21 @@ test("rejects an all-whitespace prompt before creating a session", async () => {
 
 test("replaces a stale persisted session only after a successful turn", async () => {
   let prompted = false;
+  let body;
+  const model = { providerID: "openai", modelID: "model-a" };
   const fetch = async (url, init = {}) => {
     const pathname = new URL(url).pathname;
-    if (pathname === "/session/ses_stale/message") return jsonResponse({ error: "not found" }, 404);
+    if (pathname === "/session/ses_stale/message") {
+      model.modelID = "changed-after-start";
+      return jsonResponse({ error: "not found" }, 404);
+    }
     if (pathname === "/session/ses_stale") return jsonResponse({ error: "not found" }, 404);
     if (pathname === "/session" && init.method === "POST") return jsonResponse({ id: "ses_new" });
     if (pathname === "/session/ses_new/message") {
       return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "recovered" }] }] : []);
     }
     if (pathname === "/session/ses_new/prompt_async") {
+      body = JSON.parse(init.body);
       prompted = true;
       return new Response(null, { status: 204 });
     }
@@ -465,8 +511,25 @@ test("replaces a stale persisted session only after a successful turn", async ()
   };
 
   const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 })
-    .runTurn({ prompt: "continue", sessionId: "ses_stale", workingDirectory: "/work" });
+    .runTurn({ prompt: "continue", model, sessionId: "ses_stale", workingDirectory: "/work" });
   assert.deepEqual(result, { text: "recovered", sessionId: "ses_new" });
+  assert.deepEqual(body.model, { providerID: "openai", modelID: "model-a" });
+});
+
+test("configured model discovery uses authenticated workspace HTTP without inference", async () => {
+  const calls = [];
+  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", environment: { OPENCODE_SERVER_USERNAME: "pipa", OPENCODE_SERVER_PASSWORD: "secret" },
+    fetch: async (url, init) => {
+      calls.push(String(url));
+      assert.equal(init.headers.authorization, `Basic ${Buffer.from("pipa:secret").toString("base64")}`);
+      return Response.json({ providers: [{ id: "openai", models: { a: { id: "a", name: "A", secret: "never returned" } } }], default: {} });
+    } });
+  assert.deepEqual(await executor.listModels("/workspace"), [{ providerID: "openai", modelID: "a", name: "A" }]);
+  assert.deepEqual(calls, ["http://localhost:5555/config/providers?directory=%2Fworkspace"]);
+  const broken = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch: async () => Response.json({ nope: true }) });
+  await assert.rejects(broken.listModels("/work"), /invalid model catalog/u);
+  const stalled = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch: async (_url, { signal }) => new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })) });
+  await assert.rejects(stalled.listModels("/work"), /timed out/u);
 });
 
 test("does not complete until both the session is idle and a new assistant message exists", async () => {
@@ -531,6 +594,36 @@ test("waits for an active retry despite a terminal assistant message", async () 
     .runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" });
   assert.equal(result.text, "done");
   assert.equal(statusReads, 2);
+});
+
+for (const [error, expected] of [
+  [{ name: "APIError", data: { statusCode: 401, message: "This API key has expired. private-upstream-secret", responseBody: "private-response-secret" } }, /provider "opencode" API key has expired\. Replace that provider's API key/u],
+  [{ name: "APIError", data: { statusCode: 401, message: "Invalid API key private-upstream-secret" } }, /provider "opencode" authentication failed \(HTTP 401\)\. Reconnect that provider/u],
+  [{ name: "ProviderAuthError", data: { providerID: "opencode", message: "private-upstream-secret" } }, /provider "opencode" authentication failed\. Reconnect that provider/u],
+  [{ name: "APIError", data: { statusCode: 429, message: "private-upstream-secret" } }, /provider "opencode" failed \(HTTP 429\)/u],
+  [{ name: "UnknownError", data: { message: "private-upstream-secret" } }, /provider "opencode" failed to complete the turn/u],
+]) test(`reports safe, provider-specific ${error.name} ${error.data.statusCode ?? ""} failures instead of hiding the cause`, async () => {
+  let prompted = false;
+  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", pollIntervalMs: 1,
+    fetch: async (url) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/session/ses_1/prompt_async") {
+        prompted = true;
+        return new Response(null, { status: 204 });
+      }
+      if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+      if (pathname === "/session/ses_1/message") return jsonResponse(prompted
+        ? [{ info: { id: "new", role: "assistant", providerID: "opencode", modelID: "deepseek-v4.1-flash", error }, parts: [] }]
+        : []);
+      throw new Error(`Unexpected request: ${url}`);
+    } });
+  await assert.rejects(executor.runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" }), (failure) => {
+    assert.match(failure.message, expected);
+    assert.doesNotMatch(failure.message, /private-|responseBody|responseHeaders/u);
+    if (error.data.statusCode === 401 || error.name === "ProviderAuthError") assert.match(failure.message, /choose another provider.*model command/u);
+    if (!error.data.message.includes("expired")) assert.doesNotMatch(failure.message, /expired/u);
+    return true;
+  });
 });
 
 test("rejects prompt failures and aborts active requests during shutdown", async () => {

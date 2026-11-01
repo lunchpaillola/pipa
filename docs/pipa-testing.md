@@ -27,7 +27,7 @@ Harness ownership:
 | `scripts/verification/opencode-release-cases.mjs` | Shared production-path real-engine scenarios, outside default test discovery |
 | `scripts/slack-release-eval.mjs` | Serial opt-in Slack/provider collection, shared live checklist, routine evaluator reuse, optional independent restart observation; human/integration gates remain blocked |
 
-Keep the default `npm test`/`npm run test:pack` lane free of downloaded engines and live credentials. The opt-in `test:engines` lane exercises pins **1.18.35, 1.19.0, and 2.0.29** against Socket-owned, Managed, and attached modes on Linux/macOS/Windows where supported. Node 22 is the baseline. The downloaded executable's identity and package integrity must match the selected cell; no global executable is replaced. Use `--migration` for synthetic upgrade/rollback. See [runner options](../scripts/verification/README.md).
+Keep the default `npm test`/`npm run test:pack` lane free of downloaded engines and live credentials. The opt-in `test:engines` lane exercises pins **1.18.35, 1.19.0, 2.0.29, and 2.2.5** against Socket-owned, Managed, and attached modes on Linux/macOS/Windows where supported. Native **2.2.5** is the current v2 qualification target; **2.0.29** remains a historical comparison pin. The SDK remains `@opencode/client@2.0.29` pending real qualification. Pin inclusion does not claim passing native tests or release readiness; historical reports qualify only their recorded cases and versions. Node 22 is the baseline. The downloaded executable's identity and package integrity must match the selected cell; no global executable is replaced. Use `--migration` for synthetic upgrade/rollback. See [runner options](../scripts/verification/README.md).
 
 The Socket-owned engine cell composes the real Pipa application, executor, scheduler and state with injected fake Chat/auth. Managed cells use the actual installed CLI and detached restart chain. Attached cells use an independently launched server and prove ownership preservation. Real Socket CLI restart and visible Slack controls still require the live lane; fake Chat does not prove them.
 
@@ -39,7 +39,7 @@ The former spike's 58 comparison checks and 55 routine/restart/CLI baseline pass
 
 Each case gets private HOME/USERPROFILE, XDG config/data/cache/state, temporary directory, PIPA_HOME, workspace, artifacts, and supported engine database/config overrides. Isolate Windows app-data roots where used and retain required SystemRoot/ComSpec/PATHEXT plumbing. Construct child environments from an allowlist rather than inheriting the operator's credentials, attach URL, proxies, or Node options. Assert the product's intended non-Slack integration-variable inheritance separately with synthetic sentinels.
 
-Generate synthetic old-version data with each pinned v1 engine. Stop/checkpoint it, preserve a pristine copy and needed database companions, then migrate only a disposable copy to v2. Continue the same session IDs/history and verify Pipa's thread mappings, routines, configured permissions, and documented remembered-approval reset. Restart v2 again. Rollback restores the matched old snapshot; it never opens v2-written data with v1.
+Generate synthetic old-version data with each pinned v1 engine (**1.18.35 / 1.19.0**). Stop/checkpoint it, preserve a pristine copy and needed database companions, then migrate only a disposable copy to native **2.2.5**, the current migration target. Continue the same session IDs/history and verify Pipa's thread mappings, routines, configured permissions, and documented remembered-approval reset. Restart 2.2.5 again. Rollback restores the matched old snapshot; it never opens v2-written data with v1. Historical v1-to-2.0.29 reports are not evidence for this target.
 
 Force process death around context registration, prompt admission, pending approval, and completion. Pipa must clean up only its owned instruction/admission recovery state before accepting new work. Do not silently replay side effects or claim exactly-once delivery across crashes. The scheduler's existing crash-window semantics remain documented.
 
@@ -120,6 +120,16 @@ replacement. A passing probe against an unrelated v2 server cannot qualify v2
 Slack behavior.
 
 A sender bot cannot stand in for an authorized human clicking a button or submitting a modal. Use human-assisted real interaction checks where necessary and deterministic handler tests for repeatable authorization/error coverage. Mark which checks are automated and which require a responder.
+
+Main's shipped Slack model picker remains part of the integrated behavior, not a
+deferred feature. Use the [isolated model smoke](../CONTRIBUTING.md#isolated-slack-model-smoke)
+to verify named/alias loading, Save/reopen/Cancel, authorization, and completed
+provider/model metadata. Picker Save changes the installation default for
+new/empty sessions; it does not live-switch existing threads. Verify existing
+thread model retention across default changes and restart, plus immutable routine
+create/preview model snapshots. Native v2 session switching/reset is a separate
+executor capability and needs separate native evidence. Adapter tests alone do
+not prove real Slack modal behavior or native 2.2.5 compatibility.
 
 Run live tests sequentially by engine generation if they reuse an app. Use an app-scoped workflow concurrency lock without cancelling an active run. Paginate Slack history/replies, honor `Retry-After`, and match the exact sender/channel/thread/nonce. Validate the preview creates nothing and that the saved prompt, schedule, timezone, destination and lifecycle match the confirmed input. Keep paid/provider-backed and Slack jobs protected and manually/release-triggered; fork PRs get no secrets.
 

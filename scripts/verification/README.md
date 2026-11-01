@@ -10,10 +10,15 @@ npm run test:engines -- --baseline --migration --gate=deterministic
 ```
 
 The engine command installs one Pipa tarball and verifies private native binaries
-for OpenCode **1.18.35, 1.19.0, and 2.0.29**. It exercises Socket-owned, Managed,
+for OpenCode **1.18.35, 1.19.0, 2.0.29, and 2.2.5**. It exercises Socket-owned, Managed,
 and attached connections. Only the model and Chat transport are deterministic
 fixtures; engine execution, tools, state, scheduler and Managed CLI restart are
 real. No Slack or paid-provider credentials are required.
+
+Native **2.2.5** is the current v2 qualification target; **2.0.29** remains a
+historical comparison pin. The SDK stays pinned to `@opencode/client@2.0.29`
+pending real qualification. Pin inclusion is not evidence of a passing native
+run or release readiness, and historical reports retain their recorded versions.
 
 `npm test` and `test:pack` do not download these engines. The engine lane needs
 access to the npm registry. It uses private homes, databases, configuration,
@@ -22,9 +27,9 @@ cleanup retains the private root for diagnosis.
 
 ## Options and evidence
 
-- `--pins=1.18.35,2.0.29` and `--modes=attached` select a smaller matrix.
+- `--pins=1.18.35,2.2.5` and `--modes=attached` select a smaller matrix.
 - `--migration` seeds each v1 pin, stops its writers, snapshots the entire private
-  profile, attempts v2 continuation on a disposable copy, and tests rollback on
+  profile, attempts continuation on native **2.2.5** on a disposable copy, and tests rollback on
   a separate pristine v1 copy. Omitting it leaves required migration evidence
   blocked. No existing user database is read or migrated.
 - `--report=<private-json-path>` chooses the report location; its parent must

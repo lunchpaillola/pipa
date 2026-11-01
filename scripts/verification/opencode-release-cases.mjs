@@ -259,6 +259,36 @@ export async function observeRuntimeReadiness({ facade, baseUrl, workingDirector
   return connection;
 }
 
+function toolEnvironmentAllowed(environment) {
+  return environment.PIPA_INTEGRATION_SENTINEL === 'matrix-integration'
+    && Object.entries(environment).every(([key, value]) => {
+      if (key === 'NO_PROXY' || key === 'no_proxy') {
+        return value.split(',').every(host => ['localhost', '127.0.0.1', '::1', '[::1]'].includes(host.trim()));
+      }
+      return !/SLACK.*(TOKEN|SECRET)|^NODE_OPTIONS$|PROXY|ATTACH_URL/i.test(key);
+    });
+}
+
+export function protectedToolCommand(marker) {
+  return `"${process.execPath}" -e "if(!(${toolEnvironmentAllowed.toString()})(process.env))process.exit(23);console.log('${marker}')"`;
+}
+
+export async function recordSharedCase(rows, definition, observe, provider) {
+  return recordCase(rows, definition, async () => {
+    // A failed observer can leave native work running until final teardown.
+    const failed = rows.find(row => row.status === "FAIL");
+    if (failed && definition.id !== "stop-ownership") return { status: "BLOCKED", observed: `Shared runtime untrusted after failed case ${failed.id}; cleanup still required` };
+    const checkpoint = provider.checkpoint();
+    const errors = [];
+    let result;
+    try { result = await observe(); } catch (error) { errors.push(error); }
+    try { provider.assertClean(checkpoint); } catch (error) { errors.push(error); }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length) throw new AggregateError(errors, errors.map(error => error.message).join("; "));
+    return result;
+  });
+}
+
 export async function runCell({ candidate, pin, mode, migration = false, caseIds }) {
   if (caseIds !== undefined) assert.ok(Array.isArray(caseIds) && caseIds.length && new Set(caseIds).size === caseIds.length && caseIds.every((id) => releaseCases.some((row) => row.id === id)), "Invalid targeted case selection");
   const engineBinaries = JSON.parse(process.env.PIPA_MATRIX_ENGINE_BINARIES ?? "{}");
@@ -572,7 +602,7 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
         const marker = textFor(id);
         provider.register({ prompt: promptFor(id), text: marker, tool: kind === "question"
           ? { names: ["question", "form"], arguments: (_, tool) => tool.name === "question" ? { questions: [{ header: "Matrix", question: "Choose the test answer", options: [{ label: "Yes", description: "Continue" }] }] } : { title: "Matrix", fields: [{ key: "answer", type: "string", title: "Choose", options: [{ value: "yes", label: "Yes" }], required: true }] }, verify: (results) => assert.match(JSON.stringify(results), /Yes|yes/u) }
-          : { names: ["bash", "shell", "$shell"], arguments: () => ({ command: `"${process.execPath}" -e "if(process.env.PIPA_INTEGRATION_SENTINEL!=='matrix-integration'||Object.keys(process.env).some(k=>/SLACK.*(TOKEN|SECRET)|^NODE_OPTIONS$|PROXY|ATTACH_URL/i.test(k)))process.exit(23);console.log('${marker}')"`, description: "Verify isolated tool environment and print a synthetic marker" }), verify: (results) => assert.ok(JSON.stringify(results).includes(marker), "Actual protected tool/environment verification did not execute") } });
+          : { names: ["bash", "shell", "$shell"], arguments: () => ({ command: protectedToolCommand(marker), description: "Verify isolated tool environment and print a synthetic marker" }), verify: (results) => assert.ok(JSON.stringify(results).includes(marker), "Actual protected tool/environment verification did not execute") } });
         const message = chat.send(thread, promptFor(id));
         const control = await runtime.waitFor(() => chat.controls.findLast((item) => item.thread === thread), { timeoutMs: 12000, label: "native interaction card" });
         const elements = control.blocks.flatMap((block) => block.elements ?? []);
@@ -1504,16 +1534,14 @@ throw Error('Native file-command completion deadline exceeded');
   try {
     const selectedCases = caseIds ? releaseCases.filter((row) => caseIds.includes(row.id)) : releaseCases;
     for (const definition of [...selectedCases.filter((row) => row.id !== "stop-ownership"), ...selectedCases.filter((row) => row.id === "stop-ownership")]) {
-      await recordCase(cell.cases, definition, async () => {
+      await recordSharedCase(cell.cases, definition, async () => {
         if (definition.id.startsWith("models-") && !pin.startsWith("2.")) {
           assert.equal(executor.capabilities.liveModelSwitch, false);
           return { status: "NOT_APPLICABLE", observed: "Native v1 has no live v2 HTTP switch operation; ordinary model execution is covered separately" };
         }
         if (definition.blocked) return { status: "BLOCKED", observed: definition.blocked };
-        const checkpoint = provider.checkpoint();
-        try { return await execute[definition.id](); }
-        finally { provider.assertClean(checkpoint); }
-      });
+        return execute[definition.id]();
+      }, provider);
     }
     cell.evidence.provider = provider.receipts.map((receipt) => ({ prompt: receipt.prompt, model: receipt.model, provider: receipt.provider, temperature: receipt.temperature, toolNames: receipt.tools.map((tool) => tool.name), toolResultCount: receipt.toolResults.length, cancelledConnection: receipt.closed && !receipt.released }));
     cell.evidence.admissions = wires.filter((wire) => wire.body.text || wire.body.parts).map((wire) => ({ path: wire.path, prompt: wire.body.text ?? wire.body.parts[0]?.text, files: wire.files.map((file) => ({ filename: file.filename, sha256: createHash("sha256").update(Buffer.from(file.base64, "base64")).digest("hex") })) }));

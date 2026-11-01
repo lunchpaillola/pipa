@@ -4,7 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { DateTime, IANAZone } from "luxon";
-import { pipaPaths, writePrivateJson } from "./state.mjs";
+import { normalizeModel, pipaPaths, writePrivateJson } from "./state.mjs";
 
 const FREQUENCIES = new Set(["minutes", "hours", "daily", "weekly"]);
 const STATUSES = new Set(["active", "inactive", "completed"]);
@@ -74,6 +74,7 @@ export function normalizeRoutine(input, now = DateTime.utc().toISO()) {
   return {
     id,
     prompt: input.prompt,
+    ...(input.model === undefined ? {} : { model: normalizeModel(input.model) }),
     schedule,
     timezone: input.timezone,
     destination,
@@ -464,7 +465,8 @@ function validateRoutineState(state) {
 
 function validateCanonicalRoutine(routine) {
   if (!routine || typeof routine !== "object" || Array.isArray(routine)) invalidState("routine must be an object");
-  requireKeys(routine, ["id", "prompt", "schedule", "timezone", "destination", "status", "nextRunAt", "runRequestedAt", "createdAt", "updatedAt", "lastRun"], "routine");
+  requireKeys(routine, ["id", "prompt", "schedule", "timezone", "destination", "status", "nextRunAt", "runRequestedAt", "createdAt", "updatedAt", "lastRun", ...(Object.hasOwn(routine, "model") ? ["model"] : [])], "routine");
+  normalizeModel(routine.model);
   requiredString(routine.id, "id", invalidState);
   if (typeof routine.prompt !== "string" || !routine.prompt.trim()) invalidState("prompt is empty");
   validateTimezone(routine.timezone, invalidState);
