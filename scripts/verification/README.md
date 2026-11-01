@@ -20,6 +20,23 @@ historical comparison pin. The SDK stays pinned to `@opencode/client@2.0.29`
 pending real qualification. Pin inclusion is not evidence of a passing native
 run or release readiness, and historical reports retain their recorded versions.
 
+The v2 crash cases SIGKILL a private runner/executor at instruction registration,
+admission, pending approval, and completion before delivery. A separate replacement
+reconciles the same recovery journal against the surviving native engine before
+explicit follow-up. Assertions cover owned-only context cleanup, foreign context
+retention, history, no replay/stale interactions, and one follow-up delivery.
+These are executor recovery checks, not whole Socket application death or routine
+crash-window proof. Unresolved or malformed journals prevent private-root cleanup.
+Workers emit case IDs/statuses, and command timeouts retain bounded captured output
+so a stalled full run identifies its last started case without logging prompts.
+For v1, plugin changes use the approved full native-process restart, with the
+attached engine restarted only by its independent test owner. V1 replacement
+probes retain completed history and wait for surviving admitted work; they do
+not claim startup cancellation of abandoned approvals or old Slack-card cleanup.
+The existing questions/permissions case also rejects a native protected write on
+both generations, requires the stopped notice and asserts its canary file was
+never created. No new release-gate exclusions are used for rejection coverage.
+
 `npm test` and `test:pack` do not download these engines. The engine lane needs
 access to the npm registry. It uses private homes, databases, configuration,
 workspaces and process ownership. Cleanup failures fail the run; uncertain

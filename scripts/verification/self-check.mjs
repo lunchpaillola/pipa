@@ -17,6 +17,16 @@ import { MIGRATION_TARGET_PIN, selectMigrationTarget } from "./opencode-migratio
 
 const facade = { checkOpenCodeConnection };
 
+test("timed-out native workers retain bounded progress diagnostics", async (t) => {
+  const runtime = await createRuntimeFixture({ timeoutMs: 5000 });
+  t.after(() => runtime.teardown());
+  await assert.rejects(command(runtime, process.execPath, ["-e", "process.stderr.write('case-progress:synthetic-barrier'); setInterval(() => {}, 1000)"], { timeoutMs: 500 }), error => {
+    assert.match(error.message, /timed out/u);
+    assert.match(error.message, /case-progress:synthetic-barrier/u);
+    return true;
+  });
+});
+
 test("protected shell admission accepts only loopback bypasses without exposing environment values", () => {
   const sentinel = { PIPA_INTEGRATION_SENTINEL: "matrix-integration" };
   const marker = "SYNTHETIC_ENV_OK";

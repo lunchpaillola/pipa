@@ -6,10 +6,43 @@ import { setTimeout as delay } from "node:timers/promises";
 import { pipaPaths, writePrivateJson } from "./state.mjs";
 
 export function createV2Adapter(options) {
-  const client = OpenCode.make({ baseUrl: options.baseUrl, headers: options.headers, fetch: (url, init) => options.fetch(url, {
-    ...init,
-    signal: AbortSignal.any([...(init.signal ? [init.signal] : []), AbortSignal.timeout(options.connectionRequestTimeoutMs ?? 5_000)]),
-  }) });
+  const client = OpenCode.make({ baseUrl: options.baseUrl, headers: options.headers, fetch: async (url, init) => {
+    const signal = AbortSignal.any([...(init.signal ? [init.signal] : []), AbortSignal.timeout(options.connectionRequestTimeoutMs ?? 5_000)]);
+    const response = await options.fetch(url, { ...init, signal });
+    if (!response.body) return response;
+    const reader = response.body.getReader();
+    let abort;
+    // Compressed native responses can stop reading without rejecting on network
+    // abort. Settle the SDK body independently so admission recovery can proceed.
+    return new Response(new ReadableStream({
+      start(controller) {
+        abort = () => {
+          controller.error(signal.reason);
+          void reader.cancel(signal.reason).catch(() => undefined);
+        };
+        if (signal.aborted) abort();
+        else signal.addEventListener("abort", abort, { once: true });
+      },
+      async pull(controller) {
+        try {
+          const next = await reader.read();
+          signal.throwIfAborted();
+          if (next.done) {
+            signal.removeEventListener("abort", abort);
+            reader.releaseLock();
+            controller.close();
+          } else controller.enqueue(next.value);
+        } catch (error) {
+          signal.removeEventListener("abort", abort);
+          controller.error(error);
+        }
+      },
+      cancel(reason) {
+        signal.removeEventListener("abort", abort);
+        void reader.cancel(reason).catch(() => undefined);
+      },
+    }), { status: response.status, statusText: response.statusText, headers: response.headers });
+  } });
   const journalFile = options.recoveryFile ?? pipaPaths(options.environment.PIPA_HOME).openCodeRecovery;
   const prefix = `pipa-${createHash("sha256").update(path.resolve(journalFile)).digest("hex").slice(0, 16)}-`;
   const turns = new Map();
@@ -56,11 +89,12 @@ export function createV2Adapter(options) {
     }
   }
 
-  async function mutate(change) {
+  async function mutate(change, committed) {
     const operation = mutationTail.then(async () => {
       const next = change(records);
       await writePrivateJson(journalFile, { version: 1, records: next });
       records = next;
+      committed?.(next);
     });
     mutationTail = operation.catch(() => undefined);
     return operation;
@@ -122,6 +156,8 @@ export function createV2Adapter(options) {
     const idle = index >= 0 ? fresh.slice(index + 1).find((message) => message.type === "idle") : null;
     const assistant = idle ? fresh.slice(index + 1, fresh.indexOf(idle)).findLast((message) => message.type === "assistant") : null;
     let dismissed = false;
+    let rejected = false;
+    let uncertainRejection = false;
     if (own && !idle && !foreign && record.dismissal && !inbox.length) {
       const message = fresh.slice(index + 1).find((message) => message.id === record.dismissal.messageId && message.type === "assistant");
       const tool = message?.content.find((part) => part.type === "tool" && part.id === record.dismissal.toolId && part.name === "question");
@@ -138,7 +174,22 @@ export function createV2Adapter(options) {
         if (cancelled) dismissed = !(await client.session.active({ signal }))[record.sessionId];
       }
     }
-    return { foreign, own, idle, assistant, inbox, dismissed };
+    if (own && !idle && !foreign && record.rejection && !inbox.length) {
+      const rejection = record.rejection;
+      const message = fresh.slice(index + 1).find((message) => message.id === rejection.messageId && message.type === "assistant");
+      const tool = message?.content.find((part) => part.type === "tool" && part.id === rejection.toolId);
+      if (typeof message?.time.completed === "number" && message.error?.type === "aborted" && tool?.state.status === "error" && tool.state.error?.type === "aborted") {
+        const pending = await client.permission.list({ sessionID: record.sessionId }, { signal });
+        if (!Array.isArray(pending)) throw new Error("OpenCode returned an invalid permission projection.");
+        // A root permission denial can abort without idle, just like dismissal.
+        // Confirm the journaled tool and native settlement, never infer success.
+        if (!pending.length && !(await client.session.active({ signal }))[record.sessionId]) {
+          rejected = rejection.confirmed;
+          uncertainRejection = !rejection.confirmed;
+        }
+      }
+    }
+    return { foreign, own, idle, assistant, inbox, dismissed, rejected, uncertainRejection };
   }
 
   async function cleanup(record) {
@@ -171,6 +222,7 @@ export function createV2Adapter(options) {
       if (record.phase !== "prepared") {
         let state = await projection(record, signal);
         foreign ||= state.foreign;
+        if (state.uncertainRejection) throw new Error("OpenCode permission rejection acknowledgement remains uncertain.");
         if (state.inbox.some((item) => item.id === record.id)) {
           try { await client.session.inbox.cancel({ sessionID: record.sessionId, inboxID: record.id }, { signal }); }
           catch (error) {
@@ -186,7 +238,7 @@ export function createV2Adapter(options) {
             await mutate((items) => items.map((item) => item.key === record.key ? { ...record } : item));
           }
         }
-        if (state.own && !state.idle && !state.dismissed) {
+        if (state.own && !state.idle && !state.dismissed && !state.rejected) {
           if (foreign || record.foreign) throw new Error("OpenCode attribution conflict: a foreign writer is still active.");
           // Native interrupt acknowledges acceptance, not settlement. Under KTD3's
           // single-writer contract it stops our active execution; never use it to
@@ -196,9 +248,10 @@ export function createV2Adapter(options) {
           do {
             state = await projection(record, signal);
             foreign ||= state.foreign;
+            if (state.uncertainRejection) throw new Error("OpenCode permission rejection acknowledgement remains uncertain.");
             if (foreign || record.foreign) throw new Error("OpenCode attribution conflict: foreign input entered during cancellation.");
-            if (!state.idle && !state.dismissed) await delay(options.pollIntervalMs, undefined, { signal });
-          } while (!state.idle && !state.dismissed);
+            if (!state.idle && !state.dismissed && !state.rejected) await delay(options.pollIntervalMs, undefined, { signal });
+          } while (!state.idle && !state.dismissed && !state.rejected);
         }
         if (!state.own && record.phase !== "cancelled") throw new Error("OpenCode prompt admission remains uncertain.");
       }
@@ -236,7 +289,8 @@ export function createV2Adapter(options) {
             || !Array.isArray(record.baseline) || !record.baseline.every((id) => typeof id === "string")
             || !["prepared", "admitting", "admitted", "cancelled"].includes(record.phase)
             || (record.instruction !== undefined && !["absent", "putting", "present"].includes(record.instruction))
-            || (record.dismissal !== undefined && (!record.dismissal || ![record.dismissal.formId, record.dismissal.messageId, record.dismissal.toolId].every((id) => typeof id === "string" && id.length)))
+             || (record.dismissal !== undefined && (!record.dismissal || ![record.dismissal.formId, record.dismissal.messageId, record.dismissal.toolId].every((id) => typeof id === "string" && id.length)))
+             || (record.rejection !== undefined && (!record.rejection || typeof record.rejection.confirmed !== "boolean" || ![record.rejection.requestId, record.rejection.messageId, record.rejection.toolId].every((id) => typeof id === "string" && id.length)))
             || typeof record.workingDirectory !== "string" || path.resolve(record.workingDirectory) !== path.resolve(workingDirectory)) throw new Error("Invalid or mismatched Pipa OpenCode recovery ownership.");
           keys.add(record.key);
           await cleanup(record);
@@ -358,6 +412,26 @@ export function createV2Adapter(options) {
           await Promise.allSettled(submissions);
         }
       }
+      async function saveRejection(rejection, requestId = rejection?.requestId) {
+        try {
+          await mutate((items) => items.map((item) => {
+            if (item.key !== record.key) return item;
+            if (rejection) return { ...item, rejection };
+            if (item.rejection?.requestId !== requestId) return item;
+            const next = { ...item };
+            delete next.rejection;
+            return next;
+          }), (next) => {
+            const saved = next.find((item) => item.key === record.key)?.rejection;
+            if (saved) record.rejection = saved;
+            else delete record.rejection;
+          });
+        } catch (cause) {
+          blocked = new Error("Pipa could not persist permission recovery state. New intake is blocked; recovery records have been retained.", { cause });
+          streamError = blocked;
+          throw blocked;
+        }
+      }
       async function dispatch(kind, request) {
         const key = `${kind}:${request.sessionID}:${request.id}`;
         if (!onInteraction || interactions.has(key) || !await belongs(request.sessionID)) return;
@@ -396,7 +470,17 @@ export function createV2Adapter(options) {
               if (kind === "permission") {
                 const decisionValue = ["reject", "stop"].includes(decision?.type) ? "reject" : decision?.type === "reply" ? decision.reply : null;
                 if (!["once", "always", "reject"].includes(decisionValue)) throw new Error("Invalid OpenCode permission decision.");
-                await client.permission.reply({ ...native, decision: decisionValue }, { signal });
+                const rejection = decisionValue === "reject" && request.sessionID === sessionId && request.source?.type === "tool"
+                  && typeof request.source.messageID === "string" && request.source.messageID.length && typeof request.source.id === "string" && request.source.id.length
+                  ? { requestId: request.id, messageId: request.source.messageID, toolId: request.source.id, confirmed: false } : null;
+                if (rejection) await saveRejection(rejection);
+                else if (record.rejection?.requestId === request.id) await saveRejection(undefined, request.id);
+                try { await client.permission.reply({ ...native, decision: decisionValue }, { signal }); }
+                catch (error) {
+                  if (!retryable(error) && error.reason !== "MalformedResponse" && error._tag !== "PermissionNotFoundError") await saveRejection(undefined, request.id);
+                  throw error;
+                }
+                if (rejection) await saveRejection({ ...rejection, confirmed: true });
               } else if (["reject", "stop"].includes(decision?.type)) {
                 if (decision.type === "stop" && request.sessionID === sessionId && typeof request.metadata?.tool?.messageID === "string" && typeof request.metadata.tool.id === "string") {
                   record.dismissal = { formId: request.id, messageId: request.metadata.tool.messageID, toolId: request.metadata.tool.id };
@@ -569,8 +653,16 @@ export function createV2Adapter(options) {
           const state = await projection(record, signal);
           if (state.foreign || record.foreign) throw new Error("OpenCode attribution conflict: foreign input entered the Pipa turn.");
           if (state.own?.text !== undefined && state.own.text !== prompt) throw new Error("OpenCode attribution conflict: projected input differs from the admitted prompt.");
-          if (state.dismissed || state.idle) await awaitSubmissions();
+          if (state.dismissed || state.rejected || state.uncertainRejection || state.idle) await awaitSubmissions();
+          if (streamError) throw streamError;
           if (state.dismissed) return "";
+          if (state.rejected || state.uncertainRejection) {
+            const settled = await projection(record, signal);
+            if (settled.foreign || record.foreign) throw new Error("OpenCode attribution conflict: foreign input entered the Pipa turn.");
+            if (settled.idle) continue;
+            if (!settled.rejected) throw new Error("OpenCode permission rejection acknowledgement remains uncertain.");
+            return dismissed ? "" : "Stopped after a permission was rejected.";
+          }
           if (state.idle) {
             if (dismissed) return "";
             if (state.assistant?.error) {

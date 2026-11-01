@@ -44,7 +44,7 @@ export const releaseCases = [
   caseOf("crash-after-admission", "Abrupt crash/recovery", "Abrupt executor death after native acceptance retains session identity without replay or false success", "U2/U6"),
   caseOf("crash-during-approval", "Abrupt crash/recovery", "Abrupt executor death at a real pending approval recovers/cancels abandoned work without false success", "U2/U6"),
   caseOf("crash-after-completion", "Abrupt crash/recovery", "Death after engine completion before delivery retains history without automatic replay/redelivery", "U2/U6"),
-  caseOf("plugin-reload-contract", "MCP/skills/agents/commands/plugins", "Modified private plugin executes its new hook once after native location reload", "U7"),
+  caseOf("plugin-reload-contract", "MCP/skills/agents/commands/plugins", "Modified plugin executes its new hook once after v2 location reload or approved v1 full native-process restart, retaining history", "U7"),
   caseOf("attachment-image-data-uri", "Incoming attachments", "Native engine receives exact image and document bytes via local and data URI transport", "U2"),
   caseOf("attachment-10mib", "Incoming attachments", "Real 10 MiB attachment reaches native admission through local and data URI transport", "U2"),
   caseOf("attachment-over-limit", "Incoming attachments", "10 MiB + 1 is rejected before native admission, both metadata and decoded bytes", "U2"),
@@ -120,8 +120,13 @@ export function assertRestartRoutineAdmission(snapshot, { pid, prompt, marker, s
 
 // Kill only a private Pipa runner/executor process. The actual attached engine
 // stays alive; no shutdown, injected adapter, or engine response substitution.
-export async function abruptTurnProbe({ runtime, candidate, baseUrl, boundary, prompt, sessionFile }) {
-  assert.ok(["admission", "approval", "completion"].includes(boundary));
+export async function abruptTurnProbe({ runtime, candidate, baseUrl, boundary, prompt, sessionFile, followup, releaseSurvivingTurn }) {
+  assert.ok(["registration", "admission", "approval", "completion"].includes(boundary));
+  const recoveryFile = `${sessionFile}.recovery.json`;
+  if (followup) runtime.defer(async () => {
+    const saved = await readFile(recoveryFile, "utf8").catch(error => { if (error.code !== "ENOENT") throw error; });
+    if (saved !== undefined) assert.deepEqual(JSON.parse(saved).records, [], "Retain private root with unresolved recovery ownership");
+  }, "crash recovery journal settlement");
   const moduleURL = (file) => pathToFileURL(path.join(candidate, "src", `${file}.mjs`)).href;
   const worker = runtime.spawn(process.execPath, ["--input-type=module", "-e", `
     import { createOpenCodeExecutor } from ${JSON.stringify(moduleURL("opencode"))};
@@ -136,12 +141,13 @@ export async function abruptTurnProbe({ runtime, candidate, baseUrl, boundary, p
       process.send({ kind: 'barrier', boundary: kind, ...evidence });
       await new Promise(() => {});
     };
-    const executor = createOpenCodeExecutor({ baseUrl: ${JSON.stringify(baseUrl)}, environment: process.env, pollIntervalMs: 50,
+    const executor = createOpenCodeExecutor({ baseUrl: ${JSON.stringify(baseUrl)}, recoveryFile: ${JSON.stringify(recoveryFile)}, environment: process.env, pollIntervalMs: 50,
       fetch: async (url, init = {}) => {
         const request = url instanceof Request ? url.clone() : null;
         const payload = init.body ?? (request && !['GET', 'HEAD'].includes(request.method) ? await request.text() : undefined);
         const wire = { path: new URL(request?.url ?? String(url)).pathname, body: payload ? JSON.parse(payload) : undefined };
         const response = await fetch(url, init);
+        if (${JSON.stringify(boundary)} === 'registration' && (init.method ?? request?.method) === 'PUT' && wire.path.includes('/instructions/entries/') && response.ok) await barrier('registration', { instructionPath: wire.path });
         if (isNativeAdmission(wire, prompt)) {
           process.send({ kind: 'admission', wire, status: response.status });
           if (response.ok) admitted.resolve();
@@ -184,8 +190,129 @@ export async function abruptTurnProbe({ runtime, candidate, baseUrl, boundary, p
     assert.equal(persisted["crash-probe"], sessionId);
     const admissions = messages.filter((message) => message.kind === "admission");
     assert.ok(admissions.every((message) => message.status >= 200 && message.status < 300));
-    assertNativeAdmissionCount(admissions.map((message) => message.wire), prompt, 1);
-    return { boundary, sessionId, exit, admissions: admissions.map((message) => message.wire), ...reached, deliveryObserved: false };
+    assertNativeAdmissionCount(admissions.map((message) => message.wire), prompt, boundary === "registration" ? 0 : 1);
+    const evidence = { boundary, sessionId, exit, admissions: admissions.map((message) => message.wire), ...reached, deliveryObserved: false };
+    if (!followup) return evidence;
+
+    const nativeV2 = boundary === "registration" || admissions[0].wire.path.startsWith("/api/");
+    const journal = nativeV2 ? JSON.parse(await readFile(recoveryFile, "utf8")) : null;
+    const entriesUrl = `${baseUrl}/api/experimental/session/${sessionId}/instructions/entries`;
+    const headers = { authorization: `Basic ${Buffer.from(`opencode:${runtime.env.OPENCODE_PASSWORD}`).toString("base64")}`, "content-type": "application/json" };
+    let entriesBefore;
+    let entriesAfter;
+    let survivingReleasedAt;
+    let followupAttemptAt;
+    if (nativeV2) {
+      assert.equal(journal.version, 1);
+      assert.equal(journal.records.length, boundary === "completion" ? 0 : 1);
+      if (journal.records.length) assert.equal(journal.records[0].sessionId, sessionId);
+      const foreignKey = `qualification-foreign-${randomUUID()}`;
+      const foreignValue = "Synthetic context owned by another client; preserve it.";
+      const foreign = await fetch(`${entriesUrl}/${foreignKey}`, { method: "PUT", headers, body: JSON.stringify({ value: foreignValue }), signal: AbortSignal.timeout(5000) });
+      assert.equal(foreign.status, 204);
+      entriesBefore = await fetch(entriesUrl, { headers, signal: AbortSignal.timeout(5000) }).then(response => response.json());
+      for (const record of journal.records) assert.ok(entriesBefore.data.some(entry => entry.key === record.key), "Owned context must exist at death");
+    }
+
+    const replacement = runtime.spawn(process.execPath, ["--input-type=module", "-e", `
+      import { createOpenCodeExecutor } from ${JSON.stringify(moduleURL("opencode"))};
+      import { createConversationRunner } from ${JSON.stringify(moduleURL("app"))};
+      import { createSessionStore } from ${JSON.stringify(moduleURL("state"))};
+      const wires = [];
+      let reportedWaiting = false;
+      const executor = createOpenCodeExecutor({ baseUrl: ${JSON.stringify(baseUrl)}, recoveryFile: ${JSON.stringify(recoveryFile)}, environment: process.env, pollIntervalMs: 50,
+        fetch: async (url, init = {}) => {
+          const request = url instanceof Request ? url.clone() : null;
+          const payload = init.body ?? (request && !['GET', 'HEAD'].includes(request.method) ? await request.text() : undefined);
+          const wire = { method: init.method ?? request?.method ?? 'GET', path: new URL(request?.url ?? String(url)).pathname, ...(payload ? { body: JSON.parse(payload) } : {}) };
+          if (wire.method === 'POST') process.send({ kind: 'mutation-attempt', wire, attemptedAt: process.hrtime.bigint().toString() });
+          const response = await fetch(url, init);
+          wires.push({ ...wire, status: response.status });
+          if (!${nativeV2} && !reportedWaiting && wire.path === '/session/status') {
+            const status = (await response.clone().json())[${JSON.stringify(sessionId)}]?.type;
+            if (['busy', 'retry'].includes(status)) {
+              reportedWaiting = true;
+              process.send({ kind: 'waiting', status, wires: [...wires] });
+            }
+          }
+          return response;
+        }
+      });
+      const resume = Promise.withResolvers();
+      process.once('message', () => resume.resolve());
+      await executor.ready(process.cwd());
+      process.send({ kind: 'recovered', pid: process.pid, wires: [...wires] });
+      await resume.promise;
+      const sessionStore = await createSessionStore(${JSON.stringify(sessionFile)});
+      const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn, abortTurn: executor.abortTurn });
+      await runner.enqueue('crash-probe', { prompt: ${JSON.stringify(followup)}, workingDirectory: process.cwd(),
+        onInteraction: () => { process.send({ kind: 'unexpected-interaction' }); throw new Error('Stale approval reached replacement'); },
+        deliver: result => process.send({ kind: 'followup', result })
+      });
+      runner.close();
+      await runner.drain();
+      process.send({ kind: 'settled', wires });
+      process.disconnect();
+    `], { stdio: ["ignore", "pipe", "pipe", "ipc"] });
+    const recoveredMessages = [];
+    let replacementError = "";
+    replacement.child.on("message", message => recoveredMessages.push(message));
+    replacement.child.stderr.on("data", data => { replacementError = (replacementError + data).slice(-8192); });
+    try {
+      const recovered = await runtime.waitFor(() => {
+        assert.equal(replacement.child.exitCode, null, `Replacement failed: ${replacementError}`);
+        return recoveredMessages.find(message => message.kind === "recovered");
+      }, { timeoutMs: 15000, label: "replacement startup reconciliation" });
+      assert.notEqual(recovered.pid, worker.child.pid);
+      if (nativeV2) assert.deepEqual(JSON.parse(await readFile(recoveryFile, "utf8")).records, []);
+      assertNativeAdmissionCount(recovered.wires, prompt, 0);
+      assertNativeAdmissionCount(recovered.wires, followup, 0);
+      assert.ok(!recoveredMessages.some(message => message.kind === "followup"));
+      if (nativeV2) {
+        const removals = recovered.wires.filter(wire => wire.method === "DELETE" && wire.path.includes("/instructions/entries/"));
+        assert.deepEqual(removals.map(wire => decodeURIComponent(wire.path.split("/").at(-1))).sort(), journal.records.map(record => record.key).sort(), "Remove only journal-owned entries");
+        entriesAfter = await fetch(entriesUrl, { headers, signal: AbortSignal.timeout(5000) }).then(response => response.json());
+        assert.deepEqual(entriesAfter.data, entriesBefore.data.filter(entry => !journal.records.some(record => record.key === entry.key)), "Foreign context must survive unchanged");
+      }
+      replacement.child.send({ followup: true });
+      if (releaseSurvivingTurn) {
+        const waiting = await runtime.waitFor(() => recoveredMessages.find(message => message.kind === "waiting"), { timeoutMs: 5000, label: "replacement waits for surviving native turn" });
+        assertNativeAdmissionCount(waiting.wires, prompt, 0);
+        assertNativeAdmissionCount(waiting.wires, followup, 0);
+        survivingReleasedAt = await releaseSurvivingTurn();
+      }
+      const settled = await runtime.waitFor(() => {
+        const settled = recoveredMessages.find(message => message.kind === "settled");
+        if (!settled) assert.equal(replacement.child.exitCode, null, `Replacement follow-up failed: ${replacementError}`);
+        return settled;
+      }, { timeoutMs: 15000, label: "explicit replacement follow-up" });
+      assertNativeAdmissionCount(settled.wires, prompt, 0);
+      assertNativeAdmissionCount(settled.wires, followup, 1);
+      const deliveries = recoveredMessages.filter(message => message.kind === "followup");
+      assert.equal(deliveries.length, 1);
+      assert.equal(deliveries[0].result.sessionId, sessionId);
+      assert.equal((await bounded(replacement.exited, { timeoutMs: 5000 })).code, 0, replacementError);
+      if (releaseSurvivingTurn) {
+        const attempts = recoveredMessages.filter(message => message.kind === "mutation-attempt");
+        assert.ok(!attempts.some(message => message.wire.path.endsWith("/abort")), "Replacement must not cancel surviving v1 work");
+        const admissions = attempts.filter(message => isNativeAdmission(message.wire, followup));
+        assert.equal(admissions.length, 1);
+        followupAttemptAt = admissions[0].attemptedAt;
+        // Same-host monotonic time proves ordering; IPC delivery order does not.
+        assert.ok(BigInt(followupAttemptAt) >= BigInt(survivingReleasedAt), "Follow-up submission preceded release of surviving v1 work");
+      }
+      assert.ok(!recoveredMessages.some(message => message.kind === "unexpected-interaction"), "Stale approval reached replacement");
+      if (nativeV2) {
+        assert.deepEqual(JSON.parse(await readFile(recoveryFile, "utf8")).records, []);
+        const entriesSettled = await fetch(entriesUrl, { headers, signal: AbortSignal.timeout(5000) }).then(response => response.json());
+        assert.deepEqual(entriesSettled.data, entriesAfter.data, "Follow-up must remove its own context and preserve foreign entries");
+      }
+      evidence.recovery = { oldPid: worker.child.pid, replacementPid: recovered.pid, ...(nativeV2 ? { journalBefore: journal, foreignContextPreserved: true } : { waitedForSurvivingTurn: Boolean(releaseSurvivingTurn), survivingReleasedAt, followupAttemptAt }), startupWires: recovered.wires, noReplay: true, result: deliveries[0].result };
+      return evidence;
+    } finally {
+      if (replacement.child.exitCode === null && replacement.child.signalCode === null) replacement.child.kill("SIGKILL");
+      await bounded(replacement.exited, { timeoutMs: 5000, label: "replacement exit" });
+    }
   } finally {
     if (worker.child.exitCode === null && worker.child.signalCode === null) worker.child.kill("SIGKILL");
     await bounded(worker.exited, { timeoutMs: 5000, label: "crash probe exit" });
@@ -346,6 +473,7 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
   let baseUrl;
   let startupError;
   let independent;
+  let ownedNative;
   let managed;
   let replacement;
   let port;
@@ -429,7 +557,11 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
       startServer: async (input, options) => {
         server = await facade.startSocketOpenCodeServer(input, { ...options, environment: runtime.env,
           ...(mode === "attached" ? { attachUrl: baseUrl } : {}),
-          spawn: (cmd, args, options) => runtime.spawn(cmd, args, options).child,
+          spawn: (cmd, args, options) => {
+            const spawned = runtime.spawn(cmd, args, options);
+            if (args[0] === "serve") ownedNative = spawned;
+            return spawned.child;
+          },
         });
         baseUrl = server.baseUrl;
         return server;
@@ -596,19 +728,21 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
     },
     "questions-permissions-tools": async () => {
       if (requireApp()) return requireApp();
-      for (const kind of ["question", "permission"]) {
+      for (const kind of ["question", "permission", "rejection"]) {
         const id = `interactive-${kind}`;
-        const thread = `slack:CMATRIX:${kind === "question" ? "300.001" : "300.002"}`;
+        const thread = `slack:CMATRIX:${kind === "question" ? "300.001" : kind === "permission" ? "300.002" : "300.003"}`;
         const marker = textFor(id);
-        provider.register({ prompt: promptFor(id), text: marker, tool: kind === "question"
+        const rejectedFile = path.join(runtime.workspace, `must-not-execute-${nonce}.txt`);
+        const rejectedCommand = `${JSON.stringify(process.execPath)} -e "require('node:fs').writeFileSync(${JSON.stringify(rejectedFile).replaceAll('"', '\\"')},'unexpected execution')"`;
+        provider.register({ prompt: promptFor(id), text: kind === "rejection" ? "" : marker, tool: kind === "question"
           ? { names: ["question", "form"], arguments: (_, tool) => tool.name === "question" ? { questions: [{ header: "Matrix", question: "Choose the test answer", options: [{ label: "Yes", description: "Continue" }] }] } : { title: "Matrix", fields: [{ key: "answer", type: "string", title: "Choose", options: [{ value: "yes", label: "Yes" }], required: true }] }, verify: (results) => assert.match(JSON.stringify(results), /Yes|yes/u) }
-          : { names: ["bash", "shell", "$shell"], arguments: () => ({ command: protectedToolCommand(marker), description: "Verify isolated tool environment and print a synthetic marker" }), verify: (results) => assert.ok(JSON.stringify(results).includes(marker), "Actual protected tool/environment verification did not execute") } });
+          : { names: ["bash", "shell", "$shell"], arguments: () => ({ command: kind === "rejection" ? rejectedCommand : protectedToolCommand(marker), description: "Verify isolated protected tool permission" }), ...(kind === "rejection" ? {} : { verify: (results) => assert.ok(JSON.stringify(results).includes(marker), "Actual protected tool/environment verification did not execute") }) } });
         const message = chat.send(thread, promptFor(id));
         const control = await runtime.waitFor(() => chat.controls.findLast((item) => item.thread === thread), { timeoutMs: 12000, label: "native interaction card" });
         const elements = control.blocks.flatMap((block) => block.elements ?? []);
-        const action = elements.find((element) => kind === "permission" ? element.action_id.startsWith("pipa_permission_once_") : element.action_id.startsWith("pipa_select_"));
+        const action = elements.find((element) => element.action_id.startsWith(kind === "question" ? "pipa_select_" : kind === "rejection" ? "pipa_permission_reject_" : "pipa_permission_once_"));
         assert.ok(action);
-        const value = kind === "permission" ? action.value : action.options[0].value;
+        const value = kind === "question" ? action.options[0].value : action.value;
         const event = { actionId: action.action_id, value, threadId: thread, user: { userId: "UMATRIX" } };
         for (const invalid of [{ ...event, threadId: "slack:CMATRIX:999.001" }, { ...event, user: { userId: "UOTHER" } }, { ...event, value: "wrong-nonce.once" }]) await chat.handlers.action(invalid);
         assert.equal(control.updated, undefined, "Unauthorized/stale decision acted");
@@ -618,8 +752,9 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
           await chat.handlers.action({ ...event, actionId: submit.action_id, value: submit.value });
         }
         await waitMessage(message);
-        assert.equal(chat.posts.findLast((post) => post.thread === thread)?.content?.markdown, marker);
-        assert.ok(provider.receipts.some((receipt) => receipt.prompt === promptFor(id) && receipt.toolResults.length), "Tool continuation absent");
+        assert.equal(chat.posts.findLast((post) => post.thread === thread)?.content?.markdown, kind === "rejection" ? "Stopped after a permission was rejected." : marker);
+        if (kind === "rejection") await assert.rejects(readFile(rejectedFile), { code: "ENOENT" });
+        else assert.ok(provider.receipts.some((receipt) => receipt.prompt === promptFor(id) && receipt.toolResults.length), "Tool continuation absent");
         assert.ok(control.updated, "Accepted control did not settle");
       }
     },
@@ -1011,12 +1146,52 @@ throw Error('Native file-command completion deadline exceeded');
       assertTurnOutcome(result, { sessionId: session, text: textFor("reload-recall") });
       assertNativeAdmissionCount(wires, promptFor("reload-recall"), 1);
     },
-    "crash-after-instruction-registration": async () => ({ status: "BLOCKED", observed: `U2/U6: no separately observable owned instruction-registration/recovery seam in the production facade; v1 instructions are inline prompt system bytes. Operations: ${Object.keys(executor ?? {}).join(", ")}. Cannot substitute session creation or admission for this boundary.` }),
+    "crash-after-instruction-registration": () => pin.startsWith("2.") ? crashed("registration") : { status: "BLOCKED", observed: "V1 instructions are inline prompt system bytes; no separate durable instruction-registration boundary qualified." },
     "crash-after-admission": () => crashed("admission"),
     "crash-during-approval": () => crashed("approval"),
     "crash-after-completion": () => crashed("completion"),
     "plugin-reload-contract": async () => {
       if (!cell.evidence.reload) return { status: "BLOCKED", observed: "Native location reload case did not reach plugin observation" };
+      if (pin.startsWith("1.")) {
+        const enginePid = async () => {
+          if (mode === "attached") return independent.child.pid;
+          if (mode === "socket-owned") return ownedNative.child.pid;
+          const identity = await state.readInstanceLock(paths.lock);
+          const registrations = (await readFile(path.join(runtime.ownership.base, "ownership.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
+          const children = [...new Set(registrations.filter(item => item.kind === "process" && item.ppid === identity.pid && state.isRunning(item.pid)).map(item => item.pid))];
+          assert.equal(children.length, 1, "Expected one live fixture-owned Managed engine child");
+          return children[0];
+        };
+        const oldPid = await enginePid();
+        const oldUrl = baseUrl;
+        executor.stopAll();
+        if (mode === "managed") {
+          await runCli("stop");
+          await runtime.waitFor(async () => !await state.readInstanceLock(paths.lock), { timeoutMs: 8000, label: "plugin restart Managed lock release" });
+        } else {
+          await app.shutdown();
+          if (mode === "attached") {
+            await health(oldUrl);
+            assert.equal(independent.child.exitCode, null, "Pipa must not stop the attached engine");
+            assert.equal(independent.child.signalCode, null, "Pipa must not signal the attached engine");
+            assert.equal(independent.child.kill("SIGTERM"), true);
+            await bounded(independent.exited, { timeoutMs: 5000, label: "owner stops private attached engine" });
+          } else await bounded(ownedNative.exited, { timeoutMs: 5000, label: "owned engine exits for plugin restart" });
+        }
+        await runtime.waitFor(() => !state.isRunning(oldPid), { timeoutMs: 5000, label: "old plugin engine PID exits" });
+        await runtime.waitFor(() => fetch(oldUrl, { signal: AbortSignal.timeout(500) }).then(() => false, () => true), { timeoutMs: 5000, label: "old plugin engine port closes" });
+        if (mode === "managed") await execute["startup-readiness"]();
+        else {
+          if (mode === "attached") await launchIndependent();
+          await startApp();
+        }
+        await health();
+        const newPid = await enginePid();
+        assert.notEqual(newPid, oldPid, "Plugin updates require a different native process");
+        const continued = await turn("plugin-restart-recall", { sessionId: cell.evidence.sessionId }, { verify: messages => assert.ok(JSON.stringify(messages).includes(promptFor("exact")), "Plugin restart lost history") });
+        assert.equal(continued.sessionId, cell.evidence.sessionId);
+        cell.evidence.reload.fullProcessRestart = { oldPid, newPid, oldPortClosed: true, historyRetained: true, attachedRestartByIndependentOwner: mode === "attached" };
+      }
       const before = (await readFile(definitions.pluginLog, "utf8")).trim().split("\n").length;
       // A built-in tool isolates plugin lifecycle from asynchronous MCP discovery.
       const result = await turn("plugin-version", {}, { tool: { names: ["read"], arguments: (_, tool) => ({ [tool.parameters.properties.path ? "path" : "filePath"]: path.join(runtime.workspace, ".opencode", "commands", "matrix-fixture.md") }), verify: (results) => assert.ok(JSON.stringify(results).includes(definitions.marker)) } });
@@ -1024,7 +1199,8 @@ throw Error('Native file-command completion deadline exceeded');
       const hooks = (await readFile(definitions.pluginLog, "utf8")).trim().split("\n").slice(before).map(JSON.parse).filter((item) => item.kind === "hook" && item.tool === "read");
       cell.evidence.reload.hooks = hooks;
       assert.equal(hooks.length, 1, "Native reload duplicated or lost plugin hook registration");
-      assert.equal(hooks[0].version, 2, "Native location dispose/reload retained old plugin module bytes instead of loading modified private file");
+      assert.equal(hooks[0].version, 2, "Native plugin lifecycle retained old module bytes instead of loading modified private file");
+      return { observed: pin.startsWith("1.") ? "Approved v1 full native-process restart: old PID/port gone, new PID, retained history and exactly one version-2 tool hook; attached engine restarted only by its independent owner" : "Native v2 location reload loaded changed plugin bytes and executed exactly one tool hook" };
     },
     "artifact-bytes": async () => {
       if (requireExecutor()) return requireExecutor();
@@ -1412,11 +1588,32 @@ throw Error('Native file-command completion deadline exceeded');
     const prerequisite = cell.cases.find((row) => row.id === "exact-prompt-continuation");
     if (prerequisite?.status !== "PASS") return { status: "BLOCKED", observed: `U2/U6: production native admission/completion prerequisite is ${prerequisite?.status ?? "absent"}; cannot reach an authoritative ${boundary} death boundary before the port. ${prerequisite?.observed ?? ""}` };
     const id = `crash-${boundary}`;
+    const followup = `${id}-followup`;
+    const replace = pin.startsWith("2.") || boundary === "completion" || boundary === "admission";
+    if (replace) provider.register({ prompt: promptFor(followup), text: textFor(followup), verify: messages => {
+      assert.equal(JSON.stringify(messages).includes(promptFor(id)), boundary !== "registration", "History must retain accepted input, never unadmitted input");
+      if (boundary === "completion" || (pin.startsWith("1.") && boundary === "admission")) assert.ok(JSON.stringify(messages).includes(textFor(id)), "Completed crash result lost");
+    } });
     provider.register({ prompt: promptFor(id), text: textFor(id), ...(boundary === "admission" ? { hold: true } : {}),
       ...(boundary === "approval" ? { tool: { names: ["bash", "shell", "$shell"], arguments: () => ({ command: `"${process.execPath}" -e "console.log('${textFor(id)}')"`, description: "Reach a real protected-tool approval before abrupt Pipa death" }) } } : {}),
     });
-    const evidence = await abruptTurnProbe({ runtime, candidate, baseUrl, boundary, prompt: promptFor(id), sessionFile: path.join(runtime.state, `${id}-sessions.json`) });
+    const evidence = await abruptTurnProbe({ runtime, candidate, baseUrl, boundary, prompt: promptFor(id), sessionFile: path.join(runtime.state, `${id}-sessions.json`), ...(replace ? { followup: promptFor(followup) } : {}),
+      ...(pin.startsWith("1.") && boundary === "admission" ? { releaseSurvivingTurn: async () => {
+        await runtime.waitFor(() => provider.receipts.some(receipt => receipt.prompt === promptFor(id)), { timeoutMs: 12000, label: "surviving v1 turn reaches held provider" });
+        const releasedAt = process.hrtime.bigint().toString();
+        provider.release(promptFor(id));
+        return releasedAt;
+      } } : {}),
+    });
     (cell.evidence.crashes ??= []).push(evidence);
+    if (evidence.recovery) {
+      assertTurnOutcome(evidence.recovery.result, { sessionId: evidence.sessionId, text: textFor(followup) });
+      if (boundary === "completion") assertTurnOutcome(evidence.result, { sessionId: evidence.sessionId, text: textFor(id) });
+      if (pin.startsWith("2.") && boundary === "admission") provider.release(promptFor(id));
+      return { observed: pin.startsWith("2.")
+        ? `Actual executor SIGKILL at ${boundary}; replacement reconciled the same private journal before intake, removed only owned context, preserved foreign context and session history, admitted no replay, and delivered one explicit follow-up without stale interactions or leaked context. Native engine survived executor death. Not full Socket application death or routine crash-window proof.`
+        : `Actual v1 executor SIGKILL at ${boundary}; separate replacement retained the mapped session/history, replayed no input, delivered no original result, and completed one explicit follow-up. ${boundary === "admission" ? "Replacement waited for surviving native work to settle; it did not cancel or claim abandoned ownership. " : ""}No native restart, v1 startup cancellation, Slack-card cleanup or whole-app recovery is claimed.`, evidence };
+    }
     if (boundary === "admission") {
       await runtime.waitFor(() => provider.receipts.some((receipt) => receipt.prompt === promptFor(id)), { timeoutMs: 12000, label: "accepted crash turn reaches native provider" });
       provider.release(promptFor(id));
@@ -1426,6 +1623,16 @@ throw Error('Native file-command completion deadline exceeded');
       const next = await turn(`${id}-followup`, { sessionId: evidence.sessionId }, { verify: (messages) => assert.ok(JSON.stringify(messages).includes(promptFor(id)), "Completed crash history lost") });
       assertTurnOutcome(next, { sessionId: evidence.sessionId, text: textFor(`${id}-followup`) });
       evidence.followupRetainedHistory = true;
+    }
+    if (pin.startsWith("1.") && boundary === "approval") {
+      const read = async pathname => {
+        const response = await fetch(`${baseUrl}${pathname}?directory=${encodeURIComponent(runtime.workspace)}`, { headers, signal: AbortSignal.timeout(5000) });
+        assert.equal(response.status, 200);
+        return response.json();
+      };
+      const [statuses, permissions, questions] = await Promise.all([read("/session/status"), read("/permission"), read("/question")]);
+      evidence.pendingAfterDeath = { status: statuses[evidence.sessionId]?.type ?? "idle", permissions: permissions.filter(item => item.sessionID === evidence.sessionId).map(item => item.id), questions: questions.filter(item => item.sessionID === evidence.sessionId).map(item => item.id) };
+      return { status: "BLOCKED", observed: `V1 executor died at native approval; surviving session is ${evidence.pendingAfterDeath.status} with ${evidence.pendingAfterDeath.permissions.length} permission(s) and ${evidence.pendingAfterDeath.questions.length} question(s). Replacement startup has no durable v1 turn ownership to cancel these safely. Plugin-restart approval does not authorize recovery-time attached-engine takeover.`, evidence };
     }
     return { status: "BLOCKED", observed: `U2/U6: actual SIGKILL at native ${boundary} barrier; one accepted admission, persisted session and no delivery. ${boundary === "completion" ? "Explicit follow-up retained completed history. " : ""}Owned instruction/admission startup recovery has no qualified public seam; this bounded runner/executor probe is not full Socket death, automatic recovery, or routine crash-window proof.`, evidence };
   }
@@ -1534,7 +1741,8 @@ throw Error('Native file-command completion deadline exceeded');
   try {
     const selectedCases = caseIds ? releaseCases.filter((row) => caseIds.includes(row.id)) : releaseCases;
     for (const definition of [...selectedCases.filter((row) => row.id !== "stop-ownership"), ...selectedCases.filter((row) => row.id === "stop-ownership")]) {
-      await recordSharedCase(cell.cases, definition, async () => {
+      process.stderr.write(`Native case ${definition.id}: START\n`);
+      const row = await recordSharedCase(cell.cases, definition, async () => {
         if (definition.id.startsWith("models-") && !pin.startsWith("2.")) {
           assert.equal(executor.capabilities.liveModelSwitch, false);
           return { status: "NOT_APPLICABLE", observed: "Native v1 has no live v2 HTTP switch operation; ordinary model execution is covered separately" };
@@ -1542,6 +1750,7 @@ throw Error('Native file-command completion deadline exceeded');
         if (definition.blocked) return { status: "BLOCKED", observed: definition.blocked };
         return execute[definition.id]();
       }, provider);
+      process.stderr.write(`Native case ${definition.id}: ${row.status}\n`);
     }
     cell.evidence.provider = provider.receipts.map((receipt) => ({ prompt: receipt.prompt, model: receipt.model, provider: receipt.provider, temperature: receipt.temperature, toolNames: receipt.tools.map((tool) => tool.name), toolResultCount: receipt.toolResults.length, cancelledConnection: receipt.closed && !receipt.released }));
     cell.evidence.admissions = wires.filter((wire) => wire.body.text || wire.body.parts).map((wire) => ({ path: wire.path, prompt: wire.body.text ?? wire.body.parts[0]?.text, files: wire.files.map((file) => ({ filename: file.filename, sha256: createHash("sha256").update(Buffer.from(file.base64, "base64")).digest("hex") })) }));

@@ -151,10 +151,15 @@ or establish private operator/plugin compatibility.
   V2 reads `plugins` (compatible package/directory entrypoints) and `mcp.servers`;
   MCP defaults to Code Mode, with `codemode:false` for direct tool exposure.
   Renaming keys alone does not convert plugin hooks or qualify credentials.
-- Both v1 pins retain old plugin module bytes after location disposal; a fresh
-  native process loads changed bytes. Their attached `run --command` can return
+- Both v1 pins retain old plugin module bytes after location disposal. V1 plugin
+  changes require a full native-process restart, not hot reload; this compatibility
+  policy was approved on 2026-11-01 and verified with changed PID, retained history
+  and exactly one updated hook. For attached servers, only the independent owner
+  restarts the engine; restarting Pipa alone does not reload that engine's plugins.
+  Their attached `run --command` can return
   before collecting output (an observed race); isolated standalone invocation returns it, but uses a
-  separate session/process. Both original gates remain failed. V2 file commands
+  separate session/process. The attached-command gate remains failed; historical
+  hot-reload failures are retained, not relabeled as passes. V2 file commands
   work through `opencode api`/`session.command` plus completed-result collection;
   v2 `run --command` is not available.
 - An attached server must serve the configured workspace and remain independently
@@ -169,6 +174,15 @@ or establish private operator/plugin compatibility.
 - Native event reconciliation is not durable replay. Foreign prompt writers in
   an active Pipa session cause an attribution conflict. Restore connectivity and
   resolve ownership conflicts rather than replaying prompts automatically.
+- V2 request deadlines include response-body consumption, including compressed
+  large-attachment admission replies. A timed-out reply triggers authoritative
+  admission reconciliation, not prompt replay; healthy long-running turns still
+  have no overall execution deadline.
+- A v2 root tool permission rejection may terminate without a native idle message.
+  Pipa settles it only after the rejection acknowledgement is durably confirmed,
+  the exact owned assistant/tool are aborted, pending permissions are absent and
+  native execution is inactive. Lost acknowledgements or failed journal writes
+  fail closed and retain uncertain recovery state; inactivity alone is not success.
 - Routine restart skips missed schedules; saved explicit run requests survive.
   A crash after side effects/delivery but before saving completion can repeat
   work. There is no new exactly-once promise.

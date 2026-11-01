@@ -105,7 +105,9 @@ export async function command(runtime, executable, args, options = {}) {
   let stderr = "";
   child.stdout?.on("data", (data) => { stdout = (stdout + data).slice(-2 * 1024 * 1024); });
   child.stderr?.on("data", (data) => { stderr = (stderr + data).slice(-2 * 1024 * 1024); });
-  const result = await bounded(exited, { timeoutMs, signal: runtime.signal, label: path.basename(executable) });
+  const result = await bounded(exited, { timeoutMs, signal: runtime.signal, label: path.basename(executable) }).catch(error => {
+    throw new Error(`${error.message}${stderr || stdout ? `\n${stderr || stdout}` : ""}`, { cause: error });
+  });
   assert.equal(result.code, 0, `${path.basename(executable)} exited ${result.code}: ${stderr || stdout}`);
   return stdout;
 }

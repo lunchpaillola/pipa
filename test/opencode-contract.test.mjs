@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { access, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rename, rmdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -33,6 +33,7 @@ test("release catalog keeps four crash boundaries and separate unqualified model
     assert.equal(releaseCases.find((row) => row.id === id)?.owner, "U2/U6");
   }
   assert.ok(releaseCases.find((row) => row.id === "slack-editable-retry-controls")?.blocked);
+  assert.match(releaseCases.find(row => row.id === "plugin-reload-contract").expected, /v1 full native-process restart/u);
   for (const id of ["models-switch", "models-variants", "models-default", "models-reset"]) {
     const definition = releaseCases.find((row) => row.id === id);
     assert.deepEqual(definition.generations, ["2"]);
@@ -43,10 +44,13 @@ test("release catalog keeps four crash boundaries and separate unqualified model
   assert.ok(workflow.includes('- "test/opencode-contract.test.mjs"'));
 });
 
-for (const boundary of ["admission", "approval", "completion"]) test(`release crash self-check: SIGKILL at ${boundary} through production runner/native HTTP fixture (not engine recovery proof)`, async (t) => {
+for (const [generation, boundary, replacement] of [["v1", "admission"], ["v1", "approval"], ["v1", "completion"], ["v2", "registration"], ["v1", "completion", true]]) test(`release crash self-check: ${generation} SIGKILL at ${boundary}${replacement ? " with replacement" : ""} through production runner/native HTTP fixture (not engine recovery proof)`, async (t) => {
   const runtime = await createRuntimeFixture({ timeoutMs: 25000 });
   t.after(() => runtime.teardown());
-  const document = await loadWireFixture("v1", runtime);
+  const document = await loadWireFixture(generation, runtime);
+  const sessionFile = path.join(runtime.state, "crash-sessions.json");
+  let registered = false;
+  if (replacement) for (const route of document.routes.filter(route => ["/global/health", "/path"].includes(route.path))) route.repeatLast = true;
   const admission = Promise.withResolvers();
   if (boundary === "approval") {
     document.routes.find((route) => route.path === "/session/status").responses = [{ json: { ses_contract: { type: "busy" } } }];
@@ -58,9 +62,25 @@ for (const boundary of ["admission", "approval", "completion"]) test(`release cr
   const serverErrors = [];
   const server = createServer(async (request, response) => {
     try {
-      if (request.url.startsWith("/event?")) {
+      if (request.url.startsWith("/api/form?") || request.url.startsWith("/api/permission/request?")) {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ location: { directory: runtime.workspace }, data: [] }));
+        return;
+      }
+      if (request.method === "PUT" && request.url.includes("/instructions/entries/")) {
+        const journal = JSON.parse(await readFile(`${sessionFile}.recovery.json`, "utf8"));
+        assert.equal(journal.records.length, 1);
+        assert.equal(journal.records[0].phase, "prepared");
+        assert.equal(journal.records[0].instruction, "putting");
+        registered = true;
+        response.writeHead(204);
+        response.end();
+        return;
+      }
+      if (request.url.startsWith("/event?") || request.url === "/api/event") {
         response.writeHead(200, { "content-type": "text/event-stream" });
         response.flushHeaders();
+        if (boundary === "registration") return;
         await admission.promise;
         // A pending approval can only appear after actual prompt acceptance.
         if (boundary === "approval") response.write(document.routes.find((route) => route.path === "/event").responses[0].sse.split("\n\n")[0] + "\n\n");
@@ -75,13 +95,20 @@ for (const boundary of ["admission", "approval", "completion"]) test(`release cr
     } catch (error) { serverErrors.push(error); response.writeHead(500); response.end(); }
   });
   const baseUrl = await runtime.listen(server);
-  const evidence = await abruptTurnProbe({ runtime, candidate: fileURLToPath(new URL("..", import.meta.url)), baseUrl, boundary, prompt: document.prompt, sessionFile: path.join(runtime.state, "crash-sessions.json") });
+  const followup = "explicit replacement follow-up";
+  const evidence = await abruptTurnProbe({ runtime, candidate: fileURLToPath(new URL("..", import.meta.url)), baseUrl, boundary, prompt: document.prompt, sessionFile, ...(replacement ? { followup } : {}) });
   assert.equal(evidence.boundary, boundary);
   assert.equal(evidence.sessionId, document.expected.sessionId);
   assert.equal(evidence.deliveryObserved, false);
   if (boundary === "completion") assertTurnOutcome(evidence.result, document.expected);
+  if (replacement) {
+    assertTurnOutcome(evidence.recovery.result, document.continuation);
+    assert.equal(evidence.recovery.noReplay, true);
+    assertNativeAdmissionCount(wire.calls, followup, 1);
+  }
   if (boundary === "approval") assert.equal(evidence.requestId, "que_contract");
-  assertNativeAdmissionCount(wire.calls, document.prompt, 1);
+  if (boundary === "registration") assert.equal(registered, true);
+  assertNativeAdmissionCount(wire.calls, document.prompt, boundary === "registration" ? 0 : 1);
   assert.deepEqual(serverErrors, []);
   wire.assertComplete();
 });
@@ -873,6 +900,174 @@ for (const confirmation of ["complete", "wrong tool", "still active", "form pend
   current.wire.assertComplete();
 });
 
+for (const confirmation of ["complete", "delayed acknowledgement", "idle while acknowledgement held", "lost acknowledgement", "external approval then generic abort", "failed intent persistence", "failed confirmation persistence", "idle while intent persistence fails", "wrong tool", "still active", "permission still pending", "foreign input", "startup", "startup unconfirmed rejection", "startup missing rejection", "startup invalid rejection"]) test(`U3 native root permission rejection without idle requires exact native confirmation: ${confirmation}`, { timeout: 3000 }, async (t) => {
+  const startup = confirmation.startsWith("startup");
+  const failedIntent = ["failed intent persistence", "idle while intent persistence fails"].includes(confirmation);
+  const failedPersistence = failedIntent || confirmation === "failed confirmation persistence";
+  const heldAcknowledgement = ["delayed acknowledgement", "idle while acknowledgement held", "failed confirmation persistence"].includes(confirmation);
+  const permission = { ...nativeExamples.permission, sessionID: "ses_contract" };
+  const rejection = { requestId: permission.id, messageId: permission.source.messageID, toolId: permission.source.id, confirmed: false };
+  const acknowledgement = Promise.withResolvers(), terminalRead = Promise.withResolvers(), pendingRead = Promise.withResolvers(), releasePending = Promise.withResolvers();
+  let durable, confirmedAtCleanup, submissionError, restoreJournal, submitted = false, settled = false, lost = false, reconciled = 0, failRemoval = startup, holdPending = false, aborted = false;
+  const exposeAbort = () => {
+    const messages = current.document.routes.find((route) => route.path.endsWith("/message"));
+    messages.responses.at(-1).json.data.push({
+      id: rejection.messageId, type: "assistant", time: { created: 3, completed: 4 }, finish: "error",
+      error: { type: "aborted", message: "Step interrupted" },
+      content: [{ type: "tool", id: confirmation === "wrong tool" ? "other_tool" : rejection.toolId, name: "bash", time: { created: 3, completed: 4 },
+        state: { status: "error", input: { command: "pwd" }, error: { type: "aborted", message: "Step interrupted" } } }],
+    });
+    aborted = true;
+  };
+  const current = await nativeInteractions(t, {
+    permissions: [permission], executorOptions: { cleanupTimeoutMs: 100 },
+    onPrompt: () => current.pendingPermissions.push(permission),
+    onReply: async (call, _, permissions) => {
+      assert.deepEqual(call.body, { decision: "reject" });
+      durable = JSON.parse(await readFile(pipaPaths(current.runtime.home).openCodeRecovery, "utf8"));
+      if (confirmation !== "permission still pending") permissions.splice(0);
+      exposeAbort();
+      if (confirmation === "still active") current.document.routes.find((route) => route.path === "/api/session/active").responses[0].json.data = { ses_contract: { type: "running" } };
+      if (confirmation === "foreign input") current.document.routes.find((route) => route.path.endsWith("/message")).responses.at(-1).json.data.push({ id: "msg_foreign", type: "user", time: { created: 5 }, text: "another writer" });
+    },
+    transport: async (url, init, fetch) => {
+      const pathname = new URL(url).pathname;
+      if (confirmation === "idle while intent persistence fails" && init.method === "DELETE" && pathname.includes("/instructions/entries/")) await restoreJournal();
+      if (["complete", "delayed acknowledgement", "idle while acknowledgement held"].includes(confirmation) && init.method === "DELETE" && pathname.includes("/instructions/entries/")) confirmedAtCleanup = JSON.parse(await readFile(pipaPaths(current.runtime.home).openCodeRecovery, "utf8")).records[0].rejection.confirmed;
+      if (failRemoval && init.method === "DELETE" && pathname.includes("/instructions/entries/")) return new Response(null, { status: 400 });
+      const response = await fetch(url, init);
+      if (holdPending && pathname === "/api/session/ses_contract/permission") {
+        holdPending = false;
+        pendingRead.resolve();
+        await bounded(releasePending.promise, { signal: init.signal });
+      }
+      if (aborted && pathname === "/api/session/ses_contract/message") terminalRead.resolve();
+      if (heldAcknowledgement && pathname.endsWith("/reply")) await bounded(acknowledgement.promise, { signal: init.signal });
+      // Another client approved the request; our rejection was definitively refused.
+      if (confirmation === "external approval then generic abort" && pathname.endsWith("/reply")) return new Response(JSON.stringify({ error: "Already approved elsewhere" }), { status: 403, headers: { "content-type": "application/json" } });
+      if (confirmation === "lost acknowledgement" && pathname.endsWith("/reply")) { lost = true; throw new TypeError("lost native reply"); }
+      if (lost && init.method === "GET" && pathname === "/api/session/ses_contract/permission") reconciled++;
+      return response;
+    },
+  });
+  // Discover the permission only after the owned prompt has actually been admitted.
+  current.pendingPermissions.splice(0);
+  const messages = current.document.routes.find((route) => route.path.endsWith("/message"));
+  const completed = structuredClone(messages.responses.at(-1).json);
+  messages.responses.at(-1).json.data = [messages.responses.at(-1).json.data[0]];
+  current.document.routes.push(
+    { method: "GET", path: `/api/session/ses_contract/message/${rejection.messageId}`, repeatLast: true, responses: [{ json: { data: {
+      id: rejection.messageId, type: "assistant", time: { created: 3 }, content: [{ type: "tool", id: rejection.toolId, name: "bash", time: { created: 3 }, state: { status: "running", input: { command: "pwd" }, metadata: {} } }],
+    } } }] },
+    { method: "POST", path: "/api/session/ses_contract/interrupt", query: { resume: "false" }, repeatLast: true, responses: [{ json: { interrupted: false } }] },
+  );
+  const safe = ["complete", "delayed acknowledgement", "idle while acknowledgement held"].includes(confirmation);
+  const turn = current.executor.runTurn({ ...current.input, signal: AbortSignal.timeout(500), onInteraction: async (interaction) => {
+    assert.equal(interaction.sessionId, "ses_contract");
+    assert.deepEqual(interaction.request.tool, { name: "bash", input: { command: "pwd" } });
+    holdPending = failedIntent;
+    try { await interaction.submit({ type: "reject" }); }
+    catch (error) { submissionError = error; return { type: "cancelled" }; }
+    submitted = true;
+    return { type: "reject" };
+  } });
+  void turn.then(() => { settled = true; }, () => { settled = true; });
+  const recoveryFile = pipaPaths(current.runtime.home).openCodeRecovery;
+  if (heldAcknowledgement && !failedPersistence) {
+    try {
+      await bounded(terminalRead.promise, { timeoutMs: 300, label: "aborted projection while acknowledgement is held" });
+      await new Promise(setImmediate);
+      assert.equal(settled, false, "intent plus an aborted projection must not settle before acknowledgement");
+      assert.equal(JSON.parse(await readFile(recoveryFile, "utf8")).records[0].rejection.confirmed, false);
+      if (confirmation === "idle while acknowledgement held") messages.responses.at(-1).json = completed;
+    } finally { acknowledgement.resolve(); }
+  }
+  if (failedPersistence) {
+    await bounded(failedIntent ? pendingRead.promise : terminalRead.promise, { timeoutMs: 300, label: "pre-write fixture barrier" });
+    durable = JSON.parse(await readFile(recoveryFile, "utf8"));
+    const backup = `${recoveryFile}.prior`;
+    await rename(recoveryFile, backup);
+    await mkdir(recoveryFile);
+    let restored = false;
+    restoreJournal = async () => {
+      if (!restored) {
+        assert.deepEqual(JSON.parse(await readFile(backup, "utf8")), durable, "failed writes must preserve the prior journal");
+        await rmdir(recoveryFile);
+        await rename(backup, recoveryFile);
+        restored = true;
+      }
+    };
+    current.runtime.defer(restoreJournal, "restore private recovery journal");
+    // Atomic rename onto this directory must fail, without losing the prior journal.
+    if (confirmation === "idle while intent persistence fails") {
+      messages.responses.at(-1).json = completed;
+      aborted = true;
+      await bounded(terminalRead.promise, { timeoutMs: 300, label: "successful idle projection before intent write fails" });
+      await new Promise(setImmediate);
+      assert.equal(settled, false, "captured idle output must wait for the pending intent write");
+    } else if (failedIntent) exposeAbort();
+    current.pendingPermissions.splice(0);
+    releasePending.resolve();
+    acknowledgement.resolve();
+    try {
+      await assert.rejects(bounded(turn, { timeoutMs: 1000, label: "failed persistence turn" }));
+      assert.ok(submissionError, "the journal write must fail rather than permit terminal delivery");
+      if (confirmation === "idle while intent persistence fails") assert.equal(restored, true, "instruction cleanup must restore the disk and finish without delivering captured success");
+    } finally {
+      await restoreJournal();
+    }
+  }
+  if (confirmation === "idle while acknowledgement held") assertTurnOutcome(await bounded(turn, { timeoutMs: 1000, label: "idle after acknowledgement" }), current.document.expected);
+  else if (safe) assert.equal((await bounded(turn, { timeoutMs: 1000, label: "permission rejection without idle" })).text, "Stopped after a permission was rejected.");
+  else await assert.rejects(turn);
+  assert.equal(submitted, confirmation !== "external approval then generic abort" && !failedPersistence, "the native rejection acknowledgement/reconciliation must settle");
+  assert.equal(current.calls.length, failedIntent ? 0 : 1, "never submit before persistence or resubmit after a lost acknowledgement");
+  const saved = JSON.parse(await readFile(recoveryFile, "utf8"));
+  assert.equal(saved.records.length, safe || confirmation === "idle while intent persistence fails" ? 0 : 1);
+  assert.equal(durable.records[0].phase, "admitted");
+  assert.equal(durable.records[0].instruction, "present");
+  if (confirmation === "lost acknowledgement") assert.equal(saved.records[0].rejection.confirmed, false, "absence after a lost reply does not prove our rejection was applied");
+  if (confirmation === "failed confirmation persistence") assert.equal(saved.records[0].rejection.confirmed, false, "an acknowledged RPC cannot substitute for a failed confirmation write");
+  if (confirmation === "external approval then generic abort" || confirmation === "failed intent persistence") assert.equal(saved.records[0].rejection, undefined, "failed intent/definitively refused rejection must not be published");
+  if (confirmation === "lost acknowledgement") assert.ok(reconciled > 0, "a lost reply requires a session-scoped native permission read");
+  if (safe) {
+    assert.equal(confirmedAtCleanup, true, "acknowledgement must be durably confirmed before terminal cleanup");
+    assert.ok(current.wire.calls.some((call) => call.method === "DELETE" && call.path.endsWith(`/instructions/entries/${durable.records[0].key}`)));
+    assert.equal(current.wire.calls.some((call) => call.path.endsWith("/interrupt")), false, "confirmed rejection is already terminal, not a new cancellation");
+  } else {
+    const admissions = current.wire.calls.filter((call) => call.path.endsWith("/prompt")).length;
+    await assert.rejects(current.executor.runTurn(current.input), /blocked/u);
+    assert.equal(current.wire.calls.filter((call) => call.path.endsWith("/prompt")).length, admissions);
+  }
+  if (startup) {
+    // Reuse the generated ownership key/baseline; seed only the crash-time intent.
+    const record = { ...durable.records[0] };
+    if (confirmation === "startup") record.rejection = { ...rejection, confirmed: true };
+    if (confirmation === "startup unconfirmed rejection") record.rejection = rejection;
+    if (confirmation === "startup missing rejection") delete record.rejection;
+    if (confirmation === "startup invalid rejection") record.rejection = { ...rejection, confirmed: "yes" };
+    await writeFile(recoveryFile, JSON.stringify({ version: 1, records: [record] }));
+    failRemoval = false;
+    const before = current.wire.calls.length;
+    const restarted = createOpenCodeExecutor({ baseUrl: "http://127.0.0.1:4096", connection: { major: 2, headers: {} }, fetch: current.fetch, environment: current.runtime.env, pollIntervalMs: 1, cleanupTimeoutMs: 100 });
+    current.runtime.defer(() => restarted.stopAll(), "restarted executor");
+    if (confirmation === "startup") {
+      await restarted.ready(current.runtime.workspace);
+      assert.deepEqual(JSON.parse(await readFile(recoveryFile, "utf8")).records, []);
+      assert.ok(current.wire.calls.slice(before).some((call) => call.method === "DELETE" && call.path.endsWith(`/instructions/entries/${record.key}`)));
+    } else {
+      await assert.rejects(restarted.ready(current.runtime.workspace), (error) => {
+        assert.match(error.message, /blocked/u);
+        if (confirmation === "startup invalid rejection") assert.match(error.cause.message, /Invalid or mismatched.*ownership/u);
+        return true;
+      });
+      assert.equal(JSON.parse(await readFile(recoveryFile, "utf8")).records.length, 1);
+    }
+    assert.equal(current.wire.calls.slice(before).some((call) => call.path.endsWith("/prompt") || call.path.endsWith("/reply") || call.method === "PUT"), false, "startup must not replay input, rejection, or instruction registration");
+  } else if (!failedIntent) assert.deepEqual(durable.records[0].rejection, rejection, "unconfirmed rejection intent must be durable before the native reply");
+  current.wire.assertComplete();
+});
+
 test("U3 v2 reconnect duplicates produce one callback and reload cancellation makes replies inert", async (t) => {
   let frames;
   let streams = 0;
@@ -1315,6 +1510,34 @@ test("U2 recovery failure gates subscriptions, Slack connection and routine cons
     createRoutineScheduler: () => seen.push("routines"),
   }), /abandoned cleanup failed/u);
   assert.deepEqual(seen, ["stop"]);
+});
+
+for (const timing of ["during-body", "before-body"]) test(`v2 admission body abort ${timing} reconciles accepted work even when the source read/cancel never settles`, async (t) => {
+  let cancelled = false;
+  let requestAborted = false;
+  const current = await fixture(t, "v2", {
+    executorOptions: { connectionRequestTimeoutMs: 50 },
+    transport: async (url, init, next) => {
+      const response = await next(url, init);
+      if (!new URL(url).pathname.endsWith("/prompt")) return response;
+      const aborted = new Promise(resolve => init.signal.addEventListener("abort", () => { requestAborted = true; resolve(); }, { once: true }));
+      if (timing === "before-body") await aborted;
+      // Model a decompressor that ignores network abort and whose cancel hangs.
+      return new Response(new ReadableStream({
+        start(controller) { controller.enqueue(new TextEncoder().encode('{"data":')); },
+        cancel() { cancelled = true; return new Promise(() => {}); },
+      }), { headers: response.headers });
+    },
+  });
+  const { runtime, executor, input, document, wire } = current;
+  const result = await bounded(executor.runTurn(input), { timeoutMs: 1000, label: "aborted admission body reconciliation" });
+  assertTurnOutcome(result, document.expected);
+  assert.equal(requestAborted, true);
+  assert.equal(cancelled, true);
+  assertNativeAdmissionCount(wire.calls, input.prompt, 1);
+  assert.equal(wire.calls.filter(call => call.method === "DELETE" && call.path.includes("/instructions/entries/")).length, 1);
+  assert.deepEqual(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records, []);
+  wire.assertComplete();
 });
 
 test("v2 U2: loss before admission retries the exact same ID; loss after admission reconciles without resubmission", async (t) => {
