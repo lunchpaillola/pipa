@@ -60,6 +60,7 @@ export function pipaPaths(home = process.env.PIPA_HOME || os.homedir()) {
     routines: path.join(directory, "routines.json"),
     routinesLock: path.join(directory, "routines.lock"),
     sessions: path.join(directory, "sessions.json"),
+    openCodeRecovery: path.join(directory, "opencode-recovery.json"),
   };
 }
 
