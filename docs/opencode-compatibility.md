@@ -49,6 +49,15 @@ V2 uses username `opencode` and `OPENCODE_PASSWORD`, falling back to
 `OPENCODE_SERVER_PASSWORD`. Keep these values private. Pipa supplies owned
 servers with a private password; do not extract one from startup logs.
 
+**Managed external-client upgrade notice:** Before upgrading, set a shared explicit
+`OPENCODE_SERVER_PASSWORD` in the Pipa server/restart launch environment and
+configure the same password in every external client. For v2, `OPENCODE_PASSWORD`
+takes precedence: set it to the same shared password or remove conflicting values
+from the server/restart and client environments. Without an explicit password,
+Pipa generates a private per-launch password that is unavailable to external
+clients; unauthenticated clients no longer connect. Keep the generated password
+private; use an explicit shared password for external access instead.
+
 Socket startup waits for native readiness before Slack subscriptions or routines.
 Ordinary Managed startup can remain running without workspace readiness, but
 cannot advertise cooperative restart readiness. A detached replacement must

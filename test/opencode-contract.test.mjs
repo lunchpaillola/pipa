@@ -611,6 +611,65 @@ for (const settlementEvent of ["question.replied", "question.rejected"]) test(`U
   } finally { releaseRead.resolve(); finished.resolve(); await turn.catch(() => undefined); }
 });
 
+for (const failure of ["network", "503"]) test(`U3 v1 rejected ancestry lookup is retried on reconnect without routing unverified or foreign children (${failure})`, async (t) => {
+  const failed = Promise.withResolvers(), retryReached = Promise.withResolvers(), releaseRetry = Promise.withResolvers(), reconciled = Promise.withResolvers(), replied = Promise.withResolvers(), finished = Promise.withResolvers();
+  const child = { id: "que_contract", sessionID: "ses_child", questions: [{ question: "Pick", options: [{ label: "Blue" }] }] };
+  const pending = [child, { ...child, id: "que_foreign", sessionID: "ses_foreign" }, { ...child, id: "que_missing", sessionID: "ses_missing" }];
+  let lookups = 0, streams = 0;
+  const current = await fixture(t, "v1", {
+    onRequest: async (call) => {
+      if (call.path.endsWith("/prompt_async")) await finished.promise;
+      if (call.path === "/question/que_contract/reply") replied.resolve();
+    },
+    transport: async (url, init, next) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/event") {
+        const sse = ++streams === 1 ? `data: ${JSON.stringify({ type: "question.asked", properties: child })}\n\n` : "";
+        return new Response(sse, { headers: { "content-type": "text/event-stream" } });
+      }
+      if (pathname === "/session/ses_parent") {
+        if (++lookups === 2) { retryReached.resolve(); await releaseRetry.promise; }
+        const response = await next(url, init);
+        if (lookups === 1) {
+          failed.resolve();
+          if (failure === "network") throw new TypeError("transient ancestry lookup failure");
+        }
+        return response;
+      }
+      return next(url, init);
+    },
+  });
+  const { document, executor, input, wire } = current;
+  document.routes.find((route) => route.path === "/question").responses = [{ json: [] }, { json: pending }];
+  document.routes.find((route) => route.path === "/session/ses_child").responses[0].json.parentID = "ses_parent";
+  const query = { directory: input.workingDirectory };
+  document.routes.push(
+    { method: "GET", path: "/session/ses_parent", query, responses: [{ status: 503, raw: "unavailable" }, { json: { id: "ses_parent", parentID: input.sessionId, directory: input.workingDirectory } }] },
+    { method: "GET", path: "/session/ses_foreign", query, responses: [{ json: { id: "ses_foreign", parentID: input.sessionId, directory: path.dirname(input.workingDirectory) } }] },
+    { method: "GET", path: "/session/ses_missing", query, responses: [{ json: null }] },
+  );
+  const seen = [];
+  const turn = executor.runTurn({ ...input, onInteraction: (interaction) => {
+    seen.push([interaction.sessionId, interaction.request.id]);
+    return { type: "answer", answers: [["Blue"]] };
+  }, onPermissionsReconciled: () => { if (lookups === 2) reconciled.resolve(); } });
+  try {
+    await bounded(failed.promise);
+    await bounded(retryReached.promise, { timeoutMs: 1000, label: "reconnect retries the rejected intermediate ancestry lookup" });
+    assert.deepEqual(seen, [], "No callback may route until the full ancestry is proven");
+    releaseRetry.resolve();
+    await bounded(reconciled.promise);
+    await bounded(replied.promise);
+    assert.deepEqual(seen, [["ses_child", "que_contract"]], "Foreign-directory and null lookups must not route");
+    assert.ok(streams >= 2, "Retry must occur within the same watcher after reconnect");
+    assert.equal(wire.calls.filter((call) => call.path === "/session/ses_parent").length, 2);
+    assert.equal(wire.calls.filter((call) => call.path === "/session/ses_child").length, 1, "Successful ancestry entries remain cached");
+    finished.resolve();
+    assertTurnOutcome(await turn, document.expected);
+    wire.assertComplete();
+  } finally { releaseRetry.resolve(); finished.resolve(); await turn.catch(() => undefined); }
+});
+
 test("U3 v1 optional permission hydration 503 followed by reconnect registers one usable control", async (t) => {
   const failedHydration = Promise.withResolvers(), allow = Promise.withResolvers(), finished = Promise.withResolvers();
   const permission = { id: "per_hydrate", sessionID: "ses_contract", permission: "bash", patterns: ["pwd"], tool: { messageID: "msg_hydrate", callID: "call_hydrate" } };
@@ -1261,6 +1320,113 @@ test("U3 v2 richer forms stay native-only; external settlement releases notices,
   assert.deepEqual(seen, ["form", "form", "form", "form"]);
   assert.equal(current.calls.length, 0);
   current.wire.assertComplete();
+});
+
+for (const projection of ["stale", "completed"]) for (const abortResult of ["acknowledged", "network", "503"]) test(`U4 v1 interaction stop cannot finish while native abort acknowledgement is in flight (${projection} assistant, ${abortResult})`, async (t) => {
+  const interaction = Promise.withResolvers(), admitted = Promise.withResolvers(), abortReached = Promise.withResolvers(), acknowledge = Promise.withResolvers(), projected = Promise.withResolvers();
+  let reads = 0, aborts = 0, finished = false;
+  const { document, executor, input, wire } = await fixture(t, "v1", { onRequest: async (call) => {
+    if (call.path.endsWith("/prompt_async")) admitted.resolve();
+    if (call.path.endsWith("/message") && ++reads > 1) await abortReached.promise;
+  }, transport: async (url, init, next) => {
+    const pathname = new URL(url).pathname;
+    const directAbort = pathname.endsWith("/abort") && ++aborts === 1;
+    if (directAbort) { abortReached.resolve(); await acknowledge.promise; }
+    const response = await next(url, init);
+    if (pathname.endsWith("/message") && reads > 1) projected.resolve();
+    if (directAbort && abortResult === "network") throw new TypeError("private-abort-network-secret");
+    return response;
+  } });
+  const messages = document.routes.find((route) => route.path.endsWith("/message"));
+  messages.responses = projection === "stale" ? [messages.responses[0]] : messages.responses.slice(0, 2);
+  document.routes.find((route) => route.path.endsWith("/abort")).responses = [
+    abortResult === "503" ? { status: 503, raw: "private-abort-body-secret" } : { json: true },
+    abortResult === "503" ? { status: 503, raw: "private-cleanup-body-secret" } : { json: true },
+  ];
+  const events = document.routes.find((route) => route.path === "/event");
+  events.responses[0].sse = events.responses[0].sse.split("\n\n")[0] + "\n\n";
+  document.routes.push({ method: "POST", path: "/question/que_contract/reject", query: { directory: input.workingDirectory }, responses: [{ json: true }] });
+  const turn = executor.runTurn({ ...input, onInteraction: (value) => { interaction.resolve(value); return value.settled; } })
+    .then((result) => { finished = true; return { result }; }, (error) => { finished = true; return { error }; });
+  try {
+    const value = await bounded(interaction.promise);
+    await bounded(admitted.promise);
+    const submission = value.submit({ type: "stop" }).then(() => null, (error) => error);
+    await bounded(abortReached.promise);
+    await bounded(projected.promise);
+    await new Promise(setImmediate);
+    const finishedBeforeAcknowledgement = finished;
+    acknowledge.resolve();
+    const submissionError = await submission;
+    const outcome = await bounded(turn, { timeoutMs: 1000, label: "pending stop and independent cancellation settle" });
+    assert.equal(finishedBeforeAcknowledgement, false, "Terminal assistant projection must not finish the turn while native abort is held");
+    if (abortResult === "acknowledged") {
+      assert.equal(submissionError, null);
+      assert.equal(outcome.result?.text, "");
+      assert.equal(aborts, 1);
+    } else {
+      assert.equal(submissionError?.message, "Pipa OpenCode cancellation could not be confirmed.");
+      assert.equal(outcome.error?.message, submissionError.message);
+      assert.equal(aborts, 2, "Finally must retry cancellation after the pending abort rejects");
+      if (abortResult === "503") await assert.rejects(executor.ready(input.workingDirectory), /cancellation failed.*New intake is blocked/u);
+      else await executor.ready(input.workingDirectory);
+    }
+    wire.assertComplete();
+  } finally { acknowledge.resolve(); await turn.catch(() => undefined); }
+});
+
+for (const type of ["question", "permission"]) for (const failure of ["network", "503"]) for (const remains of [false, true]) for (const cleanupFails of [false, true]) test(`U4 v1 accepted ${type} stop retries native abort after ${failure} (interaction remains: ${remains}, cleanup fails: ${cleanupFails})`, async (t) => {
+  const interaction = Promise.withResolvers(), admitted = Promise.withResolvers(), submitted = Promise.withResolvers();
+  const abortSignals = [];
+  let messageReads = 0;
+  const current = await fixture(t, "v1", { onRequest: async (call) => {
+    if (call.path.endsWith("/prompt_async")) admitted.resolve();
+    if (call.path.endsWith("/message") && ++messageReads > 1) await submitted.promise;
+    if (call.path === `/${type}/${type === "question" ? "que_contract/reject" : "per_contract/reply"}` && !remains) {
+      current.document.routes.find((route) => route.path === `/${type}`).responses[0].json = [];
+    }
+  }, transport: async (url, init, next) => {
+    const abort = new URL(url).pathname.endsWith("/abort");
+    if (abort) abortSignals.push(init.signal);
+    const response = await next(url, init);
+    if (abort && abortSignals.length === 1 && failure === "network") throw new TypeError("private-abort-network-secret");
+    return response;
+  } });
+  const { document, executor, input, wire } = current;
+  const request = { id: type === "question" ? "que_contract" : "per_contract", sessionID: input.sessionId };
+  document.routes.find((route) => route.path === `/${type}`).responses[0].json = [request];
+  document.routes.find((route) => route.path === "/event").responses[0].sse = `data: ${JSON.stringify({ type: `${type}.asked`, properties: request })}\n\n`;
+  document.routes.push({ method: "POST", path: "/question/que_contract/reject", query: { directory: input.workingDirectory }, repeatLast: true, responses: [{ json: true }] });
+  const permissionReply = document.routes.find((route) => route.path === "/permission/per_contract/reply");
+  permissionReply.body = { reply: "reject" };
+  permissionReply.repeatLast = true;
+  document.routes.find((route) => route.path === "/session/ses_contract/abort").responses = [
+    failure === "network" ? { json: true } : { status: 503, raw: "private-abort-body-secret" },
+    cleanupFails ? { status: 503, raw: "private-cleanup-body-secret" } : { json: true },
+  ];
+  const outcome = executor.runTurn({ ...input, onInteraction: (value) => { interaction.resolve(value); return value.settled; } }).then((result) => ({ result }), (error) => ({ error }));
+  const value = await bounded(interaction.promise);
+  await bounded(admitted.promise);
+  const submission = await value.submit({ type: "stop" }).then(() => null, (error) => error);
+  submitted.resolve();
+  const result = await bounded(outcome, { timeoutMs: 1000, label: "watcher exits and independent native cancellation drains" });
+  assert.equal(submission?.message, "Pipa OpenCode cancellation could not be confirmed.");
+  assert.equal(result.error?.message, submission.message, "An accepted interaction must not produce turn success after uncertain abort");
+  assert.equal(abortSignals.length, 2, "Finally must independently retry native session abort");
+  assert.equal(abortSignals[0].aborted, true);
+  assert.notEqual(abortSignals[0], abortSignals[1]);
+  assert.equal(abortSignals[1].aborted, false, "Cleanup must not reuse the cancelled local signal");
+  if (cleanupFails) {
+    const calls = wire.calls.length;
+    await assert.rejects(executor.ready(input.workingDirectory), /cancellation failed.*New intake is blocked/u);
+    await assert.rejects(executor.runTurn(input), /cancellation failed.*New intake is blocked/u);
+    assert.equal(wire.calls.length, calls, "Blocked intake must not reach native admission");
+  } else {
+    await executor.ready(input.workingDirectory);
+    assertTurnOutcome(await executor.runTurn(input), document.continuation);
+  }
+  assert.equal(wire.calls.filter((call) => call.path.endsWith("/prompt_async")).length, cleanupFails ? 1 : 2);
+  wire.assertComplete();
 });
 
 test("U4 v1 stop during admission waits for its acknowledgement before native cancellation", async (t) => {

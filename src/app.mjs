@@ -476,7 +476,8 @@ export function createPendingInteractions(allowedUserIds = []) {
       return;
     }
     if (event.actionId?.startsWith("pipa_custom_")) {
-      await event.openModal?.(Modal({ callbackId: "pipa_custom", privateMetadata: token, title: "Custom answer", submitLabel: "Submit", children: [TextInput({ id: "answer", label: "Answer" })] }));
+      const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
+      await event.openModal?.(Modal({ callbackId: "pipa_custom", privateMetadata: token, title: "Custom answer", submitLabel: "Submit", children: [TextInput({ id: "answer", label: question.multiple ? "Answer (replaces checkbox selections)" : "Answer" })] }));
       return;
     }
     if (entry.type !== "question") return;
@@ -507,6 +508,7 @@ export function createPendingInteractions(allowedUserIds = []) {
     if (entry.busy || entry.decision !== undefined || entry.type !== "question") return;
     const answer = event.values?.answer?.trim();
     if (!answer) return { action: "errors", errors: { answer: "Enter an answer." } };
+    // Custom answers intentionally replace selections rather than combine with them.
     entry.answers[entry.questionIndex] = [answer];
     await advance(entry, event.user);
   }

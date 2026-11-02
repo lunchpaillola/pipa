@@ -15,7 +15,7 @@ One Pipa package automatically selects a native v1 or v2 HTTP adapter. This docu
 
 Product Contract preservation: R1 and R14 now cover both supported generations, superseding v2-only scope with the user's explicit approval. R2–R13 retain their behavioral intent; R12 distinguishes the v2-only live-model-switch capability. Existing R, AE, KTD, and U IDs remain stable.
 
-### Latest Owner Scope
+## Latest Owner Scope
 
 - Migrate to v2 while preserving the current Pipa-on-v1 baseline, including the pre-existing model picker. No v1 feature expansion is authorized; broader historical requirements below are read within this boundary.
 - Instruction registration and its recovery journal are v2-only. V1 retains its existing per-prompt system instructions; do not add v1 instruction registration or automatic recovery merely to make the engines symmetrical.
@@ -114,7 +114,9 @@ Port the protocol boundary and qualify the existing product behaviors. Add only 
 
 See `docs/research/opencode-protocol-comparison.md`: 58 real-engine comparison checks, 54 passes and four measured compatibility failures on 1.18.35, 1.19.0, and 2.0.29. The comparison used a deterministic local model, not live Slack or paid inference. Existing routine/restart/CLI baseline suites passed 55 tests. The approved approach retains native HTTP adapters; neither this spike nor the baseline proves the production dual-adapter implementation.
 
-### Current Integration Evidence
+### Historical Pre-Port Integration Snapshot
+
+This 2026-10-13 snapshot describes the integration before the dual-adapter port, not the current implementation or qualification status.
 
 | Surface | Existing owner | Migration implication |
 |---|---|---|

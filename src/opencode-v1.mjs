@@ -56,7 +56,7 @@ export function createV1Adapter({ request, baseUrl, fetchImpl, headers, pollInte
     },
     async execute({ sessionId, baseline, threadModel, model, defaultModel, workingDirectory, controller, prompt, files, instructions, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
       const selectedModel = normalizeModel(model ?? threadModel ?? defaultModel);
-      let dismissed = false;
+      let dismissed;
       let permissionRejected = false;
       let watcher;
       let admitting = false;
@@ -64,7 +64,7 @@ export function createV1Adapter({ request, baseUrl, fetchImpl, headers, pollInte
         if (onInteraction) {
           watcher = watchInteractions({ baseUrl, fetchImpl, headers, sessionId, workingDirectory, controller,
             onInteraction, onPermissionReplied, onPermissionsReconciled,
-            onPermissionRejected: () => { permissionRejected = true; }, onDismiss: () => { dismissed = true; }, requestTurn: request });
+            onPermissionRejected: () => { permissionRejected = true; }, onDismiss: (operation) => { dismissed = operation; }, requestTurn: request });
           await watcher.ready;
         }
         controller.signal.throwIfAborted();
@@ -93,7 +93,10 @@ export function createV1Adapter({ request, baseUrl, fetchImpl, headers, pollInte
           if (!Array.isArray(messages)) throw new Error("OpenCode returned an invalid message projection.");
           const message = messages.findLast((message) => message?.info?.id && !baseline.has(message.info.id) && message.info.role === "assistant");
           const status = statuses?.[sessionId]?.type;
-          if (dismissed && status !== "busy" && status !== "retry") return "";
+          if (dismissed) {
+            await abortable(dismissed, controller.signal);
+            if (status !== "busy" && status !== "retry") return "";
+          }
           if (message?.info.error) {
             const error = message.info.error;
             const providerID = message.info.providerID ?? selectedModel?.providerID;
@@ -175,7 +178,12 @@ function watchInteractions({ baseUrl, fetchImpl, headers, sessionId, workingDire
     while (candidate && !visited.has(candidate)) {
       if (candidate === sessionId) { interactionSessionIds.add(original); return true; }
       visited.add(candidate);
-      if (!parents.has(candidate)) parents.set(candidate, requestTurn(`/session/${encodeURIComponent(candidate)}`, { method: "GET" }, workingDirectory, readController).then((session) => !session?.directory || session.directory === workingDirectory ? session?.parentID : undefined));
+      if (!parents.has(candidate)) {
+        const id = candidate;
+        parents.set(id, requestTurn(`/session/${encodeURIComponent(id)}`, { method: "GET" }, workingDirectory, readController)
+          .then((session) => !session?.directory || session.directory === workingDirectory ? session?.parentID : undefined)
+          .catch((error) => { parents.delete(id); throw error; }));
+      }
       candidate = await parents.get(candidate);
     }
     return false;
@@ -302,10 +310,17 @@ async function settleInteraction({ type, requestId, sessionId, request: interact
       }
       settlement.accepted = true;
       if (decision.type === "stop") {
-        onDismiss?.();
-        await requestTurn(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }, workingDirectory, controller, [200, 204], false);
+        const cancellation = requestTurn(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }, workingDirectory, controller, [200, 204], false);
+        onDismiss?.(cancellation);
+        await cancellation;
       }
     } catch (error) {
+      if (settlement.accepted && decision.type === "stop") {
+        // Interaction settlement cannot confirm native cancellation; let execute drain it independently.
+        const cancellation = new Error("Pipa OpenCode cancellation could not be confirmed.");
+        controller.abort(cancellation);
+        throw cancellation;
+      }
       if (error.status === undefined || error.status === 404 || error.status >= 500) {
         settlement.uncertain = true;
         if (!await stillPending()) return;

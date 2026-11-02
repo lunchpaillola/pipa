@@ -974,6 +974,7 @@ test("routes a subagent permission through its parent session", async () => {
 
 test("v1 ignores a pending question whose foreign session is absent", async () => {
   let prompted = false;
+  const interactions = [];
   const fetch = async (url, init = {}) => {
     const pathname = new URL(url).pathname;
     if (pathname === "/event") return new Response(new ReadableStream({ start(stream) {
@@ -988,8 +989,9 @@ test("v1 ignores a pending question whose foreign session is absent", async () =
     throw new Error(`Unexpected request: ${url}`);
   };
   const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 })
-    .runTurn({ prompt: "go", sessionId: "ses_1", workingDirectory: "/work", onInteraction: () => assert.fail("Foreign question must not be routed") });
+    .runTurn({ prompt: "go", sessionId: "ses_1", workingDirectory: "/work", onInteraction: (interaction) => { interactions.push(interaction); } });
   assert.equal(result.text, "done");
+  assert.deepEqual(interactions, []);
 });
 
 test("forwards permission replies from the OpenCode event stream", async () => {

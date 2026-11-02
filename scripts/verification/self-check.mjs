@@ -20,7 +20,7 @@ const facade = { checkOpenCodeConnection };
 
 test("Windows PowerShell identity diagnostics compare host and isolated startup/query timings", async (t) => {
   if (process.platform !== "win32") return;
-  const runtime = await createRuntimeFixture({ timeoutMs: 120_000 });
+  const runtime = await createRuntimeFixture({ timeoutMs: 180_000 });
   t.after(() => runtime.teardown());
   const probes = {
     startup: "[Console]::Out.Write('READY')",
@@ -28,14 +28,20 @@ test("Windows PowerShell identity diagnostics compare host and isolated startup/
     full: "@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate).Count",
   };
   for (const [environment, env] of [["host", process.env], ["isolated", runtime.env]]) {
-    for (const [probe, script] of Object.entries(probes)) {
+    const selected = Object.entries(probes);
+    if (environment === "isolated") selected.push(
+      ["explicit-module", `Import-Module (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/Modules/CimCmdlets/CimCmdlets.psd1'); [Console]::Error.WriteLine('PIPA_CIM_IMPORTED'); ${probes.pid}`],
+      ["system-module-path", `$env:PSModulePath=Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/Modules'; ${probes.pid}`],
+      ["wmi", `([wmi]"Win32_Process.Handle='${process.pid}'").ProcessId`],
+    );
+    for (const [probe, script] of selected) {
       const started = performance.now();
       const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference='Stop'; [Console]::Error.WriteLine('PIPA_CIM_QUERY_STARTED'); ${script}`], {
         cwd: runtime.workspace, env, encoding: "utf8", timeout: 15_000, windowsHide: true,
       });
       // Measurement only: no process records, error messages, paths or environment values.
       t.diagnostic(JSON.stringify({ environment, probe, elapsedMs: Math.round(performance.now() - started),
-        stage: result.stderr?.includes("PIPA_CIM_QUERY_STARTED") ? "query" : "startup",
+        stage: result.stderr?.includes("PIPA_CIM_IMPORTED") ? "imported" : result.stderr?.includes("PIPA_CIM_QUERY_STARTED") ? "query" : "startup",
         status: Number.isInteger(result.status) ? result.status : null,
         errorCode: result.error ? (["ETIMEDOUT", "ENOENT", "EACCES", "EPERM", "ENOBUFS"].includes(result.error.code) ? result.error.code : "OTHER") : null,
         stdoutBytes: Buffer.byteLength(result.stdout ?? ""), stderrBytes: Buffer.byteLength(result.stderr ?? ""),

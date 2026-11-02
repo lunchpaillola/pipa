@@ -1776,6 +1776,45 @@ test("interaction registry uses Block Kit selectors in Slack", async () => {
   assert.equal(updated[1].blocks[1].text.text, "Lola selected: “A”, “C”, “D”.");
 });
 
+test("custom answers explicitly replace prior checkbox selections for the current question", async () => {
+  for (const nested of [false, true]) {
+    const posted = [], updated = [], submitted = [];
+    const thread = slackInteractionThread({ posted, updated });
+    const interactions = createPendingInteractions(["U1"]);
+    const question = { question: "Which snacks?", multiple: true, custom: true, options: [{ label: "Apple" }, { label: "Plum" }] };
+    const decision = interactions.onInteraction({ thread }, {
+      type: "question", sessionId: "ses_custom", signal: AbortSignal.timeout(5000),
+      request: nested ? { questions: [{ question: "Name?", custom: true }, question] } : question,
+      submit: async value => { submitted.push(value); },
+    });
+    try {
+      await waitFor(() => posted.length === 1);
+      let modal;
+      const openCustom = async card => {
+        const custom = slackAction(card, "pipa_custom_");
+        await interactions.onAction({ actionId: custom.action_id, value: custom.value, threadId: thread.id, user: { userId: "U1" }, openModal: async value => { modal = value; } });
+      };
+      const answer = value => interactions.onCustomAnswer({ privateMetadata: modal.privateMetadata, values: { answer: value }, user: { userId: "U1" }, relatedThread: thread });
+      if (nested) {
+        await openCustom(posted[0]);
+        assert.equal(modal.children[0].label, "Answer");
+        await answer("Orbit");
+        await waitFor(() => updated.length === 1);
+      }
+      const card = nested ? updated[0] : posted[0];
+      const select = slackAction(card, "pipa_select_");
+      assert.equal(select.type, "checkboxes");
+      await interactions.onAction({ actionId: select.action_id, threadId: thread.id, user: { userId: "U1" }, raw: { actions: [{ action_id: select.action_id, selected_options: select.options }] } });
+      await openCustom(card);
+      assert.equal(modal.children[0].label, "Answer (replaces checkbox selections)");
+      await answer("Pear");
+      const expected = { type: "answer", answers: nested ? [["Orbit"], ["Pear"]] : [["Pear"]] };
+      assert.deepEqual(await decision, expected);
+      assert.deepEqual(submitted, [expected]);
+    } finally { await interactions.close(); await decision.catch(() => undefined); }
+  }
+});
+
 test("question Submit uses current Slack state after an older selection finishes authorization last", async () => {
   const posted = [];
   const thread = slackInteractionThread({ posted });
