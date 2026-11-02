@@ -43,7 +43,6 @@ test("protected shell admission accepts only loopback bypasses without exposing 
     {}, { PIPA_INTEGRATION_SENTINEL: "mutated" },
     ...["NODE_OPTIONS", "HTTP_PROXY", "https_proxy", "ALL_PROXY", "CUSTOM_PROXY", "SLACK_BOT_TOKEN", "PIPA_SLACK_APP_SECRET", "PIPA_OPENCODE_ATTACH_URL"].map(key => ({ ...sentinel, [key]: key === "NODE_OPTIONS" ? "--no-warnings" : "synthetic-private-value" })),
     ...["NO_PROXY", "no_proxy"].flatMap(key => ["", " ", "*", "localhost,", ",127.0.0.1", "localhost,,::1", "localhost,example.com", "127.0.0.2", ".localhost", "localhost:80", "127.0.0.1/8"].map(value => ({ ...sentinel, [key]: value }))),
-    { ...sentinel, NO_PROXY: "localhost", no_proxy: "*" },
   ];
   for (const env of rejected) {
     const result = probe(env);
@@ -51,6 +50,12 @@ test("protected shell admission accepts only loopback bypasses without exposing 
     assert.equal(result.stdout, "", "Rejection must not print environment values");
     assert.equal(result.stderr, "");
   }
+  // Windows child environments keep only the first lexicographically sorted key
+  // for case-insensitive duplicates; the discarded value never reaches the tool.
+  const collision = probe({ ...sentinel, NO_PROXY: "localhost", no_proxy: "*" });
+  assert.equal(collision.status, process.platform === "win32" ? 0 : 23);
+  assert.equal(collision.stdout, process.platform === "win32" ? `${marker}\n` : "");
+  assert.equal(collision.stderr, "");
 });
 
 test("shared cell failure retains both diagnostics, blocks pending-work contamination, and still stops and cleans up", async () => {
@@ -419,6 +424,38 @@ test("interrupted process registration fails cleanup and retains the owned root"
   assert.match(cell.cleanup.observed, /identity could not be proven/u);
   await access(runtime.root);
   await rm(runtime.root, { recursive: true, force: true });
+});
+
+test("ownership preload initialization failure does not expose its capability URL", async (t) => {
+  const runtime = await createRuntimeFixture();
+  t.after(() => runtime.teardown());
+  const preload = new URL("../../test/helpers/runtime-ownership.mjs", import.meta.url);
+  preload.searchParams.set("ownership", JSON.stringify({ ...runtime.ownership, key: "synthetic-private-capability" }));
+  const result = spawnSync(process.execPath, ["--import", preload.href, "-e", "process.stdout.write('BODY_RAN')"], {
+    cwd: runtime.workspace, env: runtime.env, encoding: "utf8", timeout: 5000,
+  });
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "Ownership preload initialization failed.\n");
+  if (process.platform === "win32") {
+    preload.searchParams.set("ownership", JSON.stringify({ ...runtime.ownership, launchId: "missing-powershell" }));
+    const missing = spawnSync(process.execPath, ["--import", preload.href, "-e", "process.stdout.write('BODY_RAN')"], {
+      cwd: runtime.workspace, env: { ...runtime.env, PATH: runtime.workspace }, encoding: "utf8", timeout: 5000,
+    });
+    assert.equal(missing.status, 1);
+    assert.equal(missing.stdout, "");
+    const prefix = "Cannot verify Windows process identities with CIM: ";
+    assert.ok(missing.stderr.startsWith(prefix), "Expected a bounded CIM diagnostic, not a preload stack");
+    assert.ok(!missing.stderr.includes(runtime.ownership.key) && !missing.stderr.includes(preload.href), "Private ownership capability was exposed");
+    const diagnostic = JSON.parse(missing.stderr.slice(prefix.length));
+    assert.deepEqual(Object.keys(diagnostic), ["phase", "elapsedMs", "timeoutMs", "errorCode", "status", "signal", "stdoutBytes", "stderrBytes"]);
+    assert.equal(diagnostic.phase, "preload");
+    assert.equal(diagnostic.errorCode, "ENOENT");
+    assert.equal(diagnostic.timeoutMs, 5000);
+    assert.ok(Number.isInteger(diagnostic.elapsedMs) && diagnostic.elapsedMs >= 0);
+    assert.equal(diagnostic.stdoutBytes, 0);
+    assert.equal(diagnostic.stderrBytes, 0);
+  }
 });
 
 test("ownership preload preserves the spawn command-options overload", async (t) => {

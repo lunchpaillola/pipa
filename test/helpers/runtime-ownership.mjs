@@ -23,14 +23,27 @@ function validate(context) {
   return context;
 }
 
-function snapshot() {
+function snapshot(phase) {
   if (process.platform === "win32") {
+    const started = performance.now();
+    const timeoutMs = 5000;
     const script = "$ErrorActionPreference='Stop'; @(Get-CimInstance Win32_Process | ForEach-Object { @{ pid=[int]$_.ProcessId; ppid=[int]$_.ParentProcessId; birth=$(if ($null -ne $_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('o') } else { $null }); state='R' } }) | ConvertTo-Json -Compress";
-    const result = cp.spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 5000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
-    if (result.error || result.status !== 0) throw new Error("Cannot verify Windows process identities with CIM");
-    const value = JSON.parse(result.stdout.replace(/^\uFEFF/u, ""));
+    const result = cp.spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
+    if (result.error || result.status !== 0) {
+      const diagnostic = {
+        phase, elapsedMs: Math.round(performance.now() - started), timeoutMs,
+        errorCode: result.error ? (["ETIMEDOUT", "ENOENT", "EACCES", "EPERM", "ENOBUFS"].includes(result.error.code) ? result.error.code : "OTHER") : null,
+        status: Number.isInteger(result.status) ? result.status : null,
+        signal: ["SIGTERM", "SIGKILL"].includes(result.signal) ? result.signal : null,
+        stdoutBytes: Buffer.byteLength(result.stdout ?? ""), stderrBytes: Buffer.byteLength(result.stderr ?? ""),
+      };
+      throw Object.assign(new Error(`Cannot verify Windows process identities with CIM: ${JSON.stringify(diagnostic)}`), { code: "PIPA_TEST_WINDOWS_IDENTITY" });
+    }
+    let value;
+    try { value = JSON.parse(result.stdout.replace(/^\uFEFF/u, "")); }
+    catch { throw new Error("Invalid Windows process identity snapshot"); }
     const rows = Array.isArray(value) ? value : [value];
-    if (!rows.every((item) => Number.isSafeInteger(item.pid) && Number.isSafeInteger(item.ppid) && (item.birth === null || Number.isFinite(Date.parse(item.birth))))) throw new Error("Invalid Windows process identity snapshot");
+    if (!rows.every((item) => item && Number.isSafeInteger(item.pid) && Number.isSafeInteger(item.ppid) && (item.birth === null || Number.isFinite(Date.parse(item.birth))))) throw new Error("Invalid Windows process identity snapshot");
     return rows;
   }
   const result = cp.spawnSync("ps", ["-axo", "pid=,ppid=,pgid=,stat=,lstart="], { encoding: "utf8", timeout: 2000 });
@@ -79,7 +92,7 @@ export function launchOwned(launch, command, args, options, context) {
   }
   const child = launch(command, childArgs, childOptions);
   if (!child.pid) { journal(context, { kind: "empty", id }); return child; }
-  const initial = snapshot();
+  const initial = snapshot("launch");
   const identity = initial.find((item) => item.pid === child.pid);
   if (!identity) {
     // A fast-exiting leader may already have left descendants: retain uncertainty.
@@ -91,7 +104,7 @@ export function launchOwned(launch, command, args, options, context) {
     if (options.detached || process.platform === "win32") child.once("exit", () => {
       const exitedAt = Date.now();
       try {
-        const live = snapshot();
+        const live = snapshot("exit");
         journal(context, { kind: "witness", id, exitedAt, members: process.platform === "win32" ? windowsTree(live, [identity], exitedAt) : live.filter((item) => item.group === child.pid) });
       }
       catch {
@@ -117,7 +130,7 @@ export async function stopOwned(context, timeoutMs) {
       if (uncertain) throw new Error("Owned process tree identity could not be proven; roots retained");
       return;
     }
-    const live = snapshot();
+    const live = snapshot("cleanup");
     let remaining = false;
     for (const owned of processes) {
       const leader = live.find((item) => item.pid === owned.pid);
@@ -167,23 +180,29 @@ export async function stopOwned(context, timeoutMs) {
 
 const supplied = new URL(import.meta.url).searchParams.get("ownership");
 if (supplied) {
-  const context = validate(JSON.parse(supplied));
-  globalThis[contextKey] = context;
-  if (process.platform === "win32" && context.launchId) {
-    const identity = snapshot().find((item) => item.pid === process.pid);
-    if (!identity?.birth) throw new Error("Cannot register Windows worker creation identity");
-    journal(context, { kind: "process", id: context.launchId, ...identity, detached: context.detached });
-    process.once("exit", () => {
-      const exitedAt = Date.now();
-      try { journal(context, { kind: "witness", id: context.launchId, exitedAt, members: windowsTree(snapshot(), [identity], exitedAt) }); }
-      catch { try { journal(context, { kind: "unproven", id: context.launchId, pid: process.pid }); } catch {} }
-    });
+  try {
+    const context = validate(JSON.parse(supplied));
+    globalThis[contextKey] = context;
+    if (process.platform === "win32" && context.launchId) {
+      const identity = snapshot("preload").find((item) => item.pid === process.pid);
+      if (!identity?.birth) throw new Error("Cannot register Windows worker creation identity");
+      journal(context, { kind: "process", id: context.launchId, ...identity, detached: context.detached });
+      process.once("exit", () => {
+        const exitedAt = Date.now();
+        try { journal(context, { kind: "witness", id: context.launchId, exitedAt, members: windowsTree(snapshot("exit"), [identity], exitedAt) }); }
+        catch { try { journal(context, { kind: "unproven", id: context.launchId, pid: process.pid }); } catch {} }
+      });
+    }
+    cp.spawn = (command, args = [], options = {}) => {
+      if (args && typeof args === "object" && !Array.isArray(args)) { options = args; args = []; }
+      return options[launching]
+        ? originalSpawn(command, args, options)
+        : launchOwned(originalSpawn, command, args, options, options.env?.PIPA_TEST_OWNERSHIP ? validate(JSON.parse(options.env.PIPA_TEST_OWNERSHIP)) : context);
+    };
+    syncBuiltinESMExports();
+  } catch (error) {
+    // An uncaught preload error prints its URL, including the private capability.
+    process.stderr.write(error.code === "PIPA_TEST_WINDOWS_IDENTITY" ? `${error.message}\n` : "Ownership preload initialization failed.\n");
+    process.exit(1);
   }
-  cp.spawn = (command, args = [], options = {}) => {
-    if (args && typeof args === "object" && !Array.isArray(args)) { options = args; args = []; }
-    return options[launching]
-      ? originalSpawn(command, args, options)
-      : launchOwned(originalSpawn, command, args, options, options.env?.PIPA_TEST_OWNERSHIP ? validate(JSON.parse(options.env.PIPA_TEST_OWNERSHIP)) : context);
-  };
-  syncBuiltinESMExports();
 }
