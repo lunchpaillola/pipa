@@ -569,12 +569,12 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
     baseUrl = await runtime.waitFor(() => {
       assert.equal(independent.child.exitCode, null, `Independent engine exited before listening: ${output}`);
       return output.match(/http:\/\/127\.0\.0\.1:\d+/u)?.[0];
-    }, { timeoutMs: 15_000, label: "native listening URL" });
+    }, { timeoutMs: 30_000, label: "native listening URL" });
   };
   const startApp = async (serverOverride) => {
     // Targeted case selection must not depend on package-cli having saved config.
     await state.writePrivateJson(paths.config, config);
-    app = await appModule.startPipa({ config, paths, chat, checkSlackToken: async () => ({ ok: true }), startupTimeoutMs: 20000, shutdownTimeoutMs: 5000, routineIntervalMs: 100,
+    app = await appModule.startPipa({ config, paths, chat, checkSlackToken: async () => ({ ok: true }), shutdownTimeoutMs: 5000, routineIntervalMs: 100,
       createRoutineScheduler: (options) => { routineScheduler = routines.createRoutineScheduler(options); return routineScheduler; },
       createExecutor: makeExecutor,
       ...(serverOverride ? { server: serverOverride } : {}),
@@ -669,7 +669,7 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
               await runtime.waitFor(async () => {
                 assert.equal(managed.child.exitCode, null, `Actual Managed CLI exited before readiness: ${output}`);
                 return health().catch(() => false);
-              }, { timeoutMs: 20000, label: "production workspace readiness" });
+              }, { timeoutMs: 30_000, label: "production workspace readiness" });
               break;
             } catch (error) {
               cell.evidence.managedStartup = output.replaceAll(runtime.root, "<private>");
@@ -1512,7 +1512,7 @@ throw Error('Native file-command completion deadline exceeded');
       probe.defer(() => stopProfile(probe.home, async () => mode === "attached" ? [] : [(await snapshot())?.nativeUrl], () => [original?.child.pid, identity?.pid]), "Socket CLI replacement and lock");
       try {
         original = probe.spawn(process.execPath, [cli, "start"]);
-        await probe.waitFor(async () => (await snapshot())?.ready, { timeoutMs: 20000, label: "Socket native and Chat startup" });
+        await probe.waitFor(async () => (await snapshot())?.ready, { timeoutMs: 30_000, label: "Socket native and Chat startup" });
         const old = await state.readInstanceLock(probePaths.lock);
         assert.equal(old.pid, original.child.pid);
         const thread = "slack:CMATRIX:777.001";

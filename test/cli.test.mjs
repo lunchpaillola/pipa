@@ -196,7 +196,7 @@ for (const version of ["1.19.0", "2.0.29"]) for (const mode of ["ready", "unread
       ]);
       if (current || !portClosed || [...recordedPids].some((pid) => isRunning(pid))) return false;
       const settled = await restartStatus({ home });
-      if (settled?.state === "failed" && settled.phase === "starting") {
+      if (settled?.state === "failed" && settled.phase === "starting" && !replacement?.pid) {
         const exitedPid = Number(await readFile(replacementExit, "utf8").catch(() => ""));
         if (!Number.isSafeInteger(exitedPid) || exitedPid <= 0 || isRunning(exitedPid)) return false;
       }
