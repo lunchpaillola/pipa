@@ -7,17 +7,6 @@ on:
         description: Collect the broad deterministic matrix and migration (not release certification)
         type: boolean
         default: false
-  pull_request:
-    paths:
-      - "src/**"
-      - "bin/**"
-      - "package*.json"
-      - "scripts/test-opencode-matrix.mjs"
-      - "scripts/verification/**"
-      - "test/helpers/**"
-      - "test/opencode-contract.test.mjs"
-      - "test/fixtures/opencode*/**"
-      - ".github/workflows/opencode-compatibility.yml"
 
 permissions:
   contents: read
@@ -39,9 +28,9 @@ jobs:
       - run: npm ci
       - run: node --test scripts/verification/self-check.mjs
       # Two pins x three modes: 24 journey observations per host, no provider secrets.
-      - if: github.event_name != 'workflow_dispatch' || !inputs.full_qualification
+      - if: ${{ !inputs.full_qualification }}
         run: npm run test:beta -- --report=beta-smoke.json
-      - if: github.event_name == 'workflow_dispatch' && inputs.full_qualification
+      - if: ${{ inputs.full_qualification }}
         run: npm run test:engines -- --migration --gate=deterministic --report=opencode-compatibility.json
       - uses: actions/upload-artifact@v4
         if: always()

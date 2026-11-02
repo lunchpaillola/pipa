@@ -34,7 +34,8 @@ worker/preflight/cleanup/report diagnostics to PASS; missing/duplicate required
 evidence fails. Other catalog rows, including uncollected BLOCKED placeholders,
 are outside scope with explicit reasons and unchanged statuses.
 
-PR CI uses `beta-smoke.json` on three OS hosts (18 cells). Manual workflow input
+The manual-only **OpenCode compatibility** workflow uses `beta-smoke.json` on
+three OS hosts (18 cells). It does not run for normal PR updates. Workflow input
 `full_qualification` opts into the full deterministic/migration matrix. Richer files,
 approvals and routines remain covered by retained unit tests and the broad manual
 matrix, not the native beta promise; the existing Socket restart case still checks

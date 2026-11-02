@@ -14,12 +14,19 @@ npm run test:pack
 
 Keep changes small, include a regression test for behavior changes, and never commit Slack tokens or files from `~/.pipa`.
 
-For runtime compatibility changes, also run `node --test scripts/verification/self-check.mjs`
+Every PR and push to `main` automatically runs unit tests and package checks on
+Linux only. Add focused regression tests for the behavior your change affects.
+Maintainers can select **CI -> Run workflow** on the target branch for the same
+checks on Linux, macOS and Windows when changing platform/process behavior or
+preparing a release. Normal contributor PRs do not launch real engines.
+
+For maintainer runtime compatibility checks or pre-release verification, run `node --test scripts/verification/self-check.mjs`
 and `npm run test:beta -- --report=beta-smoke.json`: real 1.19.0 / 2.2.5 engines,
 three modes, six cells and 24 applicable case observations per host, with scripted
 local provider/Chat fixtures and no credentials or paid-provider quota.
-PR CI runs this slim smoke; use the workflow's manual `full_qualification` input
-or `npm run test:engines -- --migration` for the broad matrix. Smoke covers basic
+The **OpenCode compatibility** workflow is manual-only. Its default runs this
+smoke on all three platforms; select `full_qualification` or use
+`npm run test:engines -- --migration` for the broad matrix. Smoke covers basic
 startup, prompts/history, applicable restart and stop ownership. Richer files,
 approvals and routines stay in retained unit tests and the broad manual matrix,
 not the native beta promise; the existing Socket restart case retains its routine

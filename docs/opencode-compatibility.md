@@ -26,9 +26,10 @@ worker-PID scan and records `workerExitObserved:false`, not `workersExited:true`
 It still checks durable completion, changed PID/generation, readiness, follow-up
 and ownership. This is not proof of live Slack or detached-worker exit.
 
-PR CI runs this smoke on Linux, macOS and Windows (18 cells total). The same
-workflow's manual `full_qualification` input runs the broad four-pin deterministic
-matrix with migration; locally use `npm run test:engines -- --migration`.
+The manual **OpenCode compatibility** workflow runs this smoke on Linux, macOS
+and Windows (18 cells total). It does not run automatically on PRs. Select its
+`full_qualification` input for the broad four-pin deterministic matrix with
+migration; locally use `npm run test:engines -- --migration`.
 Full deterministic/release gate semantics are unchanged. Richer files, approvals
 and routine coverage remains in retained unit tests and the broad manual matrix,
 not the native beta promise; the existing Socket restart case still checks its

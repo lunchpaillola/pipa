@@ -4,7 +4,7 @@ This is the reusable testing procedure for the dual-adapter candidate. The imple
 
 ## Three kinds of proof
 
-1. **Deterministic:** `npm test` verifies implementation behavior, failure paths, concurrency, scheduling with controlled clocks, and process ownership. `npm run test:pack` verifies the installed npm package. Run the existing Linux/macOS/Windows CI matrix.
+1. **Deterministic:** `npm test` verifies implementation behavior, failure paths, concurrency, scheduling with controlled clocks, and process ownership. `npm run test:pack` verifies the installed npm package. PRs and pushes to `main` run these on Linux; maintainers manually dispatch **CI** for Linux/macOS/Windows checks on platform/process changes and before releases.
 2. **Real OpenCode:** Qualify the exact CLI/client versions with isolated profile/database paths. Prove prompt admission versus final output, history migration, permissions/forms, attachments, cancellation, background work, and model switching against the real server.
 3. **Real Slack:** Prove message routing, scheduled delivery, result-thread continuation, artifacts, and detached restart in the selected channel. An HTTP fixture cannot substitute for these round-trips.
 
@@ -29,9 +29,11 @@ Harness ownership:
 
 Keep the default `npm test`/`npm run test:pack` lane free of downloaded engines and live credentials. The opt-in `test:engines` lane exercises pins **1.18.35, 1.19.0, 2.0.29, and 2.2.5** against Socket-owned, Managed, and attached modes on Linux/macOS/Windows where supported. Native **2.2.5** is the current v2 qualification target; **2.0.29** remains a historical comparison pin. The SDK remains `@opencode/client@2.0.29` pending real qualification. Pin inclusion does not claim passing native tests or release readiness; historical reports qualify only their recorded cases and versions. Node 22 is the baseline. The downloaded executable's identity and package integrity must match the selected cell; no global executable is replaced. Use `--migration` for synthetic upgrade/rollback. See [runner options](../scripts/verification/README.md).
 
-PR CI uses `npm run test:beta`: start, exact prompt/history, restart and stop on
-1.19.0 and 2.2.5 in three modes. This labelled smoke is not full qualification;
-the broader matrix remains a manual workflow. See the [beta scope](opencode-compatibility.md#small-beta-smoke).
+Real engines are not part of automatic PR CI. Maintainers can manually dispatch
+**OpenCode compatibility**, or run `npm run test:beta`, to check start, exact
+prompt/history, restart and stop on 1.19.0 and 2.2.5 in three modes. This labelled
+smoke is not full qualification; the broader matrix is also manual. See the
+[beta scope](opencode-compatibility.md#small-beta-smoke).
 
 Fixtures launch ordinary processes without a global spawn override or ownership
 preload. Cleanup uses live child handles and explicit private-profile shutdown;

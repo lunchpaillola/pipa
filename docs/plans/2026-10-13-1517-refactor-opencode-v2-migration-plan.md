@@ -426,8 +426,8 @@ The commands and checklist below are implemented entry points, not passing quali
 | Shared executor contract | `node --test test/opencode-contract.test.mjs test/opencode.test.mjs` | Both fixture generations pass the same mandatory assertions; native wire cases are independent |
 | Shared app/state/routines | `node --test test/app.test.mjs test/state.test.mjs test/routines.test.mjs` | Authorization, callback ordering, scheduler dispatch, and stale-output protection compose with either adapter |
 | CLI/restart | `node --test test/cli.test.mjs test/restart.test.mjs` | Both fake native contracts preserve process/generation/readiness failure semantics |
-| Default PR CI | Existing `npm test`, `npm run test:pack` | Linux/macOS/Windows, Node 22; no live Slack/provider or downloaded engine requirement |
-| Pinned production-engine matrix | Implemented `npm run test:engines` → `scripts/test-opencode-matrix.mjs` | Adapter/harness/package-affecting PRs and release candidates; all required version/mode/platform cells pass |
+| Default PR CI | Existing `npm test`, `npm run test:pack` | Linux, Node 22; manual CI dispatch adds macOS/Windows for platform/process changes and pre-release checks; no live Slack/provider or downloaded engine requirement |
+| Pinned production-engine matrix | Implemented `npm run test:engines` → `scripts/test-opencode-matrix.mjs` | Manual maintainer or release-candidate verification, not an automatic contributor-PR gate; all required version/mode/platform cells pass for full qualification |
 | Actual upgrade/rollback | Implemented engine-runner `--migration` mode | Each seeded v1 pin migrates on a disposable copy to v2 and continues; matched-snapshot rollback works |
 | Real Slack/provider release gate | Implemented `npm run test:slack:release` → `scripts/slack-release-eval.mjs` | Protected manual/release run; critical cases pass sequentially on both generations with visible-client evidence |
 | Operator definitions/integrations | Existing checklist in `docs/opencode-compatibility.md` | Required credentials, MCP, plugins, agents, skills, commands work on the selected deployment |

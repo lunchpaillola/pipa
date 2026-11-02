@@ -21,8 +21,8 @@ This shared-checkout candidate combines native v1/v2 migration work with main's 
 
 GitHub-specific automation.
 
-- `.github/workflows/ci.yml`: Runs continuous integration for every pull request and every push to `main`. GitHub creates one job each for Ubuntu, macOS, and Windows. Each job checks out the repository, installs Node.js 22, installs the exact dependencies from `package-lock.json`, runs the unit and integration tests, then packs and smoke-tests the installable CLI. The operating-system matrix catches platform-specific problems before release.
-- `.github/workflows/opencode-compatibility.yml`: No-secret pinned native-engine matrix, separate from default tests. Live Slack/client and operator gates remain external qualification evidence.
+- `.github/workflows/ci.yml`: Every pull request and push to `main` runs one Ubuntu job: Node.js 22, exact dependencies, unit/integration tests, and installed-package smoke. Manual dispatch runs the same checks on Ubuntu, macOS and Windows for platform/process changes and pre-release verification.
+- `.github/workflows/opencode-compatibility.yml`: Manual-only, no-secret pinned native-engine smoke or full qualification matrix. Normal contributor PRs do not launch real engines. Live Slack/client and operator gates remain external qualification evidence.
 - `.github/workflows/stats.yml`: Runs daily and on manual dispatch to validate and update the committed npm-download statistics. It uses only `contents: write`, serializes runs, and commits `STATS.md` only when the generated file changed.
 
 ### `bin/`
