@@ -487,6 +487,12 @@ export function createPendingInteractions(allowedUserIds = []) {
       return;
     }
     if (event.actionId?.startsWith("pipa_submit_")) {
+      // Submit carries the current UI state even if earlier selection events arrive late.
+      const values = event.raw?.state?.values;
+      const blockId = `pipa_question_${entry.token}_${entry.questionIndex}`;
+      if (values && !Object.hasOwn(values, blockId)) return;
+      const selection = values?.[blockId]?.[`pipa_select_${entry.token}`];
+      if (selection) entry.answers[entry.questionIndex] = selectedAnswers(event, selection);
       if (!entry.answers[entry.questionIndex]?.length) return;
       await advance(entry, event.user);
       return;
@@ -601,7 +607,7 @@ function renderSlackInteraction(entry) {
     ...(options.length ? [slackButton(`pipa_submit_${entry.token}`, "Submit", entry.token, "primary")] : []),
     slackButton(`pipa_dismiss_${entry.token}`, "Dismiss", entry.token, "danger"),
   ];
-  return [slackHeader(question.header || "Question"), ...(entry.error ? [slackText(entry.error)] : []), slackText(question.question ?? question.header ?? "Choose an answer."), ...(selector ? [slackActions([selector])] : []), slackActions(actions)];
+  return [slackHeader(question.header || "Question"), ...(entry.error ? [slackText(entry.error)] : []), slackText(question.question ?? question.header ?? "Choose an answer."), ...(selector ? [{ ...slackActions([selector]), block_id: `pipa_question_${entry.token}_${entry.questionIndex}` }] : []), slackActions(actions)];
 }
 
 function renderSlackSubmitted(entry, decision) {
@@ -667,9 +673,8 @@ function slackButton(actionId, text, value, style) {
   return { type: "button", action_id: actionId, text: { type: "plain_text", text }, value, ...(style ? { style } : {}) };
 }
 
-function selectedAnswers(event) {
-  const action = event.raw?.actions?.find((item) => item.action_id === event.actionId);
-  const values = action?.selected_options?.map((option) => option.value) ?? [event.value];
+function selectedAnswers(event, action = event.raw?.actions?.find((item) => item.action_id === event.actionId)) {
+  const values = action?.selected_options?.map((option) => option.value) ?? [action?.selected_option?.value ?? event.value];
   return values.filter(Boolean).map((value) => String(value).split(".").slice(1).join(".")).filter(Boolean);
 }
 

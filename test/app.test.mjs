@@ -1776,6 +1776,99 @@ test("interaction registry uses Block Kit selectors in Slack", async () => {
   assert.equal(updated[1].blocks[1].text.text, "Lola selected: “A”, “C”, “D”.");
 });
 
+test("question Submit uses current Slack state after an older selection finishes authorization last", async () => {
+  const posted = [];
+  const thread = slackInteractionThread({ posted });
+  const interactions = createPendingInteractions(["U1"]);
+  const older = Promise.withResolvers();
+  let pause = false;
+  let paused = false;
+  const submitted = [];
+  const decision = interactions.onInteraction({ thread, authorize: async () => {
+    if (pause) { pause = false; paused = true; await older.promise; }
+  } }, {
+    type: "question", sessionId: "ses_selection", signal: AbortSignal.timeout(5000),
+    request: { id: "q_selection", questions: [{ question: "Which snacks?", multiple: true, options: [{ label: "Apple" }, { label: "Plum" }] }] },
+    submit: async value => { submitted.push(value); },
+  });
+  try {
+    await waitFor(() => posted.length === 1);
+    const select = slackAction(posted[0], "pipa_select_");
+    const submit = slackAction(posted[0], "pipa_submit_");
+    const blockId = posted[0].blocks.find(block => block.elements?.includes(select)).block_id;
+    const event = action => ({ actionId: action.action_id, value: action.value, threadId: thread.id, user: { userId: "U1" } });
+    pause = true;
+    const first = interactions.onAction({ ...event(select), raw: { actions: [{ action_id: select.action_id, selected_options: [select.options[0]] }] } });
+    await waitFor(() => paused);
+    await interactions.onAction({ ...event(select), raw: { actions: [{ action_id: select.action_id, selected_options: select.options }] } });
+    older.resolve();
+    await first;
+    const click = state => interactions.onAction({ ...event(submit), raw: { state: { values: { [blockId]: { [select.action_id]: state } } } } });
+    await click({ type: "checkboxes", selected_options: [] });
+    assert.equal(submitted.length, 0, "Clearing all checkboxes must not submit an older cached choice");
+    await click({ type: "checkboxes", selected_options: select.options });
+    assert.deepEqual(await decision, { type: "answer", answers: [["Apple", "Plum"]] });
+    assert.equal(submitted.length, 1);
+    assert.deepEqual(submitted[0].answers, [["Apple", "Plum"]]);
+  } finally { older.resolve(); await interactions.close(); await decision.catch(() => undefined); }
+});
+
+test("question Submit accepts a radio selection from Slack state without a prior selection event", async () => {
+  const posted = [];
+  const thread = slackInteractionThread({ posted });
+  const interactions = createPendingInteractions(["U1"]);
+  let submitted;
+  const decision = interactions.onInteraction({ thread }, {
+    type: "question", sessionId: "ses_radio", signal: AbortSignal.timeout(5000),
+    request: { id: "q_radio", questions: [{ question: "Pick", options: [{ label: "Pear" }] }] },
+    submit: async value => { submitted = value; },
+  });
+  try {
+    await waitFor(() => posted.length === 1);
+    const select = slackAction(posted[0], "pipa_select_");
+    const submit = slackAction(posted[0], "pipa_submit_");
+    const blockId = posted[0].blocks.find(block => block.elements?.includes(select)).block_id;
+    await interactions.onAction({ actionId: submit.action_id, value: submit.value, threadId: thread.id, user: { userId: "U1" }, raw: {
+      state: { values: { [blockId]: { [select.action_id]: { type: "radio_buttons", selected_option: select.options[0] } } } },
+    } });
+    assert.deepEqual(submitted, { type: "answer", answers: [["Pear"]] });
+    assert.deepEqual(await decision, submitted);
+  } finally { await interactions.close(); await decision.catch(() => undefined); }
+});
+
+test("question Submit cannot replay a previous question's Slack state into the next question", async () => {
+  const posted = [], updated = [];
+  const thread = slackInteractionThread({ posted, updated });
+  const interactions = createPendingInteractions(["U1"]);
+  const submitted = [];
+  const decision = interactions.onInteraction({ thread }, {
+    type: "question", sessionId: "ses_questions", signal: AbortSignal.timeout(5000),
+    request: { id: "q_two", questions: [
+      { question: "First", options: [{ label: "Apple" }] },
+      { question: "Second", options: [{ label: "Apple" }, { label: "Pear" }] },
+    ] }, submit: async value => { submitted.push(value); },
+  });
+  try {
+    await waitFor(() => posted.length === 1);
+    const event = (message, option) => {
+      const select = slackAction(message, "pipa_select_");
+      const submit = slackAction(message, "pipa_submit_");
+      const blockId = message.blocks.find(block => block.elements?.includes(select)).block_id;
+      return { actionId: submit.action_id, value: submit.value, threadId: thread.id, user: { userId: "U1" }, raw: {
+        state: { values: { [blockId]: { [select.action_id]: { type: "radio_buttons", selected_option: select.options[option] } } } },
+      } };
+    };
+    const first = event(posted[0], 0);
+    await interactions.onAction(first);
+    await waitFor(() => updated.length === 1);
+    await interactions.onAction(first);
+    assert.equal(submitted.length, 0, "Old Submit must not answer the next question, even when it shares an option");
+    await interactions.onAction(event(updated[0], 1));
+    assert.deepEqual((await decision).answers, [["Apple"], ["Pear"]]);
+    assert.equal(submitted.length, 1);
+  } finally { await interactions.close(); await decision.catch(() => undefined); }
+});
+
 test("interaction registry restricts custom answers to allowed users", async () => {
   const posted = [];
   const updated = [];
