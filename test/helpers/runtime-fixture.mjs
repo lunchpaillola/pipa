@@ -64,7 +64,12 @@ export async function createRuntimeFixture({ environment = process.env, allowEnv
         catch (error) { failures.push(new Error(`Runtime fixture cleanup failed: ${label}: ${error.message}`)); }
       }
       try { await stopOwned(ownership, cleanupTimeoutMs); }
-      catch (error) { failures.push(error); }
+      catch (error) {
+        const known = ["Owned process tree identity could not be proven; roots retained", "Owned PID identity changed; refusing to signal reused PID", "Owned process tree is still alive; roots retained", "Cannot prove Windows process creation identity", "Cannot prove Windows descendant creation identity", "Windows parent PID has an older unowned child; refusing taskkill tree", "Exited Windows parent has an unproven descendant identity"];
+        const diagnostic = known.includes(error.message) || ["PIPA_TEST_WINDOWS_IDENTITY", "PIPA_TEST_WINDOWS_TERMINATION"].includes(error.code) ? error.message : "Unclassified ownership cleanup failure";
+        process.stderr.write(`Runtime fixture ownership cleanup: ${diagnostic}\n`);
+        failures.push(error);
+      }
       if (failures.length) throw new AggregateError(failures, "Runtime fixture cleanup failed; private root retained.");
       await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     });
@@ -91,7 +96,7 @@ export async function createRuntimeFixture({ environment = process.env, allowEnv
     defer(async () => {
       if (!child.pid) { await exited.catch(() => undefined); return; }
       if (process.platform === "win32") {
-        // CIM identity checks, descendant discovery and taskkill belong to the
+        // WMI identity checks, descendant discovery and taskkill belong to the
         // journal supervisor, including children whose leaders already exited.
         return;
       } else {

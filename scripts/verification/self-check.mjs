@@ -19,8 +19,11 @@ import { MIGRATION_TARGET_PIN, selectMigrationTarget } from "./opencode-migratio
 const facade = { checkOpenCodeConnection };
 
 test("timed-out native workers retain bounded progress diagnostics", async (t) => {
-  const runtime = await createRuntimeFixture({ timeoutMs: 5000 });
+  const runtime = await createRuntimeFixture();
   t.after(() => runtime.teardown());
+  // Cold Windows PowerShell startup can exceed five seconds; warm the inspector
+  // before testing the command's separate 500 ms execution deadline.
+  if (process.platform === "win32") await command(runtime, process.execPath, ["-e", ""]);
   await assert.rejects(command(runtime, process.execPath, ["-e", "process.stderr.write('case-progress:synthetic-barrier'); setInterval(() => {}, 1000)"], { timeoutMs: 500 }), error => {
     assert.match(error.message, /timed out/u);
     assert.match(error.message, /case-progress:synthetic-barrier/u);
@@ -452,7 +455,7 @@ test("ownership preload initialization failure does not expose its capability UR
     assert.equal(diagnostic.phase, "preload");
     assert.equal(diagnostic.stage, "startup");
     assert.equal(diagnostic.errorCode, "ENOENT");
-    assert.equal(diagnostic.timeoutMs, 5000);
+    assert.equal(diagnostic.timeoutMs, 10_000);
     assert.ok(Number.isInteger(diagnostic.elapsedMs) && diagnostic.elapsedMs >= 0);
     assert.equal(diagnostic.stdoutBytes, 0);
     assert.equal(diagnostic.stderrBytes, 0);

@@ -26,7 +26,7 @@ function validate(context) {
 function snapshot(phase) {
   if (process.platform === "win32") {
     const started = performance.now();
-    const timeoutMs = 5000;
+    const timeoutMs = 10_000;
     // Module initialization (including JSON cmdlets) stalls in isolated profiles.
     // Direct WMI plus tab-separated identity fields avoids module loading entirely.
     const script = "$ErrorActionPreference='Stop'; [Console]::Error.WriteLine('PIPA_WMI_QUERY_STARTED'); foreach ($p in ([wmisearcher]'SELECT ProcessId,ParentProcessId,CreationDate FROM Win32_Process').Get()) { $birth = if ($null -ne $p.CreationDate) { [System.Management.ManagementDateTimeConverter]::ToDateTime($p.CreationDate).ToUniversalTime().ToString('o') } else { 'null' }; [Console]::Out.WriteLine(('{0}{1}{2}{1}{3}' -f $p.ProcessId,[char]9,$p.ParentProcessId,$birth)) }";
@@ -154,7 +154,11 @@ export async function stopOwned(context, timeoutMs) {
         const targets = Buffer.from(members.reverse().map(({ pid, birth }) => `${pid}\t${birth}`).join("\n")).toString("base64");
         const script = `$ErrorActionPreference='Stop'; $taskkill = $env:SystemRoot + '/System32/taskkill.exe'; $targets = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${targets}')).Split([char]10); foreach ($target in $targets) { $fields = $target.Split([char]9); $pidValue = [int]$fields[0]; $birthValue = $fields[1]; $query = [wmisearcher]('SELECT CreationDate FROM Win32_Process WHERE ProcessId=' + $pidValue); $p = @($query.Get()); if ($p.Count -eq 0) { continue }; if ($null -eq $p[0].CreationDate -or [System.Management.ManagementDateTimeConverter]::ToDateTime($p[0].CreationDate).ToUniversalTime().ToString('o') -cne $birthValue) { throw 'Owned PID identity changed; refusing to signal reused PID' }; $null = & $taskkill /PID $pidValue /T /F; if ($LASTEXITCODE -ne 0) { $p = @($query.Get()); if ($p.Count -ne 0 -and [System.Management.ManagementDateTimeConverter]::ToDateTime($p[0].CreationDate).ToUniversalTime().ToString('o') -ceq $birthValue) { throw 'taskkill failed to stop owned process tree' } } }`;
         const result = cp.spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: Math.max(1, deadline - Date.now()), windowsHide: true });
-        if (result.error || result.status !== 0) throw new Error(`Windows owned process-tree termination failed: ${result.error?.message ?? result.stderr.trim()}`);
+        if (result.error || result.status !== 0) throw Object.assign(new Error(`Windows owned process-tree termination failed: ${JSON.stringify({
+          timedOut: result.error?.code === "ETIMEDOUT", status: Number.isInteger(result.status) ? result.status : null,
+          identityChanged: result.stderr?.includes("Owned PID identity changed") ?? false,
+          stderrBytes: Buffer.byteLength(result.stderr ?? ""),
+        })}`), { code: "PIPA_TEST_WINDOWS_TERMINATION" });
         continue;
       }
       const members = owned.detached ? live.filter((item) => item.group === owned.pid) : live.filter((item) => item.pid === owned.pid);
