@@ -27,9 +27,9 @@ function snapshot(phase) {
   if (process.platform === "win32") {
     const started = performance.now();
     const timeoutMs = 5000;
-    // CimCmdlets module initialization hangs under the isolated Windows profile;
-    // direct WMI reads the same creation identities without loading that module.
-    const script = "$ErrorActionPreference='Stop'; [Console]::Error.WriteLine('PIPA_WMI_QUERY_STARTED'); @(([wmisearcher]'SELECT ProcessId,ParentProcessId,CreationDate FROM Win32_Process').Get() | ForEach-Object { @{ pid=[int]$_.ProcessId; ppid=[int]$_.ParentProcessId; birth=$(if ($null -ne $_.CreationDate) { [System.Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate).ToUniversalTime().ToString('o') } else { $null }); state='R' } }) | ConvertTo-Json -Compress";
+    // Module initialization (including JSON cmdlets) stalls in isolated profiles.
+    // Direct WMI plus tab-separated identity fields avoids module loading entirely.
+    const script = "$ErrorActionPreference='Stop'; [Console]::Error.WriteLine('PIPA_WMI_QUERY_STARTED'); foreach ($p in ([wmisearcher]'SELECT ProcessId,ParentProcessId,CreationDate FROM Win32_Process').Get()) { $birth = if ($null -ne $p.CreationDate) { [System.Management.ManagementDateTimeConverter]::ToDateTime($p.CreationDate).ToUniversalTime().ToString('o') } else { 'null' }; [Console]::Out.WriteLine(('{0}{1}{2}{1}{3}' -f $p.ProcessId,[char]9,$p.ParentProcessId,$birth)) }";
     const result = cp.spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
     if (result.error || result.status !== 0) {
       const diagnostic = {
@@ -41,10 +41,11 @@ function snapshot(phase) {
       };
       throw Object.assign(new Error(`Cannot verify Windows process identities with WMI: ${JSON.stringify(diagnostic)}`), { code: "PIPA_TEST_WINDOWS_IDENTITY" });
     }
-    let value;
-    try { value = JSON.parse(result.stdout.replace(/^\uFEFF/u, "")); }
-    catch { throw new Error("Invalid Windows process identity snapshot"); }
-    const rows = Array.isArray(value) ? value : [value];
+    const rows = result.stdout.replace(/^\uFEFF/u, "").trim().split(/\r?\n/u).map((line) => {
+      const fields = line.split("\t");
+      if (fields.length !== 3 || !/^\d+$/u.test(fields[0]) || !/^\d+$/u.test(fields[1])) throw new Error("Invalid Windows process identity snapshot");
+      return { pid: Number(fields[0]), ppid: Number(fields[1]), birth: fields[2] === "null" ? null : fields[2], state: "R" };
+    });
     if (!rows.every((item) => item && Number.isSafeInteger(item.pid) && Number.isSafeInteger(item.ppid) && (item.birth === null || Number.isFinite(Date.parse(item.birth))))) throw new Error("Invalid Windows process identity snapshot");
     return rows;
   }
@@ -150,8 +151,8 @@ export async function stopOwned(context, timeoutMs) {
         remaining = true;
         // One PowerShell session avoids paying its startup cost per descendant.
         // Recheck each creation identity immediately before invoking taskkill.
-        const targets = Buffer.from(JSON.stringify(members.reverse().map(({ pid, birth }) => ({ pid, birth })))).toString("base64");
-        const script = `$ErrorActionPreference='Stop'; $taskkill = Join-Path $env:SystemRoot 'System32/taskkill.exe'; $targets = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${targets}')) | ConvertFrom-Json; foreach ($target in $targets) { $query = [wmisearcher]('SELECT CreationDate FROM Win32_Process WHERE ProcessId=' + $target.pid); $p = @($query.Get()); if ($p.Count -eq 0) { continue }; if ($null -eq $p[0].CreationDate -or [System.Management.ManagementDateTimeConverter]::ToDateTime($p[0].CreationDate).ToUniversalTime().ToString('o') -cne $target.birth) { throw 'Owned PID identity changed; refusing to signal reused PID' }; & $taskkill /PID $target.pid /T /F | Out-Null; if ($LASTEXITCODE -ne 0) { $p = @($query.Get()); if ($p.Count -ne 0 -and [System.Management.ManagementDateTimeConverter]::ToDateTime($p[0].CreationDate).ToUniversalTime().ToString('o') -ceq $target.birth) { throw 'taskkill failed to stop owned process tree' } } }`;
+        const targets = Buffer.from(members.reverse().map(({ pid, birth }) => `${pid}\t${birth}`).join("\n")).toString("base64");
+        const script = `$ErrorActionPreference='Stop'; $taskkill = $env:SystemRoot + '/System32/taskkill.exe'; $targets = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${targets}')).Split([char]10); foreach ($target in $targets) { $fields = $target.Split([char]9); $pidValue = [int]$fields[0]; $birthValue = $fields[1]; $query = [wmisearcher]('SELECT CreationDate FROM Win32_Process WHERE ProcessId=' + $pidValue); $p = @($query.Get()); if ($p.Count -eq 0) { continue }; if ($null -eq $p[0].CreationDate -or [System.Management.ManagementDateTimeConverter]::ToDateTime($p[0].CreationDate).ToUniversalTime().ToString('o') -cne $birthValue) { throw 'Owned PID identity changed; refusing to signal reused PID' }; $null = & $taskkill /PID $pidValue /T /F; if ($LASTEXITCODE -ne 0) { $p = @($query.Get()); if ($p.Count -ne 0 -and [System.Management.ManagementDateTimeConverter]::ToDateTime($p[0].CreationDate).ToUniversalTime().ToString('o') -ceq $birthValue) { throw 'taskkill failed to stop owned process tree' } } }`;
         const result = cp.spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: Math.max(1, deadline - Date.now()), windowsHide: true });
         if (result.error || result.status !== 0) throw new Error(`Windows owned process-tree termination failed: ${result.error?.message ?? result.stderr.trim()}`);
         continue;

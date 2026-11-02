@@ -18,29 +18,6 @@ import { MIGRATION_TARGET_PIN, selectMigrationTarget } from "./opencode-migratio
 
 const facade = { checkOpenCodeConnection };
 
-test("Windows isolated identity diagnostics separate enumeration, conversion and JSON", async (t) => {
-  if (process.platform !== "win32") return;
-  const runtime = await createRuntimeFixture({ timeoutMs: 90_000 });
-  t.after(() => runtime.teardown());
-  const probes = {
-    enumeration: "[Console]::Out.Write(([wmisearcher]'SELECT ProcessId,ParentProcessId,CreationDate FROM Win32_Process').Get().Count)",
-    conversion: `[Console]::Out.Write([System.Management.ManagementDateTimeConverter]::ToDateTime(([wmi]"Win32_Process.Handle='${process.pid}'").CreationDate).ToUniversalTime().ToString('o'))`,
-    encode: "@{pid=1} | ConvertTo-Json -Compress",
-    decode: "[Console]::Out.Write(('{\"pid\":1}' | ConvertFrom-Json).pid)",
-  };
-  for (const [probe, script] of Object.entries(probes)) {
-    const started = performance.now();
-    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference='Stop'; [Console]::Error.WriteLine('PIPA_WMI_QUERY_STARTED'); ${script}`], {
-      cwd: runtime.workspace, env: runtime.env, encoding: "utf8", timeout: 15_000, windowsHide: true,
-    });
-    t.diagnostic(JSON.stringify({ probe, elapsedMs: Math.round(performance.now() - started),
-      status: Number.isInteger(result.status) ? result.status : null,
-      timedOut: result.error?.code === "ETIMEDOUT",
-      stdoutBytes: Buffer.byteLength(result.stdout ?? ""), stderrBytes: Buffer.byteLength(result.stderr ?? ""),
-    }));
-  }
-});
-
 test("timed-out native workers retain bounded progress diagnostics", async (t) => {
   const runtime = await createRuntimeFixture({ timeoutMs: 5000 });
   t.after(() => runtime.teardown());
