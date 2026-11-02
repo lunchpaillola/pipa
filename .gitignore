@@ -1,9 +1,13 @@
 node_modules/
 *.tgz
 .env
+.env.*
+!.env.example
 .DS_Store
 .opencode/.gitignore
 .opencode/goals/
 .opencode/skills/
-docs/plans/
+docs/plans/*
+!docs/plans/2026-10-13-1517-refactor-opencode-v2-migration-plan.md
 tmp/slack-routine-evals/
+tmp/slack-release-evals/

@@ -1,0 +1,27 @@
+{
+  "generation": "v2",
+  "provenance": "Independent synthetic pages matching observed 2.0.29 wire semantics and @opencode/protocol@2.0.29 groups/message: order is first-page-only, cursors are opaque, nonempty short pages still have next cursors, and exhaustion is an empty page.",
+  "routes": [
+    {
+      "method": "GET", "path": "/api/session/ses_contract/message", "query": { "limit": "100", "order": "asc" }, "repeatLast": true, "required": true,
+      "responses": [{ "json": {
+        "data": [{ "id": "msg_input", "type": "user", "time": { "created": 2 }, "text": "  contract `prompt` $(untouched) café  \n" }],
+        "cursor": { "previous": "opaque-before-input", "next": "opaque-after-input" }
+      } }]
+    },
+    {
+      "method": "GET", "path": "/api/session/ses_contract/message", "query": { "limit": "100", "cursor": "opaque-after-input" }, "repeatLast": true, "required": true,
+      "responses": [{ "json": {
+        "data": [
+          { "id": "msg_result", "type": "assistant", "agent": "default", "model": { "providerID": "fixture", "id": "deterministic" }, "time": { "created": 2, "completed": 3 }, "finish": "stop", "content": [{ "type": "text", "text": "contract complete" }] },
+          { "id": "msg_idle", "type": "idle", "time": { "created": 4 }, "outcome": "succeeded" }
+        ],
+        "cursor": { "previous": "opaque-before-result", "next": "opaque-after-idle" }
+      } }]
+    },
+    {
+      "method": "GET", "path": "/api/session/ses_contract/message", "query": { "limit": "100", "cursor": "opaque-after-idle" }, "repeatLast": true, "required": true,
+      "responses": [{ "json": { "data": [], "cursor": { "previous": null, "next": null } } }]
+    }
+  ]
+}

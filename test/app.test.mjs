@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { getEventListeners } from "node:events";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -8,7 +9,8 @@ import { SocketModeClient } from "@slack/socket-mode";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { Chat } from "chat";
 import { checkSlackAppToken, checkSlackToken, createConversationRunner, createPendingInteractions, createPipaSlackAdapter, initializePipa, postResult, slackDestinationId, startPipa as startPipaRuntime } from "../src/app.mjs";
-import { PipaRestartingError, PipaStoppedError } from "../src/opencode.mjs";
+import { PipaRestartingError, PipaStoppedError, startSocketOpenCodeServer } from "../src/opencode.mjs";
+import { createRuntimeFixture } from "./helpers/runtime-fixture.mjs";
 import { createRoutineScheduler, normalizeRoutine } from "../src/routines.mjs";
 import { createSessionStore, pipaPaths, writePrivateJson } from "../src/state.mjs";
 
@@ -91,7 +93,7 @@ test("init validates dependencies before replacing config", async () => {
   const failures = [
     () => initializePipa({ ...input, workingDirectory: file }, valid),
     () => initializePipa(input, { ...valid, checkOpenCode: async () => { throw new Error("OpenCode missing"); } }),
-    () => initializePipa(input, { ...valid, checkOpenCode: async () => "2.0.0" }),
+    () => initializePipa(input, { ...valid, checkOpenCode: async () => "3.0.0" }),
     () => initializePipa(input, { ...valid, checkSlackAppToken: async () => { throw new Error("app rejected"); } }),
     () => initializePipa({ ...input, slackBotToken: "xoxb-rejected" }, { ...valid, checkSlackToken: async () => { throw new Error("bot rejected"); } }),
   ];
@@ -101,6 +103,84 @@ test("init validates dependencies before replacing config", async () => {
     assert.equal(await readFile(paths.manifest, "utf8"), manifestBefore);
   }
   assert.doesNotMatch(before.replace("xapp-test", "").replace("xoxb-test", ""), /xoxb|xapp/u);
+});
+
+for (const version of ["OpenCode v1.19.0", "OpenCode 2.0.29"]) test(`init accepts qualified CLI identity: ${version}`, async (t) => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-init-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await initializePipa({ botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: home }, {
+    paths: pipaPaths(home), checkOpenCode: async () => version,
+    checkSlackAppToken: async () => ({ ok: true }), checkSlackToken: async () => ({ ok: true }),
+  });
+  assert.equal(JSON.parse(await readFile(pipaPaths(home).config, "utf8")).botName, "Pipa");
+});
+
+for (const readiness of ["ready", "auth", "workspace"]) test(`U1 Socket v2 ${readiness} checks readiness without migration calls and preserves state`, async (t) => {
+  const runtime = await createRuntimeFixture();
+  t.after(() => runtime.teardown());
+  const paths = pipaPaths(runtime.home);
+  const config = { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: runtime.workspace };
+  await writePrivateJson(paths.config, config);
+  await writePrivateJson(paths.sessions, { "slack:C1:1": "ses_history" });
+  await writePrivateJson(paths.routines, { version: 1, routines: [] });
+  const files = [paths.config, paths.sessions, paths.routines];
+  const before = await Promise.all(files.map((file) => readFile(file, "utf8")));
+  const events = [];
+  const requests = [];
+  const starting = startPipaRuntime({
+    paths, config, checkSlackToken: async () => ({ ok: true }),
+    chat: { onNewMention() {}, onSubscribedMessage() {},
+      async initialize() { events.push("initialized"); }, async shutdown() {},
+      thread(id) { return { async subscribe() { events.push(id); } }; } },
+    createExecutor: ({ connection }) => {
+      assert.equal(connection.major, 2);
+      return { stopAll() {} };
+    },
+    createRoutineScheduler: () => ({ start() { events.push("scheduler"); }, stop() {}, async drain() {} }),
+    startServer: (config, options) => startSocketOpenCodeServer(config, { ...options,
+      attachUrl: "http://localhost:5555", environment: {},
+      fetch: async (url) => {
+        const pathname = new URL(url).pathname;
+        requests.push(pathname);
+        if (pathname === "/global/health") return new Response("<html>");
+        if (pathname === "/api/info") return readiness === "auth" ? Response.json({}, { status: 401 })
+          : Response.json({ version: "2.0.29", pid: 1, urls: [], paths: { tmp: "/tmp" } });
+        assert.equal(pathname, "/api/location");
+        assert.equal(new URL(url).searchParams.get("location[directory]"), runtime.workspace);
+        return Response.json({ directory: readiness === "workspace" ? runtime.home : runtime.workspace,
+          project: { id: "prj_test", directory: runtime.workspace, canonical: runtime.workspace } });
+      },
+    }),
+  });
+  if (readiness === "ready") {
+    const app = await starting;
+    t.after(() => app.shutdown());
+    assert.deepEqual(events, ["slack:C1:1", "initialized", "scheduler"]);
+  } else {
+    await assert.rejects(starting, readiness === "auth" ? /authentication/iu : /workspace identity mismatch/iu);
+    assert.deepEqual(events, []);
+  }
+  assert.deepEqual(requests, ["/global/health", "/api/info", ...(readiness === "auth" ? [] : ["/api/location"])]);
+  assert.deepEqual(await Promise.all(files.map((file) => readFile(file, "utf8"))), before);
+});
+
+test("U1 init attached identity ignores local CLI and preserves config on auth failure", async (t) => {
+  const runtime = await createRuntimeFixture();
+  t.after(() => runtime.teardown());
+  const paths = pipaPaths(runtime.home);
+  const input = { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: runtime.workspace };
+  const options = { paths, environment: { PIPA_OPENCODE_ATTACH_URL: "http://localhost:5555" },
+    checkOpenCode: () => assert.fail("must not read local version"), checkSlackAppToken: async () => ({}), checkSlackToken: async () => ({}) };
+  await initializePipa(input, { ...options, fetch: async (url) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/global/health") return new Response("<html>");
+    if (pathname === "/api/info") return Response.json({ version: "2.0.29", pid: 1, urls: [], paths: { tmp: "/tmp" } });
+    assert.equal(pathname, "/api/location");
+    return Response.json({ directory: runtime.workspace, project: { id: "prj_test", directory: runtime.workspace, canonical: runtime.workspace } });
+  } });
+  const before = await readFile(paths.config, "utf8");
+  await assert.rejects(initializePipa(input, { ...options, fetch: async () => Response.json({}, { status: 401 }) }), /authentication/iu);
+  assert.equal(await readFile(paths.config, "utf8"), before);
 });
 
 test("Slack auth errors never include the token", async () => {
@@ -225,6 +305,7 @@ test("starts and health-checks OpenCode before Slack, then stops only the owned 
   });
   const server = {
     baseUrl: "http://127.0.0.1:54321",
+    connection: { major: 1, version: "1.19.0", headers: { authorization: "synthetic" } },
     owned: true,
     wait: () => serverWait,
     fail: failServer,
@@ -248,10 +329,11 @@ test("starts and health-checks OpenCode before Slack, then stops only the owned 
       events.push("server:ready");
       return server;
     },
-    createExecutor: ({ artifactRoot, baseUrl, onFatal }) => {
+    createExecutor: ({ artifactRoot, baseUrl, onFatal, connection }) => {
       events.push(`executor:${baseUrl}`);
       assert.equal(artifactRoot, path.join("/work", ".pipa", "artifacts"));
       assert.equal(onFatal, server.fail);
+      assert.equal(connection, server.connection);
       return { runTurn: async () => undefined, stopAll: () => events.push("executor:stop") };
     },
   });
@@ -654,7 +736,7 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   await waitFor(() => posts.length === 1);
   await handlers.subscribed(thread, { id: "2", text: "<@U2> follow up", author: human, raw: {} });
   await waitFor(() => posts.length === 2);
-  const attachment = { name: "notes.txt", size: 100 * 1024 * 1024, fetchData: async () => Buffer.from("notes") };
+  const attachment = { name: "notes.txt", size: 10 * 1024 * 1024, fetchData: async () => Buffer.from("notes") };
   await handlers.mention(thread, { id: "file-1", text: "@U1 summarize", attachments: [attachment], author: human, raw: {} });
   await waitFor(() => posts.length === 3);
   await handlers.subscribed(thread, { id: "file-2", text: "compare this", attachments: [attachment], author: human, raw: { subtype: "file_share" } });
@@ -673,8 +755,8 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   }
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(calls.length, beforeIgnored);
-  await handlers.mention(thread, { id: "too-large", text: "@U1 summarize", attachments: [{ ...attachment, size: 100 * 1024 * 1024 + 1 }], author: human, raw: {} });
-  await waitFor(() => posts.includes("Pipa can read files up to 100 MB each."));
+  await handlers.mention(thread, { id: "too-large", text: "@U1 summarize", attachments: [{ ...attachment, size: 10 * 1024 * 1024 + 1 }], author: human, raw: {} });
+  await waitFor(() => posts.includes("Pipa can read files up to 10 MiB each."));
   assert.equal(calls.length, beforeIgnored);
   await handlers.subscribed(thread, { id: "missing-size", text: "no declared size", attachments: [{ ...attachment, size: undefined }], author: human, raw: { subtype: "file_share" } });
   await waitFor(() => calls.length === beforeIgnored + 1);
@@ -693,7 +775,7 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
     { markdown: "<@U2> follow up:ses_1" },
   ]);
   assert.deepEqual(posts.slice(2, 4), [{ markdown: "summarize:ses_1" }, { markdown: "compare this:ses_1" }]);
-  assert.equal(posts[4], "Pipa can read files up to 100 MB each.");
+  assert.equal(posts[4], "Pipa can read files up to 10 MiB each.");
   assert.deepEqual(posts[5], { markdown: "no declared size:ses_1" });
   assert.equal(posts[6], "Piper failed: Could not read one of the attached files. Please try uploading it again.");
   assert.deepEqual(posts.slice(7, 10).map((part) => part.markdown.length), [3500, 3500, 1]);
@@ -801,7 +883,7 @@ test("failed artifact post retries declaration-free text once without files", as
   await delivery.app.shutdown();
 });
 
-test("interrupted Slack messages keep their eyes until the latest turn succeeds", async () => {
+test("interrupted Slack messages lose their eyes without a stale success reaction", async () => {
   const handlers = {};
   const reactions = [];
   const posts = [];
@@ -852,10 +934,10 @@ test("interrupted Slack messages keep their eyes until the latest turn succeeds"
   assert.deepEqual(reactions, ["add:1:eyes", "add:2:eyes"]);
 
   finishSecond();
-  await waitFor(() => reactions.length === 6);
+  await waitFor(() => reactions.includes("add:2:white_check_mark"));
   assert.deepEqual(reactions, [
     "add:1:eyes", "add:2:eyes",
-    "remove:1:eyes", "add:1:white_check_mark",
+    "remove:1:eyes",
     "remove:2:eyes", "add:2:white_check_mark",
   ]);
   assert.deepEqual(posts, [{ markdown: "second complete" }]);
@@ -1117,6 +1199,54 @@ for (const allowedSlackUserIds of [["U1"], []]) test(`handles only allowed Slack
   await waitFor(() => posts.length === 2);
   assert.deepEqual(calls, ["alert fired", "triage this"]);
   assert.deepEqual(posts, [{ markdown: "alert fired" }, { markdown: "triage this" }]);
+});
+
+for (const phase of ["auth", "socket"]) test(`Socket startup cancellation during ${phase} prevents late connections and intake`, { timeout: 1_000 }, async (t) => {
+  const adapter = createPipaSlackAdapter({ mode: "socket", appToken: "xapp-test", botToken: "xoxb-test" });
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const events = [];
+  let socket = adapter.socketClient;
+  // Stub only this adapter's newly allocated client, before the SDK starts it.
+  Object.defineProperty(adapter, "socketClient", {
+    get: () => socket,
+    set(value) {
+      socket = value;
+      if (!value) return;
+      events.push("created");
+      value.start = async () => {
+        if (phase === "socket") { entered.resolve(); await release.promise; }
+      };
+      value.disconnect = async () => { events.push("disconnected"); };
+    },
+  });
+  adapter._client.auth.test = async () => {
+    if (phase === "auth") { entered.resolve(); await release.promise; }
+    return { user_id: "UPIPA" };
+  };
+  const chat = new Chat({ adapters: { slack: adapter }, state: createMemoryState(), logger: "silent" });
+  const controller = new AbortController();
+  const reason = new Error("cancel pending Slack startup");
+  const starting = startPipa({
+    chat, signal: controller.signal,
+    checkSlackToken: async () => ({ ok: true }),
+    executor: { stopAll() {} },
+    sessionStore: { keys: () => [] },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+  });
+  const rejected = assert.rejects(starting, (error) => error === reason);
+  t.after(async () => { release.resolve(); await rejected; await chat.shutdown(); });
+  await entered.promise;
+  const initialization = chat.initialize();
+  controller.abort(reason);
+  await rejected;
+  assert.deepEqual(events, phase === "auth" ? [] : ["created", "disconnected"]);
+  release.resolve();
+  await initialization;
+  await adapter.routeSocketEvent({ get type() { assert.fail("late intake after cancellation"); } }, "interactive", async () => assert.fail("late acknowledgment"));
+  await chat.shutdown();
+  assert.deepEqual(events, phase === "auth" ? [] : ["created", "disconnected"]);
+  assert.equal(adapter.socketClient, null);
 });
 
 test("Socket shutdown drains a modal-close acknowledgment before disconnecting", async (t) => {
@@ -1525,6 +1655,53 @@ test("startup timeout shuts Chat down", async () => {
   assert.deepEqual(events, ["stopped", "shutdown"]);
 });
 
+test("default Chat startup can finish after 30 seconds", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const entered = Promise.withResolvers();
+  const initialized = Promise.withResolvers();
+  const starting = startPipa({
+    chat: { onNewMention() {}, onSubscribedMessage() {},
+      initialize() { entered.resolve(); return initialized.promise; }, async shutdown() {} },
+    state: { connect: async () => undefined },
+    checkSlackToken: async () => ({ ok: true }),
+    executor: { stopAll() {} },
+    sessionStore: { keys: () => [] },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+  });
+  await entered.promise;
+  t.mock.timers.tick(30_001);
+  initialized.resolve();
+  const app = await starting;
+  await app.shutdown();
+});
+
+for (const startupTimeoutMs of [undefined, 60_000]) test(`aborting pending Chat initialization cleans resources (deadline ${startupTimeoutMs})`, { timeout: 1_000 }, async () => {
+  const controller = new AbortController();
+  const entered = Promise.withResolvers();
+  const events = [];
+  const reason = new Error("cancel pending initialization");
+  const starting = startPipaRuntime({
+    signal: controller.signal, startupTimeoutMs,
+    chat: { onNewMention() {}, onSubscribedMessage() {},
+      initialize() { entered.resolve(); return new Promise(() => undefined); },
+      async shutdown() { events.push("chat-stop"); } },
+    state: { connect: async () => undefined },
+    checkSlackToken: async () => ({ ok: true }),
+    executor: { stopAll() { events.push("executor-stop"); } },
+    server: { stop() { events.push("server-stop"); }, async wait() { events.push("server-wait"); } },
+    createRoutineScheduler: () => ({ start() { assert.fail("must not start routines"); },
+      stop() { events.push("scheduler-stop"); }, async drain() { events.push("scheduler-drain"); } }),
+    sessionStore: { keys: () => [] },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+  });
+  await entered.promise;
+  const rejected = assert.rejects(starting, (error) => error === reason);
+  controller.abort(reason);
+  await rejected;
+  assert.deepEqual(events, ["scheduler-stop", "executor-stop", "scheduler-stop", "scheduler-drain", "executor-stop", "chat-stop", "server-stop", "server-wait"]);
+  assert.deepEqual(getEventListeners(controller.signal, "abort"), []);
+});
+
 test("surfaces an unexpected owned-server exit and still shuts Slack down", async () => {
   let failServer;
   let serverStopped = false;
@@ -1710,6 +1887,138 @@ test("interaction registry uses Block Kit selectors in Slack", async () => {
   await actionHandler({ actionId: submitButton.action_id, value: submitButton.value, user: { fullName: "lola" }, thread });
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(updated[1].blocks[1].text.text, "Lola selected: “A”, “C”, “D”.");
+});
+
+test("custom answers explicitly replace prior checkbox selections for the current question", async () => {
+  for (const nested of [false, true]) {
+    const posted = [], updated = [], submitted = [];
+    const thread = slackInteractionThread({ posted, updated });
+    const interactions = createPendingInteractions(["U1"]);
+    const question = { question: "Which snacks?", multiple: true, custom: true, options: [{ label: "Apple" }, { label: "Plum" }] };
+    const decision = interactions.onInteraction({ thread }, {
+      type: "question", sessionId: "ses_custom", signal: AbortSignal.timeout(5000),
+      request: nested ? { questions: [{ question: "Name?", custom: true }, question] } : question,
+      submit: async value => { submitted.push(value); },
+    });
+    try {
+      await waitFor(() => posted.length === 1);
+      let modal;
+      const openCustom = async card => {
+        const custom = slackAction(card, "pipa_custom_");
+        await interactions.onAction({ actionId: custom.action_id, value: custom.value, threadId: thread.id, user: { userId: "U1" }, openModal: async value => { modal = value; } });
+      };
+      const answer = value => interactions.onCustomAnswer({ privateMetadata: modal.privateMetadata, values: { answer: value }, user: { userId: "U1" }, relatedThread: thread });
+      if (nested) {
+        await openCustom(posted[0]);
+        assert.equal(modal.children[0].label, "Answer");
+        await answer("Orbit");
+        await waitFor(() => updated.length === 1);
+      }
+      const card = nested ? updated[0] : posted[0];
+      const select = slackAction(card, "pipa_select_");
+      assert.equal(select.type, "checkboxes");
+      await interactions.onAction({ actionId: select.action_id, threadId: thread.id, user: { userId: "U1" }, raw: { actions: [{ action_id: select.action_id, selected_options: select.options }] } });
+      await openCustom(card);
+      assert.equal(modal.children[0].label, "Answer (replaces checkbox selections)");
+      await answer("Pear");
+      const expected = { type: "answer", answers: nested ? [["Orbit"], ["Pear"]] : [["Pear"]] };
+      assert.deepEqual(await decision, expected);
+      assert.deepEqual(submitted, [expected]);
+    } finally { await interactions.close(); await decision.catch(() => undefined); }
+  }
+});
+
+test("question Submit uses current Slack state after an older selection finishes authorization last", async () => {
+  const posted = [];
+  const thread = slackInteractionThread({ posted });
+  const interactions = createPendingInteractions(["U1"]);
+  const older = Promise.withResolvers();
+  let pause = false;
+  let paused = false;
+  const submitted = [];
+  const decision = interactions.onInteraction({ thread, authorize: async () => {
+    if (pause) { pause = false; paused = true; await older.promise; }
+  } }, {
+    type: "question", sessionId: "ses_selection", signal: AbortSignal.timeout(5000),
+    request: { id: "q_selection", questions: [{ question: "Which snacks?", multiple: true, options: [{ label: "Apple" }, { label: "Plum" }] }] },
+    submit: async value => { submitted.push(value); },
+  });
+  try {
+    await waitFor(() => posted.length === 1);
+    const select = slackAction(posted[0], "pipa_select_");
+    const submit = slackAction(posted[0], "pipa_submit_");
+    const blockId = posted[0].blocks.find(block => block.elements?.includes(select)).block_id;
+    const event = action => ({ actionId: action.action_id, value: action.value, threadId: thread.id, user: { userId: "U1" } });
+    pause = true;
+    const first = interactions.onAction({ ...event(select), raw: { actions: [{ action_id: select.action_id, selected_options: [select.options[0]] }] } });
+    await waitFor(() => paused);
+    await interactions.onAction({ ...event(select), raw: { actions: [{ action_id: select.action_id, selected_options: select.options }] } });
+    older.resolve();
+    await first;
+    const click = state => interactions.onAction({ ...event(submit), raw: { state: { values: { [blockId]: { [select.action_id]: state } } } } });
+    await click({ type: "checkboxes", selected_options: [] });
+    assert.equal(submitted.length, 0, "Clearing all checkboxes must not submit an older cached choice");
+    await click({ type: "checkboxes", selected_options: select.options });
+    assert.deepEqual(await decision, { type: "answer", answers: [["Apple", "Plum"]] });
+    assert.equal(submitted.length, 1);
+    assert.deepEqual(submitted[0].answers, [["Apple", "Plum"]]);
+  } finally { older.resolve(); await interactions.close(); await decision.catch(() => undefined); }
+});
+
+test("question Submit accepts a radio selection from Slack state without a prior selection event", async () => {
+  const posted = [];
+  const thread = slackInteractionThread({ posted });
+  const interactions = createPendingInteractions(["U1"]);
+  let submitted;
+  const decision = interactions.onInteraction({ thread }, {
+    type: "question", sessionId: "ses_radio", signal: AbortSignal.timeout(5000),
+    request: { id: "q_radio", questions: [{ question: "Pick", options: [{ label: "Pear" }] }] },
+    submit: async value => { submitted = value; },
+  });
+  try {
+    await waitFor(() => posted.length === 1);
+    const select = slackAction(posted[0], "pipa_select_");
+    const submit = slackAction(posted[0], "pipa_submit_");
+    const blockId = posted[0].blocks.find(block => block.elements?.includes(select)).block_id;
+    await interactions.onAction({ actionId: submit.action_id, value: submit.value, threadId: thread.id, user: { userId: "U1" }, raw: {
+      state: { values: { [blockId]: { [select.action_id]: { type: "radio_buttons", selected_option: select.options[0] } } } },
+    } });
+    assert.deepEqual(submitted, { type: "answer", answers: [["Pear"]] });
+    assert.deepEqual(await decision, submitted);
+  } finally { await interactions.close(); await decision.catch(() => undefined); }
+});
+
+test("question Submit cannot replay a previous question's Slack state into the next question", async () => {
+  const posted = [], updated = [];
+  const thread = slackInteractionThread({ posted, updated });
+  const interactions = createPendingInteractions(["U1"]);
+  const submitted = [];
+  const decision = interactions.onInteraction({ thread }, {
+    type: "question", sessionId: "ses_questions", signal: AbortSignal.timeout(5000),
+    request: { id: "q_two", questions: [
+      { question: "First", options: [{ label: "Apple" }] },
+      { question: "Second", options: [{ label: "Apple" }, { label: "Pear" }] },
+    ] }, submit: async value => { submitted.push(value); },
+  });
+  try {
+    await waitFor(() => posted.length === 1);
+    const event = (message, option) => {
+      const select = slackAction(message, "pipa_select_");
+      const submit = slackAction(message, "pipa_submit_");
+      const blockId = message.blocks.find(block => block.elements?.includes(select)).block_id;
+      return { actionId: submit.action_id, value: submit.value, threadId: thread.id, user: { userId: "U1" }, raw: {
+        state: { values: { [blockId]: { [select.action_id]: { type: "radio_buttons", selected_option: select.options[option] } } } },
+      } };
+    };
+    const first = event(posted[0], 0);
+    await interactions.onAction(first);
+    await waitFor(() => updated.length === 1);
+    await interactions.onAction(first);
+    assert.equal(submitted.length, 0, "Old Submit must not answer the next question, even when it shares an option");
+    await interactions.onAction(event(updated[0], 1));
+    assert.deepEqual((await decision).answers, [["Apple"], ["Pear"]]);
+    assert.equal(submitted.length, 1);
+  } finally { await interactions.close(); await decision.catch(() => undefined); }
 });
 
 test("interaction registry restricts custom answers to allowed users", async () => {
@@ -1976,6 +2285,85 @@ test("only allowed users can answer an active question", async () => {
   await actionHandler({ actionId: submit.action_id, value: submit.value, user: { userId: "U1" }, thread });
   await waitFor(() => resolvedDecision);
   assert.deepEqual(resolvedDecision, { type: "answer", answers: [["X"]] });
+});
+
+test("native rejection retains the same editable controls until acceptance", async () => {
+  const posted = [], updated = [];
+  const thread = slackInteractionThread({ posted, updated });
+  const interactions = createPendingInteractions(["U1"]);
+  let attempts = 0, resolved = false;
+  const acceptance = Promise.withResolvers();
+  const result = interactions.onInteraction({ thread }, {
+    type: "question", sessionId: "ses_retry", signal: AbortSignal.timeout(5000),
+    request: { id: "q_retry", questions: [{ question: "Pick", options: [{ label: "X" }], custom: true }] },
+    submit: async () => { if (++attempts === 1) throw new Error("Native answer rejected"); await acceptance.promise; },
+  }).then((value) => { resolved = true; return value; });
+  await waitFor(() => posted.length === 1);
+  const select = slackAction(posted[0], "pipa_select_");
+  const submit = slackAction(posted[0], "pipa_submit_");
+  const event = (action, value = action.value) => ({ actionId: action.action_id, value, threadId: thread.id, user: { userId: "U1" } });
+  await interactions.onAction(event(select, select.options[0].value));
+  await interactions.onAction(event(submit));
+  await waitFor(() => updated.length > 0);
+  assert.equal(attempts, 1);
+  assert.equal(resolved, false);
+  assert.match(JSON.stringify(updated), /rejected/iu);
+  const retry = interactions.onAction(event(submit));
+  await waitFor(() => attempts === 2);
+  await interactions.onAction(event(submit));
+  assert.equal(attempts, 2, "double clicks must not submit twice");
+  assert.equal(resolved, false);
+  acceptance.resolve();
+  await retry;
+  assert.deepEqual(await result, { type: "answer", answers: [["X"]] });
+  assert.equal(posted.length, 1);
+});
+
+test("native external settlement and queued cancellation make stale Slack controls inert", async () => {
+  const posted = [], deleted = [];
+  const thread = slackInteractionThread({ posted, deleted });
+  const interactions = createPendingInteractions();
+  const external = Promise.withResolvers();
+  const controller = new AbortController();
+  let submissions = 0;
+  const request = { type: "permission", sessionId: "ses_child", request: { id: "per_native", action: "read", resources: ["test"] }, signal: AbortSignal.timeout(5000), submit: async () => { submissions++; } };
+  const first = interactions.onInteraction({ thread }, { ...request, settled: external.promise });
+  await waitFor(() => posted.length === 1);
+  const queued = interactions.onInteraction({ thread }, { ...request, request: { ...request.request, id: "queued" }, signal: controller.signal });
+  const cancelled = assert.rejects(queued, /cancel queued/u);
+  controller.abort(new Error("cancel queued"));
+  const allow = slackAction(posted[0], "pipa_permission_once_");
+  external.resolve();
+  assert.deepEqual(await first, { type: "cancelled" });
+  await cancelled;
+  await interactions.onAction({ actionId: allow.action_id, value: allow.value, threadId: thread.id, user: { userId: "U1" } });
+  assert.equal(posted.length, 1, "cancelled queued cards must never be posted");
+  assert.equal(deleted.length, 1);
+  assert.equal(submissions, 0);
+});
+
+test("native submission still checks current routine authorization and exact thread", async () => {
+  const posted = [];
+  const thread = slackInteractionThread({ posted });
+  const interactions = createPendingInteractions();
+  let allowed = ["U1"], authorized = true, submissions = 0;
+  const result = interactions.onInteraction({ thread, loadAllowedUserIds: async () => allowed, authorize: async () => { if (!authorized) throw new Error("revoked"); } }, {
+    type: "permission", sessionId: "ses_child", request: { id: "per_native", action: "read", resources: ["test"] }, signal: AbortSignal.timeout(5000), submit: async () => { submissions++; },
+  });
+  await waitFor(() => posted.length === 1);
+  const allow = slackAction(posted[0], "pipa_permission_once_");
+  const click = (threadId = thread.id, userId = "U1") => interactions.onAction({ actionId: allow.action_id, value: allow.value, threadId, user: { userId } });
+  await click("slack:C1:wrong");
+  await click(thread.id, "U2");
+  allowed = ["U2"];
+  await click();
+  authorized = false;
+  await click(thread.id, "U2");
+  assert.equal(submissions, 0);
+  authorized = true;
+  await click(thread.id, "U2");
+  assert.deepEqual(await result, { type: "reply", reply: "once" });
+  assert.equal(submissions, 1);
 });
 
 test("routine interactions and results target an exact channel or existing thread", async () => {

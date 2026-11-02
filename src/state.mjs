@@ -3,6 +3,8 @@ import { access, chmod, link, mkdir, readFile, realpath, rename, rm, stat, write
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
 
 const MANIFEST = {
   display_information: {
@@ -60,6 +62,7 @@ export function pipaPaths(home = process.env.PIPA_HOME || os.homedir()) {
     routines: path.join(directory, "routines.json"),
     routinesLock: path.join(directory, "routines.lock"),
     sessions: path.join(directory, "sessions.json"),
+    openCodeRecovery: path.join(directory, "opencode-recovery.json"),
   };
 }
 
@@ -84,10 +87,26 @@ export async function acquireInstanceLock(file = pipaPaths().lock) {
   return release;
 }
 
-export async function stopInstance(file = pipaPaths().lock, kill = process.kill) {
+export async function stopInstance(file = pipaPaths().lock, kill = process.kill, { platform = process.platform, terminate = spawnSync, running = isRunning } = {}) {
   const identity = await readInstanceLock(file);
   const pid = identity?.pid;
   if (!pid) return null;
+  if (platform === "win32" && kill === process.kill) {
+    if (!running(pid)) { removeInstanceLock(file, identity); return null; }
+    // Windows SIGTERM does not run Node's shutdown handler. Stop the owned tree
+    // and release only the unchanged lock after the original process has exited.
+    const result = terminate(process.env.SystemRoot ? path.join(process.env.SystemRoot, "System32", "taskkill.exe") : "taskkill", ["/PID", String(pid), "/T", "/F"], {
+      timeout: 5000, windowsHide: true, stdio: "ignore", shell: false,
+    });
+    if (result.error || result.status !== 0) throw new Error("Could not stop Pipa's Windows process tree.");
+    const deadline = Date.now() + 5000;
+    while (running(pid)) {
+      if (Date.now() >= deadline) throw new Error("Could not confirm Pipa's Windows process tree stopped.");
+      await delay(25);
+    }
+    removeInstanceLock(file, identity);
+    return pid;
+  }
   try {
     kill(pid, "SIGTERM");
     return pid;

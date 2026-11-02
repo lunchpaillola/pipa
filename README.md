@@ -51,6 +51,22 @@ pipa start
 
 `pipa init` creates the Slack app manifest, opens the install flow, and saves the profile under `~/.pipa`. Invite Pipa to a channel and mention it. The [3-minute setup video](https://www.youtube.com/watch?v=rlTMdkPWPcA) shows the flow, and the [OpenCode Slack integration guide](https://www.usepipa.com/opencode-slack?utm_source=github&utm_medium=repo_readme&utm_campaign=signup&utm_content=readme_install_guide) is the current written path.
 
+### Opt-in 0.6 beta
+
+`0.6.0-beta.1` is being prepared for controlled testing, not stable release.
+Once published, opt in with:
+
+```sh
+npm install --global @usepipa/pipa@0.6.0-beta.1
+```
+
+Normal installs keep using npm's `latest` tag; subsequent betas use `@beta`.
+This updates Pipa only, not OpenCode. For an existing installation, arrange a
+maintenance window, stop Pipa and back up its profile before installing. Keep
+your current OpenCode version initially; do not rerun `pipa init` or create a
+second listener. See the [beta release notes](https://github.com/lunchpaillola/pipa/blob/main/docs/beta-release.md)
+for changes, limitations, and trial/rollback guidance.
+
 ## Security model
 
 In local mode, Pipa runs on your machine, not behind a relay. The local OpenCode server binds to `127.0.0.1` on an operating-system-assigned port; attached servers follow their own network controls. Slack access is limited by channel, user, and bot allowlists, rechecked on every turn. Tokens stay in the local profile with private file permissions, and OpenCode manages provider credentials.
@@ -68,10 +84,12 @@ Profiles created by `pipa init` use Socket Mode. Profiles written before mode su
 ### Requirements
 
 - Node.js 22 or newer
-- [OpenCode](https://opencode.ai) installed and authenticated
+- [OpenCode](https://opencode.ai) installed and authenticated; the dual-adapter candidate selects native v1/v2 automatically (current native v2 qualification target: 2.2.5; historical v2 pin: 2.0.29; v1 pins: 1.18.35, 1.19.0; release-qualified minimums pending)
 - A Slack workspace where you can create an app
 
 Invite the Slack app only to channels whose members may use OpenCode in the configured working directory.
+
+See [OpenCode compatibility](docs/opencode-compatibility.md) for remaining-on-v1 and deliberate-v2 upgrade paths, matched-snapshot rollback, capability differences and remaining release gates. Upgrading Pipa preserves the existing Slack profile; it does not require recreating the Slack app or upgrading OpenCode.
 
 ### Install
 
@@ -97,9 +115,21 @@ pipa start
 
 Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. In owned local mode, Pipa starts one OpenCode server bound to `127.0.0.1` on an operating-system-assigned port and reuses it for every Slack turn. Port `0` asks the operating system for an available port; no port configuration is required. Pipa replies in a thread, and follow-up messages in that thread reuse the same OpenCode session without another mention. A newer follow-up interrupts an active turn in the same thread, while other threads continue independently. While a turn is active, Pipa shows a typing status in its Slack thread.
 
+Ordinary startup detects OpenCode v1/v2 and waits for listening, workspace readiness and Slack initialization without a default overall timeout or migration-status gate. OpenCode owns schema/data upgrades; Pipa never converts that data. Ctrl+C cancels startup and stops owned children, never attached servers. See the [startup contract](docs/opencode-compatibility.md#startup-contract) for retry, failure and explicit-deadline behavior.
+
+**Managed external-client upgrade notice:** Before upgrading a Managed profile used by external OpenCode clients, set a shared explicit `OPENCODE_SERVER_PASSWORD` in the Pipa server/restart launch environment and configure that password in every external client. For v2, `OPENCODE_PASSWORD` takes precedence; match it to the shared password or remove conflicting values from the server/restart and client environments. If no explicit password is set, Pipa generates a private per-launch password unavailable to external clients, and unauthenticated clients no longer connect. Keep generated passwords private; use an explicit shared password for external access. See [OpenCode compatibility](docs/opencode-compatibility.md).
+
 Pipa keeps naturally short answers inline. For deeper work, OpenCode can return a concise summary with suitable generated files, such as documents, spreadsheets, PDFs, or images. Files are read only from a private session directory under `.pipa/artifacts` in the configured working directory. The directory is cleared before each turn, files are validated and limited to 10 files and 100 MB total, and the directory is deleted locally after delivery. If file delivery fails, Pipa retries the declaration-free summary without the files. Attached OpenCode servers on non-loopback hosts use inline text fallback instead of local artifact delivery.
 
-Incoming messages can include up to Slack's 10-file limit, with a maximum size of 100 MB per file. Attachments require a text prompt and are copied to a temporary directory only for the duration of the turn.
+Incoming messages can include up to Slack's 10-file limit, with a maximum size of 10 MiB (10,485,760 bytes) per file. Pipa checks both declared size and downloaded bytes before sending the prompt. Attachments require a text prompt and are copied to a temporary directory only for the duration of the turn. Outgoing artifact limits remain 10 files and 100 MB per file or response.
+
+For owned OpenCode v2 servers, Pipa defaults `BUN_JSC_maxRegExpStackSize` to `536870912` (a 512 MiB on-demand regular-expression stack ceiling), preserving any explicit override. This works around native 2.0.29 rejecting valid large base64 attachments. An independently launched attached v2 server needs the same setting in **its server process**, for example `BUN_JSC_maxRegExpStackSize=536870912 opencode serve`; setting it only on the attaching Pipa client cannot configure that server. The model's context/media capabilities still determine which admitted files it can process.
+
+### Recovering a blocked OpenCode turn
+
+If v2 reports that cleanup failed and new intake is blocked, restore the selected server's connectivity and let any independently submitted work finish, then restart Pipa with `pipa restart`. Use `pipa restart --status` to confirm the outcome. If Pipa already exited, run `pipa start` with the same profile and working directory instead.
+
+Startup reconciles the profile's private `~/.pipa/opencode-recovery.json` before accepting Slack or routine work. It removes only owned instructions/admissions and waits for owned execution to settle; it does not replay the failed prompt. Keep the recovery file and session mappings intact. If startup still blocks, resolve the reported server/workspace or foreign-writer conflict before trying again; deleting the recovery file would discard the evidence needed for safe cleanup. Review any partial side effects before manually retrying the original request.
 
 ### Access control
 
@@ -274,6 +304,8 @@ Anyone allowed by the existing Slack user and channel controls can request a res
 
 The running Pipa launches a detached worker before stopping intake, cleaning up, and releasing its instance lock. The worker waits for the original process and lock to disappear, then starts a detached replacement and confirms workspace readiness (and Slack readiness for Socket Mode). The replacement continues in the background without terminal output; use `pipa stop` to stop it. This works for Socket and Managed profiles on supported macOS, Linux, and Windows systems. Attached OpenCode servers remain externally owned and are never stopped by Pipa.
 
+On Windows, `pipa stop` forcibly terminates Pipa's owned process tree and clears only its unchanged instance lock after exit. It can interrupt active work; `pipa restart` uses the cooperative restart handoff instead.
+
 When a restart is requested from Slack, the bot reports that it is restarting and posts to the same thread after the replacement is ready. A manual stop instead reports that the bot will not respond until it starts again.
 
 Do not chain `pipa stop` and `pipa start` inside an agent turn: stopping owned OpenCode also kills that turn. OpenCode's `/instance/dispose` disposes an instance; it does not restart the server.
@@ -301,7 +333,9 @@ npm test
 npm run test:pack
 ```
 
-`npm run test:slack:routines` is a manual real-service smoke test. It requires a running local Socket Mode process plus `SLACK_USER_TOKEN`, `SLACK_TEST_CHANNEL_ID`, and `SLACK_PIPA_BOT_USER_ID`; it is not part of automatic CI.
+`npm run test:slack:routines` is a manual real-service smoke test. `npm run test:slack:release -- --plan` lists the shared live gates without contacting Slack. The opt-in `--run` collector requires an isolated running Socket candidate and private inputs from `.env.example`; see the testing guide. Human/client and integration evidence remain separate mandatory gates.
+
+See the [testing strategy](docs/pipa-testing.md) for repeatable real-runtime and Slack validation, existing-app reuse, evidence, and cleanup.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 

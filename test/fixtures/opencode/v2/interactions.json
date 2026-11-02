@@ -1,0 +1,18 @@
+{
+  "provenance": "Independent synthetic examples from @opencode/client@2.0.29 FormInfo, FormDetail, PermissionRequest and reply input definitions",
+  "question": {
+    "id": "frm_native", "sessionID": "ses_child", "title": "Preferences", "metadata": { "kind": "question" },
+    "fields": [
+      { "key": "q0", "type": "string", "title": "Color", "description": "Pick a color", "required": true, "options": [{ "label": "Blue", "value": "blue-id" }, { "label": "Red", "value": "red-id" }], "custom": false },
+      { "key": "q1", "type": "multiselect", "title": "Features", "required": true, "options": [{ "label": "Fast", "value": "fast-id" }, { "label": "Small", "value": "small-id" }], "custom": true },
+      { "key": "q2", "type": "string", "title": "Name", "required": true, "custom": true }
+    ]
+  },
+  "permission": { "id": "per_native", "sessionID": "ses_child", "action": "bash", "resources": ["pwd"], "save": ["pwd"], "source": { "type": "tool", "messageID": "msg_tool", "id": "call_native" } },
+  "rich": [
+    { "id": "frm_generic", "sessionID": "ses_contract", "title": "Generic", "fields": [{ "key": "answer", "type": "string", "title": "Answer" }] },
+    { "id": "frm_numeric", "sessionID": "ses_contract", "title": "Numeric", "metadata": { "kind": "question" }, "fields": [{ "key": "q0", "type": "integer", "title": "Count", "required": true }] },
+    { "id": "frm_conditional", "sessionID": "ses_contract", "title": "Conditional", "metadata": { "kind": "question" }, "fields": [{ "key": "q0", "type": "string", "when": [{ "key": "other", "op": "eq", "value": "yes" }] }] },
+    { "id": "frm_external", "sessionID": "ses_contract", "title": "External", "metadata": { "kind": "question" }, "fields": [{ "key": "q0", "type": "external", "title": "Continue", "url": "https://example.invalid/auth" }] }
+  ]
+}

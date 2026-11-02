@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { acquireInstanceLock, createManifest, createManifestUrl, createSessionStore, createModelSetting, loadConfig, loadSessions, pipaPaths, saveConfig, slackCommandName, stopInstance, writePrivateJson } from "../src/state.mjs";
+import { createRuntimeFixture } from "./helpers/runtime-fixture.mjs";
 
 test("installation command names are shared with the manifest and fit Slack's limit", () => {
   for (const [name, command] of [
@@ -81,11 +82,13 @@ test("config and sessions are stored separately with private permissions", async
   if (process.platform !== "win32") assert.equal((await stat(paths.config)).mode & 0o777, 0o600);
 });
 
-test("routine paths are separate and the atomic JSON writer is reusable", async () => {
+test("routine and OpenCode recovery paths are separate and the atomic JSON writer is reusable", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-state-"));
   const paths = pipaPaths(home);
   assert.equal(paths.routines, path.join(paths.directory, "routines.json"));
   assert.equal(paths.routinesLock, path.join(paths.directory, "routines.lock"));
+  assert.equal(paths.openCodeRecovery, path.join(paths.directory, "opencode-recovery.json"));
+  assert.equal(new Set([paths.config, paths.sessions, paths.routines, paths.openCodeRecovery]).size, 4);
   await writePrivateJson(paths.routines, { version: 1, routines: [] });
   assert.deepEqual(JSON.parse(await readFile(paths.routines, "utf8")), { version: 1, routines: [] });
   if (process.platform !== "win32") assert.equal((await stat(paths.routines)).mode & 0o777, 0o600);
@@ -213,6 +216,42 @@ test("stops the process recorded in the instance lock", async () => {
   let signal;
   assert.equal(await stopInstance(file, (pid, received) => { signal = { pid, received }; }), 12345);
   assert.deepEqual(signal, { pid: 12345, received: "SIGTERM" });
+});
+
+for (const outcome of ["stopped", "replacement", "failed", "parent-exited-on-failure"]) test(`Windows stop uses the owned tree and preserves lock identity: ${outcome}`, async (t) => {
+  const runtime = await createRuntimeFixture();
+  t.after(() => runtime.teardown());
+  const { child } = runtime.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
+  const file = pipaPaths(runtime.home).lock;
+  const identity = { pid: child.pid, generation: "00000000-0000-0000-0000-000000000001" };
+  const replacement = { ...identity, generation: "00000000-0000-0000-0000-000000000002" };
+  await writePrivateJson(file, identity);
+  let alive = true;
+  let calls = 0;
+  const stopping = stopInstance(file, undefined, {
+    platform: "win32", running: () => alive,
+    terminate: (command, args, options) => {
+      calls++;
+      assert.match(command, /(?:^|[\\/])taskkill(?:\.exe)?$/u);
+      assert.deepEqual(args, ["/PID", String(child.pid), "/T", "/F"]);
+      assert.equal(options.shell, false);
+      assert.equal(options.timeout, 5000);
+      if (outcome === "replacement") writeFileSync(file, JSON.stringify(replacement));
+      if (outcome === "failed") return { status: 1 };
+      alive = false;
+      if (outcome === "parent-exited-on-failure") return { status: 1 };
+      return { status: 0 };
+    },
+  });
+  if (outcome === "failed" || outcome === "parent-exited-on-failure") {
+    await assert.rejects(stopping, /Could not stop/u);
+    assert.deepEqual(JSON.parse(await readFile(file, "utf8")), identity);
+  } else {
+    assert.equal(await stopping, child.pid);
+    if (outcome === "replacement") assert.deepEqual(JSON.parse(await readFile(file, "utf8")), replacement);
+    else await assert.rejects(readFile(file), { code: "ENOENT" });
+  }
+  assert.equal(calls, 1);
 });
 
 test("lock generations are unique and an old release cannot delete a replacement", async () => {

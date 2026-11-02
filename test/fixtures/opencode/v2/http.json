@@ -1,0 +1,82 @@
+{
+  "generation": "v2",
+  "version": "2.0.29",
+  "provenance": {
+    "source": "@opencode/client@2.0.29 published generated client and types, inspected from the prior protocol spike's pinned installation",
+    "reference": "https://www.npmjs.com/package/@opencode/client/v/2.0.29",
+    "nativeDefinitions": ["SessionInfo", "SessionInboxUser", "SessionMessagesResponse", "SessionMessageAssistant", "SessionMessageIdle", "FormCreated", "PermissionAsked", "SessionExecutionSucceeded"],
+    "kind": "independently authored synthetic native examples; legacy 405/HTML observations from the real-engine spike"
+  },
+  "prompt": "  contract `prompt` $(untouched) café  \n",
+  "expected": { "sessionId": "ses_contract", "text": "contract complete" },
+  "continuation": { "sessionId": "ses_contract", "text": "history retained" },
+  "routes": [
+    {
+      "method": "GET", "path": "/global/health",
+      "responses": [{ "raw": "<!doctype html><html>OpenCode</html>", "contentType": "text/html" }]
+    },
+    {
+      "method": "GET", "path": "/api/experimental/migration/v1",
+      "responses": [{ "json": { "status": "completed" } }]
+    },
+    {
+      "method": "GET", "path": "/api/location", "query": { "location[directory]": "$WORKSPACE" },
+      "responses": [{ "json": { "directory": "$WORKSPACE", "project": { "id": "prj_contract", "directory": "$WORKSPACE", "canonical": "$WORKSPACE" } } }]
+    },
+    {
+      "method": "POST", "path": "/session", "query": { "directory": "$WORKSPACE" }, "body": {},
+      "responses": [{ "status": 405, "raw": "Method Not Allowed", "contentType": "text/plain" }]
+    },
+    {
+      "method": "GET", "path": "/session/status", "query": { "directory": "$WORKSPACE" }, "repeatLast": true,
+      "responses": [{ "raw": "<!doctype html><html><body>OpenCode</body></html>", "contentType": "text/html" }]
+    },
+    {
+      "method": "GET", "path": "/api/info",
+      "responses": [{ "json": { "version": "2.0.29", "pid": 4242, "urls": ["http://127.0.0.1:4096"], "paths": { "tmp": "$TEMP" } } }]
+    },
+    {
+      "method": "POST", "path": "/api/session", "body": { "location": { "directory": "$WORKSPACE" } },
+      "responses": [{ "json": { "data": { "id": "ses_contract", "projectID": "prj_contract", "cost": 0, "tokens": { "input": 0, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } }, "time": { "created": 1, "updated": 1 }, "location": { "directory": "$WORKSPACE" } } } }]
+    },
+    {
+      "method": "GET", "path": "/api/session/ses_contract", "repeatLast": true,
+      "responses": [{ "json": { "data": { "id": "ses_contract", "projectID": "prj_contract", "time": { "created": 1, "updated": 1 }, "location": { "directory": "$WORKSPACE" } } } }]
+    },
+    {
+      "method": "GET", "path": "/api/session/active", "repeatLast": true,
+      "responses": [{ "json": { "data": {} } }]
+    },
+    {
+      "method": "GET", "path": "/api/session/ses_contract/inbox", "repeatLast": true,
+      "responses": [{ "json": { "data": [] } }]
+    },
+    {
+      "method": "POST", "path": "/api/session/ses_contract/prompt",
+      "body": { "id": "msg_input", "text": "  contract `prompt` $(untouched) café  \n" },
+      "responses": [{ "json": { "data": { "id": "msg_input", "sessionID": "ses_contract", "time": { "created": 2 }, "type": "user", "payload": { "text": "  contract `prompt` $(untouched) café  \n" }, "delivery": "steer" } } }]
+    },
+    {
+      "method": "GET", "path": "/api/session/ses_contract/message", "query": { "limit": "100", "order": "asc" },
+      "responses": [{ "json": {
+        "data": [
+          { "id": "msg_input", "type": "user", "time": { "created": 2 }, "text": "  contract `prompt` $(untouched) café  \n" },
+          { "id": "msg_result", "type": "assistant", "agent": "default", "model": { "providerID": "fixture", "id": "deterministic" }, "time": { "created": 2, "completed": 3 }, "finish": "stop", "content": [{ "type": "reasoning", "text": "private reasoning must not deliver" }, { "type": "text", "text": "contract complete" }] },
+          { "id": "msg_idle", "type": "idle", "time": { "created": 4 }, "outcome": "succeeded" }
+        ], "cursor": { "previous": null, "next": null }
+      } }]
+    },
+    {
+      "method": "GET", "path": "/api/event",
+      "responses": [{ "sse": "data: {\"id\":\"evt_form\",\"created\":2,\"type\":\"form.created\",\"location\":{\"directory\":\"$WORKSPACE\"},\"data\":{\"form\":{\"id\":\"frm_contract\",\"sessionID\":\"ses_contract\",\"title\":\"Color\",\"metadata\":{\"kind\":\"question\"},\"fields\":[{\"key\":\"q0\",\"type\":\"string\",\"title\":\"Pick one\",\"required\":true,\"options\":[{\"value\":\"Blue\",\"label\":\"Blue\"}]}]}}}\n\ndata: {\"id\":\"evt_permission\",\"created\":2,\"type\":\"permission.asked\",\"location\":{\"directory\":\"$WORKSPACE\"},\"data\":{\"id\":\"per_contract\",\"sessionID\":\"ses_child\",\"action\":\"bash\",\"resources\":[\"pwd\"]}}\n\ndata: {\"id\":\"evt_done\",\"created\":4,\"type\":\"session.execution.succeeded\",\"durable\":{\"aggregateID\":\"ses_contract\",\"seq\":9,\"version\":1},\"location\":{\"directory\":\"$WORKSPACE\"},\"data\":{\"sessionID\":\"ses_contract\"}}\n\n" }]
+    },
+    {
+      "method": "POST", "path": "/api/session/ses_contract/form/frm_contract/reply", "body": { "answer": { "q0": "Blue" } },
+      "responses": [{ "status": 204 }]
+    },
+    {
+      "method": "POST", "path": "/api/session/ses_child/permission/per_contract/reply", "body": { "decision": "once" },
+      "responses": [{ "status": 204 }]
+    }
+  ]
+}

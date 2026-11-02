@@ -7,10 +7,73 @@ import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { acquireInstanceLock, pipaPaths, readInstanceLock, writePrivateJson } from "../src/state.mjs";
+import { acquireInstanceLock, isRunning, pipaPaths, readInstanceLock, stopInstance, writePrivateJson } from "../src/state.mjs";
 import { restartStatus } from "../src/restart.mjs";
+import { createRuntimeFixture, waitFor } from "./helpers/runtime-fixture.mjs";
 
 const cli = fileURLToPath(new URL("../bin/pipa.mjs", import.meta.url));
+
+for (const failure of ["authentication", "permission", "protocol", "temporary"]) test(`U1 ordinary Managed readiness policy: ${failure}`, { timeout: 10000 }, async (t) => {
+  const runtime = await createRuntimeFixture({ timeoutMs: 9000 });
+  t.after(() => runtime.teardown());
+  const paths = pipaPaths(runtime.home);
+  const reservation = createServer();
+  await new Promise((resolve) => reservation.listen(0, "127.0.0.1", resolve));
+  const port = reservation.address().port;
+  await new Promise((resolve) => reservation.close(resolve));
+  const config = { botName: "Pipa", workingDirectory: runtime.workspace, slackMode: "managed", openCodeHostname: "127.0.0.1", openCodePort: port };
+  await writePrivateJson(paths.config, config);
+  const before = await readFile(paths.config, "utf8");
+  const fakeBin = path.join(runtime.root, "bin");
+  await mkdir(fakeBin);
+  const script = path.join(fakeBin, "fake.cjs");
+  const healthProbed = path.join(runtime.root, "health-probed");
+  await writeFile(script, `
+    if (process.argv.includes('--version')) { console.log('OpenCode 1.19.0'); process.exit(0); }
+    const http = require('node:http');
+    const server = http.createServer((req, res) => {
+      if (req.url === '/fixture-shutdown' && req.headers.authorization === 'Basic ' + Buffer.from('opencode:' + process.env.OPENCODE_SERVER_PASSWORD).toString('base64')) { res.end(); server.close(); return; }
+      if (req.url === '/global/health') require('node:fs').writeFileSync(${JSON.stringify(healthProbed)}, 'probed');
+      res.writeHead(${failure === "authentication" ? 401 : failure === "permission" ? 403 : failure === "temporary" ? 503 : 200}, { 'content-type': 'application/json' }); res.end('{}');
+    });
+    server.listen(Number(process.argv[process.argv.indexOf('--port') + 1]), '127.0.0.1');
+    process.on('SIGTERM', () => server.close());
+  `);
+  const executable = path.join(fakeBin, process.platform === "win32" ? "opencode.cmd" : "opencode");
+  await writeFile(executable, process.platform === "win32" ? `@ECHO off\r\n"${process.execPath}" "%~dp0fake.cjs" %*\r\n` : `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`);
+  if (process.platform !== "win32") await chmod(executable, 0o755);
+  runtime.env.PATH = `${fakeBin}${path.delimiter}${runtime.env.PATH}`;
+  runtime.env.OPENCODE_SERVER_PASSWORD = "synthetic-readiness-password";
+  const { child, exited } = runtime.spawn(process.execPath, [cli, "start"]);
+  let stderr = "";
+  let stdout = "";
+  child.stderr.on("data", (data) => { stderr += data; });
+  child.stdout.on("data", (data) => { stdout += data; });
+  if (failure === "temporary") {
+    await runtime.waitFor(() => readFile(healthProbed, "utf8").catch(() => false), { timeoutMs: 3000, label: "first private health probe" });
+    assert.match(stdout, /Pipa is starting OpenCode/u);
+    assert.equal(child.exitCode, null);
+    assert.ok(await readInstanceLock(paths.lock));
+    const request = spawnSync(process.execPath, [cli, "restart"], { env: runtime.env, encoding: "utf8" });
+    assert.equal(request.status, 0, request.stderr);
+    await delay(300);
+    assert.equal(child.exitCode, null, "Temporary 503 must leave ordinary startup waiting");
+    assert.doesNotMatch(stderr, /warning|Managed restart unavailable|timed out/iu);
+    assert.equal((await restartStatus({ home: runtime.home })).state, "requested", "unready Managed must not claim restart readiness");
+    // End the fake engine without assuming Windows delivers POSIX signals.
+    assert.equal((await fetch(`http://127.0.0.1:${port}/fixture-shutdown`, {
+      headers: { authorization: `Basic ${Buffer.from("opencode:synthetic-readiness-password").toString("base64")}` },
+      signal: AbortSignal.timeout(2000),
+    })).status, 200);
+    assert.equal((await exited).code, 1, "Unexpected engine exit must stop the CLI and release its lock");
+  } else {
+    assert.equal((await exited).code, 1);
+    assert.match(stderr, ["authentication", "permission"].includes(failure) ? /authentication failed/iu : /identity protocol/iu);
+    assert.doesNotMatch(stderr, /Managed restart unavailable/u);
+  }
+  assert.equal(await readInstanceLock(paths.lock), null);
+  assert.equal(await readFile(paths.config, "utf8"), before);
+});
 
 test("restart requests rather than claims success and status survives the caller", async (t) => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-restart-cli-"));
@@ -34,8 +97,10 @@ test("restart requests rather than claims success and status survives the caller
   assert.notEqual(invoke("--bogus").status, 0);
 });
 
-for (const mode of ["ready", "unready", "startup-failure"]) test(`isolated Managed restart: ${mode}`, { timeout: 120_000 }, async (t) => {
-  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-detached-"));
+for (const version of ["1.19.0", "2.0.29"]) for (const mode of ["ready", "unready", "startup-failure", "authentication", "wrong-generation"]) test(`isolated Managed restart ${version}: ${mode}`, { timeout: 120_000 }, async (t) => {
+  const runtime = await createRuntimeFixture({ timeoutMs: 119000, cleanupTimeoutMs: 10_000 });
+  t.after(() => runtime.teardown());
+  const home = runtime.home;
   const paths = pipaPaths(home);
   const reservation = createServer();
   await new Promise((resolve) => reservation.listen(0, "127.0.0.1", resolve));
@@ -52,13 +117,31 @@ for (const mode of ["ready", "unready", "startup-failure"]) test(`isolated Manag
   const configBefore = await readFile(paths.config, "utf8");
   await writeFile(path.join(fakeBin, "server.cjs"), `
     const http = require('node:http');
+    if (process.argv.includes('--version')) { console.log(${JSON.stringify(version)}); process.exit(0); }
     if (process.env.PIPA_HOME !== ${JSON.stringify(home)}) throw new Error('Profile home changed in the tool environment.');
+    if (process.env.PIPA_INTEGRATION_SENTINEL !== 'integration-kept') throw new Error('Integration environment lost.');
+    if (process.env.PIPA_SLACK_BOT_TOKEN || process.env.Slack_Client_Secret) throw new Error('Slack secret reached engine.');
     if (process.env.PIPA_RESTART_ID && ${JSON.stringify(mode)} === 'startup-failure') process.exit(23);
     const server = http.createServer((req, res) => {
-      if (req.url === '/shutdown') { res.end(); server.close(); return; }
+      if (req.url === '/shutdown') {
+        if (req.headers.authorization !== 'Basic ' + Buffer.from('opencode:' + process.env.OPENCODE_SERVER_PASSWORD).toString('base64')) { res.writeHead(401); res.end(); return; }
+        res.end(); server.close(); return;
+      }
       if (process.env.PIPA_RESTART_ID && ${JSON.stringify(mode)} === 'unready') res.statusCode = 503;
+      if (req.headers.authorization !== 'Basic ' + Buffer.from('opencode:' + process.env.OPENCODE_SERVER_PASSWORD).toString('base64')
+        || (process.env.PIPA_RESTART_ID && ${JSON.stringify(mode)} === 'authentication')) res.statusCode = 401;
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({}));
+      const url = new URL(req.url, 'http://localhost');
+      if (process.env.PIPA_RESTART_ID && ${JSON.stringify(mode)} === 'ready' && ['/path', '/api/location'].includes(url.pathname)) {
+        require('node:fs').writeFileSync(${JSON.stringify(path.join(home, "workspace-probed"))}, 'waiting');
+        if (!require('node:fs').existsSync(${JSON.stringify(path.join(home, "workspace-release"))})) res.statusCode = 503;
+      }
+      const body = ${JSON.stringify(version)}.startsWith('1.')
+        ? url.pathname === '/global/health' ? { healthy: true, version: ${JSON.stringify(version)} } : url.pathname === '/path' ? { directory: ${JSON.stringify(home)} } : url.pathname === '/session/status' ? {} : null
+        : url.pathname === '/api/info' ? { version: ${JSON.stringify(version)}, pid: process.pid, urls: [], paths: { tmp: ${JSON.stringify(runtime.temp)} } }
+        : url.pathname === '/api/location' ? { directory: ${JSON.stringify(home)}, project: { id: 'prj_fixture', directory: ${JSON.stringify(home)}, canonical: ${JSON.stringify(home)} } } : null;
+      if (!body && res.statusCode === 200) res.statusCode = 404;
+      res.end(JSON.stringify(body ?? {}));
     });
     server.listen(Number(process.argv[process.argv.indexOf('--port') + 1]), '127.0.0.1');
     process.on('SIGTERM', () => server.close());
@@ -71,51 +154,97 @@ for (const mode of ["ready", "unready", "startup-failure"]) test(`isolated Manag
   // Observe the real worker's exit without replacing any process boundary.
   const observer = path.join(home, "observe.mjs");
   const workerExit = path.join(home, "worker-exit");
+  const replacementExit = path.join(home, "replacement-exit");
   await writeFile(observer, `import { writeFileSync } from 'node:fs';
     if (process.argv[2] === '--worker') process.on('exit', () => writeFileSync(${JSON.stringify(workerExit)}, String(process.pid)));
+    if (process.env.PIPA_RESTART_ID && process.argv[1] === ${JSON.stringify(cli)}) process.on('exit', () => writeFileSync(${JSON.stringify(replacementExit)}, String(process.pid)));
+    if (process.env.PIPA_RESTART_ID && process.send && ${JSON.stringify(mode)} === 'wrong-generation') {
+      const send = process.send.bind(process);
+      process.send = (message, ...args) => send(message.type === 'ready' ? { ...message, generation: '00000000-0000-0000-0000-000000000000' } : message, ...args);
+    }
   `);
   const environment = {
-    PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
-    ...(process.platform === "win32" ? { SystemRoot: process.env.SystemRoot, ComSpec: process.env.ComSpec, PATHEXT: process.env.PATHEXT } : {}),
-    HOME: home, USERPROFILE: home, PIPA_HOME: path.relative(process.cwd(), home),
+    ...runtime.env,
+    PATH: `${fakeBin}${path.delimiter}${runtime.env.PATH}`,
+    HOME: home, USERPROFILE: home, PIPA_HOME: path.relative(runtime.workspace, home),
     NODE_OPTIONS: `--import=${pathToFileURL(observer).href}`,
+    PIPA_INTEGRATION_SENTINEL: "integration-kept",
+    OPENCODE_SERVER_PASSWORD: "synthetic-private-password",
+    PIPA_SLACK_BOT_TOKEN: "xoxb-forbidden-child-marker", Slack_Client_Secret: "forbidden-child-marker",
   };
-  const original = spawn(process.execPath, [cli, "start"], { env: environment, stdio: "ignore" });
+  let original;
+  let replacement;
+  runtime.defer(async () => {
+    const recordedPids = new Set();
+    let gracefulShutdown = false;
+    await waitFor(async () => {
+      const status = await restartStatus({ home });
+      if (status?.replacement?.pid) recordedPids.add(status.replacement.pid);
+      if (status?.state === "running" || status?.phase === "arming"
+        || (status?.state === "unconfirmed" && status.phase !== "acceptance")) return false;
+      const lock = await readInstanceLock(paths.lock);
+      for (const pid of [lock?.pid, original?.pid, replacement?.pid].filter(Boolean)) recordedPids.add(pid);
+      // Let the private engine's exit release its owner's lock before Windows SIGTERM.
+      if (!gracefulShutdown) {
+        const shutdown = await fetch(`${url}/shutdown`, {
+          headers: { authorization: `Basic ${Buffer.from("opencode:synthetic-private-password").toString("base64")}` },
+          signal: AbortSignal.timeout(500),
+        }).catch(() => undefined);
+        gracefulShutdown = Boolean(shutdown?.ok);
+        if (gracefulShutdown) return false;
+      }
+      if (gracefulShutdown && lock) return false;
+      const stopped = await stopInstance(paths.lock);
+      if (stopped) recordedPids.add(stopped);
+      const [current, portClosed] = await Promise.all([
+        readInstanceLock(paths.lock),
+        fetch(url, { signal: AbortSignal.timeout(500) }).then(() => false, () => true),
+      ]);
+      if (current || !portClosed || [...recordedPids].some((pid) => isRunning(pid))) return false;
+      const settled = await restartStatus({ home });
+      if (settled?.state === "failed" && settled.phase === "starting" && !replacement?.pid) {
+        const exitedPid = Number(await readFile(replacementExit, "utf8").catch(() => ""));
+        if (!Number.isSafeInteger(exitedPid) || exitedPid <= 0 || isRunning(exitedPid)) return false;
+      }
+      return settled?.state !== "running" && settled?.phase !== "arming"
+        && !(settled?.state === "unconfirmed" && settled.phase !== "acceptance");
+    }, { timeoutMs: 8_000, label: "private CLI profile handoff/stop/lock/port/processes" });
+  }, "Managed CLI profile cleanup");
+  original = runtime.spawn(process.execPath, [cli, "start"], { env: environment }).child;
+  let output = "";
+  for (const stream of [original.stdout, original.stderr]) stream.on("data", (chunk) => { output += chunk; });
   const originalExit = new Promise((resolve, reject) => {
     original.once("error", reject);
     original.once("exit", (code) => resolve(code));
   });
-  let replacement;
-  t.after(async () => {
-    await fetch(`${url}/shutdown`, { signal: AbortSignal.timeout(2_000) }).catch(() => undefined);
-    try { await until(async () => !await readInstanceLock(paths.lock), 8_000); }
-    finally {
-      // Windows fixture wrappers are process trees; never strand their Node child.
-      for (const pid of [original.exitCode === null ? original.pid : null, replacement?.pid].filter(Boolean)) {
-        if (process.platform === "win32") spawnSync("taskkill", ["/pid", String(pid), "/t", "/f"], { stdio: "ignore" });
-        else { try { process.kill(pid, "SIGTERM"); } catch {} }
-      }
-      await rm(home, { recursive: true, force: true });
-    }
-  });
-  await until(async () => fetch(`${url}/session/status`).then((response) => response.ok, () => false));
+  // Requests may precede watcher startup; replacement readiness is asserted at
+  // the authenticated workspace barrier below, never inferred from listening.
+  await until(async () => fetch(url).then(() => true, () => false));
   const identity = await readInstanceLock(paths.lock);
   assert.equal(identity.pid, original.pid);
-  const request = spawnSync(process.execPath, [cli, "restart"], { env: environment, encoding: "utf8" });
+  const request = spawnSync(process.execPath, [cli, "restart"], { cwd: runtime.workspace, env: environment, encoding: "utf8" });
   assert.equal(request.status, 0, request.stderr);
   assert.match(request.stdout, /Restart requested/u);
+  if (mode === "ready") {
+    await until(() => readFile(path.join(home, "workspace-probed"), "utf8").catch(() => false));
+    assert.equal((await restartStatus({ home })).state, "running", "Authenticated identity is not workspace readiness");
+    assert.notEqual((await readInstanceLock(paths.lock)).generation, identity.generation);
+    await assert.rejects(readFile(workerExit), { code: "ENOENT" });
+    await writeFile(path.join(home, "workspace-release"), "ready");
+  }
   const outcome = await until(async () => {
     const status = await restartStatus({ home });
     const lock = await readInstanceLock(paths.lock);
     if (lock && lock.pid !== original.pid) replacement = lock;
-    if (status?.state === "unconfirmed") assert.fail(JSON.stringify(status));
+    if (status?.state === "unconfirmed" && mode !== "unready") assert.fail(JSON.stringify(status));
     return ["completed", "failed"].includes(status?.state) ? status : false;
-  }, 45_000);
+  }, mode === "unready" ? 90_000 : 45_000);
   assert.equal(await originalExit, 0);
+  assert.doesNotMatch(output + JSON.stringify(outcome), /synthetic-private-password|forbidden-child-marker/u);
   if (mode !== "ready") {
     assert.equal(outcome.state, "failed");
     assert.equal(outcome.phase, "starting");
-    assert.equal(await readInstanceLock(paths.lock), null);
+    await until(async () => !await readInstanceLock(paths.lock));
     await assert.rejects(fetch(`${url}/session/status`, { signal: AbortSignal.timeout(1_000) }));
     await until(() => readFile(workerExit, "utf8").catch(() => false));
     assert.equal(await readFile(paths.config, "utf8"), configBefore);
@@ -127,9 +256,9 @@ for (const mode of ["ready", "unready", "startup-failure"]) test(`isolated Manag
   assert.notEqual(replacement.generation, identity.generation);
   await until(() => readFile(workerExit, "utf8").catch(() => false));
   await delay(300);
-  assert.equal((await fetch(`${url}/session/status`)).ok, true);
+  assert.equal((await fetch(url)).status, 401);
   assert.deepEqual(await readInstanceLock(paths.lock), replacement);
-  const status = spawnSync(process.execPath, [cli, "restart", "--status"], { env: environment, encoding: "utf8" });
+  const status = spawnSync(process.execPath, [cli, "restart", "--status"], { cwd: runtime.workspace, env: environment, encoding: "utf8" });
   assert.equal(JSON.parse(status.stdout).state, "completed");
   assert.equal(await readFile(paths.config, "utf8"), configBefore);
 });

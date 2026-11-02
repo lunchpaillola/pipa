@@ -1,0 +1,68 @@
+{
+  "generation": "v1",
+  "version": "1.19.0",
+  "provenance": {
+    "source": "Pipa native HTTP tests and independently authored v1 wire examples; real-engine spike qualified 1.18.35/1.19.0",
+    "reference": "https://opencode.ai/docs/sdk/",
+    "kind": "synthetic native wire fixture, not a captured user profile"
+  },
+  "prompt": "  contract `prompt` $(untouched) café  \n",
+  "expected": { "sessionId": "ses_contract", "text": "contract complete" },
+  "continuation": { "sessionId": "ses_contract", "text": "history retained" },
+  "routes": [
+    { "method": "GET", "path": "/question", "query": { "directory": "$WORKSPACE" }, "repeatLast": true, "responses": [{ "json": [] }] },
+    {
+      "method": "GET", "path": "/path", "query": { "directory": "$WORKSPACE" },
+      "responses": [{ "json": { "directory": "$WORKSPACE", "worktree": "$WORKSPACE", "home": "$TEMP", "state": "$TEMP", "config": "$TEMP" } }]
+    },
+    {
+      "method": "GET", "path": "/global/health",
+      "responses": [{ "json": { "healthy": true, "version": "1.19.0" } }]
+    },
+    {
+      "method": "POST", "path": "/session", "query": { "directory": "$WORKSPACE" }, "body": {},
+      "responses": [{ "json": { "id": "ses_contract", "directory": "$WORKSPACE", "title": "Contract", "time": { "created": 1, "updated": 1 } } }]
+    },
+    {
+      "method": "GET", "path": "/session/status", "query": { "directory": "$WORKSPACE" }, "repeatLast": true,
+      "responses": [{ "json": { "ses_contract": { "type": "idle" } } }]
+    },
+    {
+      "method": "GET", "path": "/session/ses_contract/message", "query": { "limit": "1", "directory": "$WORKSPACE" }, "repeatLast": true,
+      "responses": [
+        { "json": [{ "info": { "id": "msg_old", "role": "assistant", "time": { "completed": 1 } }, "parts": [{ "type": "text", "text": "stale output must not deliver" }] }] },
+        { "json": [{ "info": { "id": "msg_result", "role": "assistant", "finish": "stop", "time": { "completed": 3 } }, "parts": [{ "type": "reasoning", "text": "private reasoning must not deliver" }, { "type": "text", "text": "contract complete" }] }] },
+        { "json": [{ "info": { "id": "msg_result", "role": "assistant", "finish": "stop", "time": { "completed": 3 } }, "parts": [{ "type": "text", "text": "contract complete" }] }] },
+        { "json": [{ "info": { "id": "msg_continued", "role": "assistant", "finish": "stop", "time": { "completed": 5 } }, "parts": [{ "type": "text", "text": "history retained" }] }] }
+      ]
+    },
+    {
+      "method": "POST", "path": "/session/ses_contract/prompt_async", "query": { "directory": "$WORKSPACE" }, "repeatLast": true,
+      "responses": [{ "status": 204 }]
+    },
+    {
+      "method": "GET", "path": "/event", "query": { "directory": "$WORKSPACE" },
+      "responses": [{ "sse": "data: {\"type\":\"question.asked\",\"properties\":{\"id\":\"que_contract\",\"sessionID\":\"ses_contract\",\"questions\":[{\"header\":\"Color\",\"question\":\"Pick one\",\"options\":[{\"label\":\"Blue\",\"description\":\"Continue\"}]}]}}\n\ndata: {\"type\":\"question.asked\",\"properties\":{\"id\":\"que_contract\",\"sessionID\":\"ses_contract\",\"questions\":[{\"header\":\"Color\",\"question\":\"Pick one\",\"options\":[{\"label\":\"Blue\",\"description\":\"Continue\"}]}]}}\n\ndata: {\"type\":\"permission.asked\",\"properties\":{\"id\":\"per_contract\",\"sessionID\":\"ses_child\",\"permission\":\"bash\",\"patterns\":[\"pwd\"]}}\n\n" }]
+    },
+    {
+      "method": "GET", "path": "/permission", "query": { "directory": "$WORKSPACE" }, "repeatLast": true,
+      "responses": [{ "json": [] }]
+    },
+    {
+      "method": "GET", "path": "/session/ses_child", "query": { "directory": "$WORKSPACE" },
+      "responses": [{ "json": { "id": "ses_child", "parentID": "ses_contract", "directory": "$WORKSPACE" } }]
+    },
+    {
+      "method": "POST", "path": "/question/que_contract/reply", "query": { "directory": "$WORKSPACE" }, "body": { "answers": [["Blue"]] },
+      "responses": [{ "json": true }]
+    },
+    {
+      "method": "POST", "path": "/permission/per_contract/reply", "query": { "directory": "$WORKSPACE" }, "body": { "reply": "once" },
+      "responses": [{ "json": true }]
+    },
+    {
+      "method": "POST", "path": "/session/ses_contract/abort", "query": { "directory": "$WORKSPACE" },
+      "responses": [{ "json": true }]
+    }
+  ]
+}

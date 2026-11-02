@@ -5,7 +5,7 @@ import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { canonicalWorkingDirectory, createManifest, createModelSetting, createSessionStore, loadConfig, pipaPaths, saveConfig, slackCommandNames } from "./state.mjs";
 import { createModelPicker } from "./models.mjs";
-import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaRestartingError, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
+import { checkOpenCodeConnection, createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, parseOpenCodeVersion, PipaRestartingError, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
 import { assertRoutineDestinationAllowed, createRoutineScheduler, loadRoutineState } from "./routines.mjs";
 
 class RoutineDeniedError extends Error {}
@@ -23,8 +23,10 @@ export async function initializePipa(input, options = {}) {
     allowedSlackBotIds: normalizeIdList(input.allowedSlackBotIds),
     mentionOnly: input.mentionOnly === true,
   };
-  const openCodeVersion = await (options.checkOpenCode ?? runOpenCodeVersion)();
-  if (!/^v?1(?:\.|$)/u.test(openCodeVersion)) throw new Error(`Pipa requires OpenCode v1; found ${openCodeVersion || "an unknown version"}.`);
+  const environment = options.environment ?? process.env;
+  const attachUrl = environment.PIPA_OPENCODE_ATTACH_URL?.trim();
+  if (attachUrl) await checkOpenCodeConnection(attachUrl, config.workingDirectory, options);
+  else parseOpenCodeVersion(await (options.checkOpenCode ?? runOpenCodeVersion)(options));
   await (options.checkSlackAppToken ?? checkSlackAppToken)(config.slackAppToken);
   const slackAuth = await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
   warnMissingSlackScopes(slackAuth, options.warn);
@@ -70,8 +72,12 @@ export async function startPipa(options = {}) {
     executor = options.executor ?? (options.createExecutor ?? createOpenCodeExecutor)({
       artifactRoot: path.join(config.workingDirectory, ".pipa", "artifacts"),
       baseUrl: server.baseUrl,
+      connection: server.connection,
+      recoveryFile: paths.openCodeRecovery,
       onFatal: server.fail,
     });
+    await executor.ready?.(config.workingDirectory);
+    options.signal?.throwIfAborted();
   } catch (error) {
     server?.stop();
     await withTimeout(server?.wait(), options.shutdownTimeoutMs ?? 15_000, "OpenCode shutdown timed out.").catch(() => undefined);
@@ -177,7 +183,7 @@ export async function startPipa(options = {}) {
     const pending = pendingReactions.get(conversationKey) ?? [];
     if (pending.at(-1)?.message !== currentMessage) return;
     pendingReactions.delete(conversationKey);
-    for (const entry of pending) await finishReaction(entry.thread, entry.message, entry.message === currentMessage ? emoji : "white_check_mark");
+    for (const entry of pending) await finishReaction(entry.thread, entry.message, entry.message === currentMessage ? emoji : null);
   };
 
   const handle = async (thread, message, subscribe) => {
@@ -191,7 +197,7 @@ export async function startPipa(options = {}) {
     const attachments = message.attachments ?? [];
     if (subscribe) await thread.subscribe();
     if (attachments.some(({ size }) => size !== undefined && (!Number.isSafeInteger(size) || size < 0 || size > MAX_ATTACHMENT_BYTES))) {
-      await thread.post("Pipa can read files up to 100 MB each.");
+      await thread.post("Pipa can read files up to 10 MiB each.");
       return;
     }
     if (!accepting) return;
@@ -247,7 +253,7 @@ export async function startPipa(options = {}) {
       await chat.thread(conversationKey).subscribe();
       options.signal?.throwIfAborted();
     }
-    await withTimeout(chat.initialize(), options.startupTimeoutMs ?? 30_000, "Slack Socket Mode startup timed out.");
+    await withTimeout(chat.initialize(), options.startupTimeoutMs, "Slack Socket Mode startup timed out.", options.signal);
     options.signal?.throwIfAborted();
     await routineScheduler?.start();
     options.signal?.throwIfAborted();
@@ -318,8 +324,11 @@ export function createPipaSlackAdapter(options, drainTimeoutMs = 3_000) {
   };
   const route = adapter.routeSocketEvent.bind(adapter);
   const disconnect = adapter.disconnect.bind(adapter);
+  const startSocketMode = adapter.startSocketMode.bind(adapter);
   const pending = new Set();
   let disconnecting;
+  // SDK auth may settle after shutdown; do not create a socket in that case.
+  adapter.startSocketMode = (...args) => disconnecting ? Promise.resolve() : startSocketMode(...args);
   // The pinned adapter's async EventEmitter listener neither observes route
   // rejections nor drains acknowledgments before closing its Socket Mode client.
   adapter.routeSocketEvent = (...args) => {
@@ -370,9 +379,23 @@ export function createPendingInteractions(allowedUserIds = []) {
       threadId: context.thread.id,
       loadAllowedUserIds: context.loadAllowedUserIds,
       authorize: context.authorize,
+      native: typeof interaction.submit === "function",
+    };
+    entry.choose = async (value) => {
+      if (entry.busy || entry.decision !== undefined) return;
+      entry.busy = true;
+      try {
+        await interaction.submit?.(value);
+        if (!interaction.signal.aborted) entry.resolve(value);
+      } catch {
+        if (entry.decision !== undefined || interaction.signal.aborted) return;
+        entry.questionIndex = 0;
+        entry.error = "OpenCode rejected or could not confirm this response. Edit your answer and retry.";
+        await entry.message?.edit();
+      } finally { entry.busy = false; }
     };
     const decision = new Promise((resolve, reject) => {
-      const abort = () => reject(interaction.signal.reason);
+      const abort = () => { entry.decision ??= { type: "stopped" }; reject(interaction.signal.reason); };
       entry.resolve = (value) => {
         if (entry.decision !== undefined) return;
         entry.decision = value;
@@ -382,7 +405,12 @@ export function createPendingInteractions(allowedUserIds = []) {
       if (interaction.signal.aborted) abort();
       else interaction.signal.addEventListener("abort", abort, { once: true });
     });
+    // A queued card can be cancelled before its predecessor releases the thread.
+    void decision.catch(() => undefined);
     pending.set(token, entry);
+    // Native settlement is independent of the responder callback (another client
+    // may answer or a location reload may cancel while this card is queued).
+    interaction.settled?.then(() => entry.resolve({ type: "cancelled" }), () => entry.resolve({ type: "cancelled" }));
     const requestId = interaction.request.requestID ?? interaction.request.requestId ?? interaction.request.id;
     const permissionKey = interaction.type === "permission" && requestId ? `${interaction.sessionId}:${requestId}` : null;
     if (permissionKey) permissionRequests.set(permissionKey, entry);
@@ -403,7 +431,7 @@ export function createPendingInteractions(allowedUserIds = []) {
       await submit(entry, result);
       return result;
     } finally {
-      if (entry.decision === undefined) {
+      if (!entry.submitted) {
         entry.resolve?.({ type: "stopped" });
         await submit(entry, { type: "stopped" }).catch(() => undefined);
       }
@@ -416,12 +444,13 @@ export function createPendingInteractions(allowedUserIds = []) {
 
   function onPermissionReplied({ sessionId, requestId, reply }) {
     const entry = permissionRequests.get(`${sessionId}:${requestId}`);
+    if (entry?.native) return;
     entry?.resolve?.(reply === "reject" ? { type: "reject" } : { type: "reply", reply });
   }
 
   function onPermissionsReconciled({ sessionId, requestIds }) {
     for (const entry of permissionRequests.values()) {
-      if (entry.sessionId === sessionId && !requestIds.has(entry.requestId)) entry.resolve?.({ type: "cancelled" });
+      if (!entry.native && entry.sessionId === sessionId && !requestIds.has(entry.requestId)) entry.resolve?.({ type: "cancelled" });
     }
   }
 
@@ -437,19 +466,21 @@ export function createPendingInteractions(allowedUserIds = []) {
     if (!entry) return;
     if ((event.threadId ?? event.thread?.id) !== entry.threadId) return;
     if (!await canRespond(entry, event.user)) return;
+    if (entry.busy || entry.decision !== undefined || entry.type === "form") return;
     if (event.actionId?.startsWith("pipa_dismiss_")) {
-      entry.resolve?.({ type: "stop" });
+      await entry.choose({ type: "stop" });
       return;
     }
     if (entry.type === "permission") {
       const reply = String(event.value ?? "").split(".")[1];
       if (!["once", "always", "reject"].includes(reply)) return;
       const selectedBy = displayName(event.user?.fullName ?? event.user?.userName);
-      entry.resolve?.(reply === "reject" ? { type: "reject", ...(selectedBy ? { selectedBy } : {}) } : { type: "reply", reply, ...(selectedBy ? { selectedBy } : {}) });
+      await entry.choose(reply === "reject" ? { type: "reject", ...(selectedBy ? { selectedBy } : {}) } : { type: "reply", reply, ...(selectedBy ? { selectedBy } : {}) });
       return;
     }
     if (event.actionId?.startsWith("pipa_custom_")) {
-      await event.openModal?.(Modal({ callbackId: "pipa_custom", privateMetadata: token, title: "Custom answer", submitLabel: "Submit", children: [TextInput({ id: "answer", label: "Answer" })] }));
+      const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
+      await event.openModal?.(Modal({ callbackId: "pipa_custom", privateMetadata: token, title: "Custom answer", submitLabel: "Submit", children: [TextInput({ id: "answer", label: question.multiple ? "Answer (replaces checkbox selections)" : "Answer" })] }));
       return;
     }
     if (entry.type !== "question") return;
@@ -460,8 +491,14 @@ export function createPendingInteractions(allowedUserIds = []) {
       return;
     }
     if (event.actionId?.startsWith("pipa_submit_")) {
+      // Submit carries the current UI state even if earlier selection events arrive late.
+      const values = event.raw?.state?.values;
+      const blockId = `pipa_question_${entry.token}_${entry.questionIndex}`;
+      if (values && !Object.hasOwn(values, blockId)) return;
+      const selection = values?.[blockId]?.[`pipa_select_${entry.token}`];
+      if (selection) entry.answers[entry.questionIndex] = selectedAnswers(event, selection);
       if (!entry.answers[entry.questionIndex]?.length) return;
-      advance(entry, event.user);
+      await advance(entry, event.user);
       return;
     }
   }
@@ -471,16 +508,18 @@ export function createPendingInteractions(allowedUserIds = []) {
     if (!entry) return;
     if (event.relatedThread?.id !== entry.threadId) return;
     if (!await canRespond(entry, event.user)) return;
+    if (entry.busy || entry.decision !== undefined || entry.type !== "question") return;
     const answer = event.values?.answer?.trim();
     if (!answer) return { action: "errors", errors: { answer: "Enter an answer." } };
+    // Custom answers intentionally replace selections rather than combine with them.
     entry.answers[entry.questionIndex] = [answer];
-    advance(entry, event.user);
+    await advance(entry, event.user);
   }
 
-  function advance(entry, user) {
+  async function advance(entry, user) {
     if (++entry.questionIndex === (entry.request.questions?.length ?? 1)) {
       const selectedBy = displayName(user?.fullName ?? user?.userName);
-      entry.resolve?.({ type: "answer", answers: entry.answers, ...(selectedBy ? { selectedBy } : {}) });
+      await entry.choose({ type: "answer", answers: entry.answers, ...(selectedBy ? { selectedBy } : {}) });
     }
     else entry.message?.edit();
   }
@@ -546,10 +585,12 @@ async function postInteraction(thread, entry) {
 }
 
 function renderSlackInteraction(entry) {
+  if (entry.type === "form") return [slackHeader(entry.request.title || "OpenCode form"), slackText("This form requires an OpenCode client response. Pipa will remove this notice when it is settled.")];
   if (entry.type === "permission") {
     const resources = entry.request.patterns ?? entry.request.resources ?? [];
     return [
       slackHeader("Permission requested"),
+      ...(entry.error ? [slackText(entry.error)] : []),
       slackText(permissionDetail(entry.request, resources)),
       slackActions([
         slackButton(`pipa_permission_once_${entry.token}`, "Allow once", `${entry.token}.once`, "primary"),
@@ -571,7 +612,7 @@ function renderSlackInteraction(entry) {
     ...(options.length ? [slackButton(`pipa_submit_${entry.token}`, "Submit", entry.token, "primary")] : []),
     slackButton(`pipa_dismiss_${entry.token}`, "Dismiss", entry.token, "danger"),
   ];
-  return [slackHeader(question.header || "Question"), slackText(question.question ?? question.header ?? "Choose an answer."), ...(selector ? [slackActions([selector])] : []), slackActions(actions)];
+  return [slackHeader(question.header || "Question"), ...(entry.error ? [slackText(entry.error)] : []), slackText(question.question ?? question.header ?? "Choose an answer."), ...(selector ? [{ ...slackActions([selector]), block_id: `pipa_question_${entry.token}_${entry.questionIndex}` }] : []), slackActions(actions)];
 }
 
 function renderSlackSubmitted(entry, decision) {
@@ -637,9 +678,8 @@ function slackButton(actionId, text, value, style) {
   return { type: "button", action_id: actionId, text: { type: "plain_text", text }, value, ...(style ? { style } : {}) };
 }
 
-function selectedAnswers(event) {
-  const action = event.raw?.actions?.find((item) => item.action_id === event.actionId);
-  const values = action?.selected_options?.map((option) => option.value) ?? [event.value];
+function selectedAnswers(event, action = event.raw?.actions?.find((item) => item.action_id === event.actionId)) {
+  const values = action?.selected_options?.map((option) => option.value) ?? [action?.selected_option?.value ?? event.value];
   return values.filter(Boolean).map((value) => String(value).split(".").slice(1).join(".")).filter(Boolean);
 }
 
@@ -924,15 +964,25 @@ async function finishReaction(thread, message, emoji) {
   if (emoji) await react(thread, message, emoji);
 }
 
-async function withTimeout(promise, timeoutMs, message) {
+async function withTimeout(promise, timeoutMs, message, signal) {
   if (!promise) return;
+  if (timeoutMs === undefined && !signal) return promise;
   let timer;
+  let abort;
   try {
     return await Promise.race([
       promise,
-      new Promise((_, reject) => timer = setTimeout(() => reject(new Error(message)), timeoutMs)),
+      new Promise((_, reject) => {
+        if (timeoutMs !== undefined) timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+        if (signal) {
+          abort = () => reject(signal.reason);
+          if (signal.aborted) abort();
+          else signal.addEventListener("abort", abort, { once: true });
+        }
+      }),
     ]);
   } finally {
-    clearTimeout(timer);
+    if (timer !== undefined) clearTimeout(timer);
+    if (abort) signal.removeEventListener("abort", abort);
   }
 }

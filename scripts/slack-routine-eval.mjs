@@ -1,179 +1,78 @@
-import { execFile } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { isRunning, loadConfig, readInstanceLock } from "../src/state.mjs";
+import { slackDestinationId } from "../src/app.mjs";
+import { assertRoutine, liveContext, runCli, safeError, sleep, waitFor, withAppLock } from "./verification/slack-eval.mjs";
 
-const runFile = promisify(execFile);
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const cli = path.join(root, "bin", "pipa.mjs");
-const outputDirectory = path.join(root, "tmp", "slack-routine-evals");
-const timeoutMs = Number.parseInt(process.env.SLACK_ROUTINE_EVAL_TIMEOUT_MS ?? "300000", 10);
-const pollMs = Number.parseInt(process.env.SLACK_ROUTINE_EVAL_POLL_MS ?? "3000", 10);
-const nonce = `routine-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-const evidence = { status: "FAIL", nonce, startedAt: new Date().toISOString(), steps: [] };
-let routineId;
-let baselineIds = new Set();
-
-try {
-  const context = await preflight();
-  Object.assign(evidence, { channelId: context.channelId, teamId: context.teamId });
-  baselineIds = new Set((await listRoutines()).map((routine) => routine.id));
-
-  const rootMessage = await slack("chat.postMessage", {
-    channel: context.channelId,
-    text: `<@${context.botUserId}> Preview a local Pipa routine with prompt exactly "Reply with exactly: ROUTINE PASS ${nonce}". Use timezone UTC, this concrete channel ${context.channelId}, no thread, and --in 1m. Do not create it yet. Show me the normalized preview including the nonce.`,
-  });
-  evidence.rootTs = rootMessage.ts;
-  evidence.threadUrl = slackThreadUrl(context.teamId, context.channelId, rootMessage.ts);
-  evidence.steps.push({ id: "request-preview", status: "PASS", ts: rootMessage.ts });
-
-  const preview = await waitForReply(context, rootMessage.ts, rootMessage.ts, (message) => message.text?.includes(nonce) && /preview|next run|schedule/iu.test(message.text));
-  evidence.steps.push({ id: "preview", status: "PASS", ts: preview.ts });
-
-  const confirmation = await slack("chat.postMessage", {
-    channel: context.channelId,
-    thread_ts: rootMessage.ts,
-    text: `I confirm the preview for ${nonce}. Create that exact routine now, then reply with its routine ID.`,
-  });
-  evidence.steps.push({ id: "confirm", status: "PASS", ts: confirmation.ts });
-
-  const routine = await waitForRoutine();
-  routineId = routine.id;
-  evidence.routineId = routine.id;
-  evidence.nextRunAt = routine.nextRunAt;
-  evidence.steps.push({ id: "created", status: "PASS", routineId: routine.id, nextRunAt: routine.nextRunAt });
-
-  const result = await waitForResult(context, Date.now() / 1000 - 5);
-  evidence.resultTs = result.ts;
-  evidence.steps.push({ id: "exact-destination-result", status: "PASS", ts: result.ts });
-  await sleep(35_000);
-  const duplicates = await matchingTopLevelResults(context, Date.now() / 1000 - (timeoutMs + 60_000) / 1000);
-  if (duplicates.length !== 1) throw new Error(`Expected one nonce result, found ${duplicates.length}.`);
-  evidence.steps.push({ id: "single-result", status: "PASS", count: 1 });
-  evidence.status = "PASS";
-} catch (error) {
-  evidence.error = safeError(error);
-  process.exitCode = 1;
-} finally {
+export async function runRoutineEval(context, { threadTs, nonce = `routine-${randomUUID()}` } = {}) {
+  const original = await context.routines();
+  const baseline = new Set(original.map((r) => r.id));
+  const prompt = `Reply with exactly: ROUTINE PASS ${nonce}`;
+  const evidence = { nonce, status: "FAIL", destination: { channelId: context.channelId, threadTs: threadTs ?? null } };
+  // ponytail: the evaluator attaches to an operator-owned candidate; only nonce
+  // routines are removed. Process startup/stop belongs to the operator runbook.
   try {
-    const matches = (await listRoutines()).filter((routine) => !baselineIds.has(routine.id) && routine.prompt.includes(nonce));
-    for (const routine of matches) await runCli("routine", "delete", routine.id, "--json");
-    evidence.cleanup = { status: "PASS", deletedRoutineIds: matches.map((routine) => routine.id) };
-    if (routineId && !matches.some((routine) => routine.id === routineId)) evidence.cleanup.note = "Routine was already absent.";
-  } catch (error) {
-    evidence.cleanup = { status: "FAIL", error: safeError(error) };
-    evidence.status = "FAIL";
-    process.exitCode = 1;
+    const request = await context.post(`<@${context.botUserId}> Preview a local Pipa routine with prompt exactly ${JSON.stringify(prompt)}. Use timezone UTC, channel ${context.channelId}, ${threadTs ? `existing thread ${threadTs}` : "no thread"}, and --in 1m. Do not create it yet. Show the normalized preview including ${nonce}.`, threadTs);
+    const rootTs = threadTs ?? request.ts;
+    evidence.previewTs = (await waitFor(async () => (await context.replies(rootTs)).find((m) => Number(m.ts) > Number(request.ts) && m.text?.includes(nonce) && /preview|next run|schedule/iu.test(m.text)))).ts;
+    assert.deepEqual(await context.routines(), original, "Preview changed routine state");
+    const before = Date.now();
+    await context.post(`I confirm that preview for ${nonce}. Create the exact routine now using --in 1m, then reply with its ID.`, rootTs);
+    const routine = await waitFor(async () => {
+      const matches = (await context.routines()).filter((r) => !baseline.has(r.id) && r.prompt.includes(nonce));
+      assert.ok(matches.length <= 1, "Duplicate nonce routines");
+      return matches[0];
+    });
+    assertRoutine(routine, { prompt, channelId: context.channelId, threadTs, before, after: Date.now() });
+    evidence.routineId = routine.id;
+    evidence.schedule = routine.schedule;
+    const results = async () => {
+      const messages = threadTs ? await context.reader.messages("conversations.replies", { channel: context.channelId, ts: threadTs })
+        : await context.reader.messages("conversations.history", { channel: context.channelId, oldest: String(before / 1000), inclusive: "true" });
+      return messages.filter((m) => m.user === context.botUserId && (threadTs ? m.thread_ts === threadTs : !m.thread_ts || m.thread_ts === m.ts) && m.text?.trim() === `ROUTINE PASS ${nonce}`);
+    };
+    const result = await waitFor(async () => { const matches = await results(); assert.ok(matches.length <= 1, "Duplicate scheduled results"); return matches[0]; });
+    const completed = await waitFor(async () => { const saved = (await context.routines()).find((r) => r.id === routine.id); return saved?.status === "completed" && saved; });
+    assert.equal(completed.lastRun?.status, "succeeded");
+    assert.equal(completed.lastRun?.trigger, "scheduled");
+    assert.equal(completed.nextRunAt, null);
+    const resultThread = threadTs ?? result.ts;
+    const key = slackDestinationId({ channelId: context.channelId, threadTs: resultThread });
+    const session = (await context.sessions())[key];
+    assert.ok(session, "Routine result session mapping");
+    const followup = await context.post(`Reply with exactly: CONTINUED ${nonce}`, resultThread);
+    await waitFor(async () => (await context.replies(resultThread)).find((m) => Number(m.ts) > Number(followup.ts) && m.text?.trim() === `CONTINUED ${nonce}`));
+    assert.equal((await context.sessions())[key], session);
+    await sleep(35000); // Observe a subsequent production scheduler boundary.
+    assert.equal((await results()).length, 1);
+    Object.assign(evidence, { status: "PASS", resultTs: result.ts, sessionId: session, duplicateCount: 0 });
+  } catch (error) { evidence.error = safeError(error); }
+  finally {
+    try {
+      const matches = (await context.routines()).filter((r) => !baseline.has(r.id) && r.prompt.includes(nonce));
+      for (const routine of matches) await runCli(context.cli, "routine", "delete", routine.id, "--json");
+      assert.ok(!(await context.routines()).some((r) => !baseline.has(r.id) && r.prompt.includes(nonce)));
+      evidence.cleanup = { status: evidence.status === "PASS" ? "PASS" : "FAIL", deleted: matches.map((r) => r.id),
+        ...(evidence.status !== "PASS" ? { pendingTurnUnconfirmed: true, observed: "Visible nonce routines removed, but outstanding agent settlement is unconfirmed. Stop/drain the candidate and reconcile nonce routines before releasing the app lock." } : {}) };
+    } catch (error) { evidence.cleanup = { status: "FAIL", error: safeError(error) }; evidence.status = "FAIL"; }
   }
-  evidence.completedAt = new Date().toISOString();
-  await mkdir(outputDirectory, { recursive: true });
-  const file = path.join(outputDirectory, `${nonce}.json`);
-  await writeFile(file, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });
-  process.stdout.write(`${evidence.status} Local Pipa routine Slack eval\nEvidence: ${file}\n`);
-  if (evidence.threadUrl) process.stdout.write(`Thread: ${evidence.threadUrl}\n`);
-  if (evidence.error) process.stderr.write(`${evidence.error}\n`);
+  return evidence;
 }
 
-async function preflight() {
-  const token = requiredEnv("SLACK_USER_TOKEN");
-  const channelId = requiredEnv("SLACK_TEST_CHANNEL_ID");
-  const botUserId = requiredEnv("SLACK_PIPA_BOT_USER_ID");
-  if (!/^[CG][A-Z0-9]+$/u.test(channelId)) throw new Error("SLACK_TEST_CHANNEL_ID must be a concrete Slack channel ID.");
-  const config = await loadConfig();
-  if (config.slackMode !== "socket") throw new Error("The configured Pipa profile is not using Socket Mode.");
-  if (config.allowedSlackChannelIds?.length && !config.allowedSlackChannelIds.includes(channelId)) throw new Error("The eval channel is not in allowedSlackChannelIds.");
-  const pid = (await readInstanceLock())?.pid;
-  if (!pid || !isRunning(pid)) throw new Error("A local `pipa start` Socket Mode process must be running.");
-  const auth = await slackWithToken(token, "auth.test", {});
-  if (config.allowedSlackUserIds?.length && !config.allowedSlackUserIds.includes(auth.user_id)) throw new Error("The Slack eval user is not in allowedSlackUserIds.");
-  await slackWithToken(token, "conversations.info", { channel: channelId });
-  return { token, channelId, botUserId, teamId: auth.team_id };
-}
-
-async function waitForRoutine() {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const matches = (await listRoutines()).filter((routine) => !baselineIds.has(routine.id) && routine.prompt.includes(nonce));
-    if (matches.length > 1) throw new Error(`Found ${matches.length} new nonce routines; expected one.`);
-    if (matches.length === 1) return matches[0];
-    await sleep(Math.min(pollMs, deadline - Date.now()));
+async function main() {
+  const directory = fileURLToPath(new URL("../tmp/slack-routine-evals/", import.meta.url));
+  let evidence;
+  try {
+    const context = await liveContext(path.resolve(process.env.PIPA_TEST_CLI || fileURLToPath(new URL("../bin/pipa.mjs", import.meta.url))));
+    evidence = await withAppLock(context, () => runRoutineEval(context));
   }
-  throw new Error("Timed out waiting for the confirmed routine to appear.");
+  catch (error) { evidence = { status: "BLOCKED", error: safeError(error) }; }
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const file = path.join(directory, `${randomUUID()}.json`);
+  await writeFile(file, JSON.stringify(evidence, null, 2), { mode: 0o600, flag: "wx" });
+  process.stdout.write(`${evidence.status} routine evaluation; private evidence: ${file}\n`);
+  process.exitCode = evidence.status === "PASS" ? 0 : 1;
 }
-
-async function waitForResult(context, oldest) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const matches = await matchingTopLevelResults(context, oldest);
-    if (matches.length > 1) throw new Error(`Found ${matches.length} nonce results; expected one.`);
-    if (matches.length === 1) return matches[0];
-    await sleep(Math.min(pollMs, deadline - Date.now()));
-  }
-  throw new Error("Timed out waiting for the scheduled Slack result.");
-}
-
-async function matchingTopLevelResults(context, oldest) {
-  const history = await slack("conversations.history", { channel: context.channelId, oldest: String(oldest), limit: "100", inclusive: "true" });
-  return (history.messages ?? []).filter((message) => !message.thread_ts && isBot(message, context.botUserId) && message.text?.trim() === `ROUTINE PASS ${nonce}`);
-}
-
-async function waitForReply(context, rootTs, afterTs, predicate) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const replies = await slack("conversations.replies", { channel: context.channelId, ts: rootTs, limit: "100" });
-    const match = (replies.messages ?? []).find((message) => Number(message.ts) > Number(afterTs) && isBot(message, context.botUserId) && predicate(message));
-    if (match) return match;
-    await sleep(Math.min(pollMs, deadline - Date.now()));
-  }
-  throw new Error("Timed out waiting for Pipa's routine preview.");
-}
-
-async function listRoutines() {
-  const output = JSON.parse(await runCli("routine", "list", "--json"));
-  return output.routines;
-}
-
-async function runCli(...args) {
-  const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/(?:^|_)SLACK(?:_[A-Z0-9]+)*_(?:TOKEN|SECRET)$/iu.test(key)));
-  const { stdout } = await runFile(process.execPath, [cli, ...args], { cwd: root, env: environment });
-  return stdout;
-}
-
-async function slack(method, fields) {
-  return slackWithToken(requiredEnv("SLACK_USER_TOKEN"), method, fields);
-}
-
-async function slackWithToken(token, method, fields) {
-  const response = await fetch(`https://slack.com/api/${method}`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${token}`, "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams(fields),
-  });
-  const result = await response.json();
-  if (!response.ok || !result.ok) throw new Error(`Slack API ${method} failed: ${result.error ?? response.statusText}`);
-  return result;
-}
-
-function isBot(message, botUserId) {
-  return message.user === botUserId;
-}
-
-function requiredEnv(name) {
-  const value = process.env[name]?.trim();
-  if (!value) throw new Error(`${name} is required.`);
-  return value;
-}
-
-function slackThreadUrl(teamId, channelId, ts) {
-  return `https://app.slack.com/client/${teamId}/${channelId}/thread/${channelId}-${ts.replace(".", "")}`;
-}
-
-function safeError(error) {
-  return (error instanceof Error ? error.message : String(error)).replace(/xox[baprs]-[^\s]+|xapp-[^\s]+/gu, "[redacted]").slice(0, 500);
-}
-
-function sleep(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, Math.max(1, milliseconds)));
-}
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url) && !process.env.NODE_TEST_CONTEXT) await main();

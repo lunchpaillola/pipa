@@ -1,10 +1,14 @@
-import crossSpawn from "cross-spawn";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { chmod, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { createServer } from "node:net";
 import { pathToFileURL } from "node:url";
+import { createRuntimeFixture } from "../test/helpers/runtime-fixture.mjs";
 
-const directory = await mkdtemp(path.join(os.tmpdir(), "pipa-pack-"));
+const runtime = await createRuntimeFixture({ timeoutMs: 120000 });
+const directory = runtime.root;
+runtime.env.npm_config_cache = path.join(runtime.cache, "npm");
+runtime.env.npm_config_userconfig = path.join(runtime.config, "npmrc");
+await writeFile(runtime.env.npm_config_userconfig, "");
 const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 const filename = `${packageJson.name.replace("@", "").replace("/", "-")}-${packageJson.version}.tgz`;
 try {
@@ -20,12 +24,24 @@ try {
   const installedRoot = path.join(directory, "install", "node_modules", "@usepipa", "pipa");
   const packedRuntime = await import(pathToFileURL(path.join(installedRoot, "src", "opencode.mjs")).href);
   if (typeof packedRuntime.createOpenCodeExecutor !== "function") throw new Error("Packed OpenCode executor is unavailable.");
+  for (const [file, name] of [["opencode-v1.mjs", "createV1Adapter"], ["opencode-v2.mjs", "createV2Adapter"]]) {
+    const adapter = await import(pathToFileURL(path.join(installedRoot, "src", file)).href);
+    if (typeof adapter[name] !== "function") throw new Error(`Packed ${file} is unavailable.`);
+  }
   const packedModels = await import(pathToFileURL(path.join(installedRoot, "src", "models.mjs")).href);
   if (typeof packedModels.createModelPicker !== "function") throw new Error("Packed model picker is unavailable.");
   const packedRestart = await import(pathToFileURL(path.join(installedRoot, "src", "restart.mjs")).href);
   if (typeof packedRestart.startRestartWatcher !== "function" || typeof packedRestart.runRestartWorker !== "function") throw new Error("Packed restart worker is unavailable.");
   const installedCli = path.join(installedRoot, "bin", "pipa.mjs");
 
+  for (const version of ["1.19.0", "2.0.29", "2.2.5"]) await smoke(version, installedCli, stdout.trim());
+} finally {
+  await runtime.teardown();
+}
+
+async function smoke(version, installedCli, pipaVersion) {
+  const directory = path.join(runtime.root, version);
+  await mkdir(directory);
   const home = path.join(directory, "home");
   const workingDirectory = path.join(directory, "work");
   const fakeBin = path.join(directory, "fake-bin");
@@ -35,17 +51,25 @@ try {
     mkdir(workingDirectory),
     mkdir(fakeBin),
   ]);
+  const reservation = createServer();
+  await new Promise((resolve, reject) => {
+    reservation.once("error", reject);
+    reservation.listen(0, "127.0.0.1", resolve);
+  });
+  const managedPort = reservation.address().port;
+  await new Promise((resolve) => reservation.close(resolve));
   const fakeScript = path.join(fakeBin, "fake-opencode.cjs");
   await writeFile(fakeScript, `
 const fs = require("node:fs");
 if (process.argv[2] === "--version") {
-  console.log("1.0.0");
+  console.log(${JSON.stringify(version)});
 } else {
-  const expectedArgs = ["serve", "--hostname", "127.0.0.1", "--port", "4096", "--log-level", "ERROR"];
+  const expectedArgs = ["serve", "--hostname", "127.0.0.1", "--port", ${JSON.stringify(String(managedPort))}, "--log-level", ${JSON.stringify(version.startsWith("1.") ? "ERROR" : "error")}];
   const environmentKeys = ["OPENCODE_DB", "OPENCODE_CONFIG_CONTENT", "PIPA_API_BASE_URL", "PIPA_EXECUTION_SECRET", "COMPOSIO_API_KEY", "OPENAI_API_KEY"];
   if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(expectedArgs)) throw new Error("Unexpected Managed OpenCode arguments.");
   if (process.cwd() !== process.env.EXPECTED_CWD) throw new Error("Unexpected Managed OpenCode working directory.");
   if (environmentKeys.some((key) => process.env[key] !== "pack-sentinel")) throw new Error("Managed OpenCode environment was not inherited.");
+  if (process.env.PIPA_SLACK_BOT_TOKEN || process.env.Slack_Client_Secret) throw new Error("Slack secret reached Managed OpenCode.");
   fs.writeFileSync(process.env.ASSERT_FILE, "managed-ok");
   process.exitCode = 23;
 }
@@ -57,7 +81,7 @@ if (process.argv[2] === "--version") {
   if (process.platform !== "win32") await chmod(fakeOpenCode, 0o755);
 
   const init = await run(process.execPath, [installedCli, "init"], {
-    ...process.env,
+    ...runtime.env,
     HOME: home,
     USERPROFILE: home,
     PIPA_HOME: home,
@@ -69,7 +93,7 @@ if (process.argv[2] === "--version") {
     PIPA_ALLOWED_BOT_IDS: "",
     PIPA_MENTION_ONLY: "true",
     NODE_OPTIONS: `--import=${pathToFileURL(path.join(directory, "fetch-mock.mjs")).href}`,
-    PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+    PATH: `${fakeBin}${path.delimiter}${runtime.env.PATH}`,
   }, "", workingDirectory);
   if (init.stdout.includes("xapp-test") || init.stdout.includes("xoxb-test")) throw new Error("Packed init echoed Slack credentials.");
   if (init.stdout.includes("api.slack.com/apps?new_app=1")) throw new Error("Non-interactive init opened Slack setup.");
@@ -92,7 +116,7 @@ if (process.argv[2] === "--version") {
   if (await readFile(path.join(home, ".pipa", "config.json"), "utf8") !== beforeExport) throw new Error("Packed manifest export changed config.");
 
   const preview = await run(process.execPath, [installedCli, "routine", "create", "--prompt", "Pack preview", "--timezone", "America/New_York", "--channel", "C123", "--every", "1d", "--times", "05:00", "--preview", "--json"], {
-    ...process.env,
+    ...runtime.env,
     PIPA_HOME: home,
   }, "", workingDirectory);
   const previewJson = JSON.parse(preview.stdout);
@@ -104,13 +128,13 @@ if (process.argv[2] === "--version") {
 
   const cancelledHome = path.join(directory, "cancelled-home");
   await mkdir(cancelledHome);
-  const restartHelp = await run(process.execPath, [installedCli, "restart", "--help"], { ...process.env, PIPA_HOME: cancelledHome });
+  const restartHelp = await run(process.execPath, [installedCli, "restart", "--help"], { ...runtime.env, PIPA_HOME: cancelledHome });
   if (!restartHelp.stdout.includes("pipa restart [--status]")) throw new Error("Packed restart help is unavailable.");
-  const restartStatus = await run(process.execPath, [installedCli, "restart", "--status"], { ...process.env, PIPA_HOME: cancelledHome });
+  const restartStatus = await run(process.execPath, [installedCli, "restart", "--status"], { ...runtime.env, PIPA_HOME: cancelledHome });
   if (!restartStatus.stdout.includes("No restart requested")) throw new Error("Packed restart status is unavailable.");
   if (await readFile(path.join(cancelledHome, ".pipa", "pipa.lock"), "utf8").then(() => true, () => false)) throw new Error("Packed restart status mutated state.");
   const cancelled = await run(process.execPath, [installedCli, "init"], {
-    ...process.env,
+    ...runtime.env,
     PIPA_HOME: cancelledHome,
     PIPA_BOT_NAME: "Pack Bot",
   }, "n\n", workingDirectory);
@@ -129,14 +153,14 @@ if (process.argv[2] === "--version") {
     workingDirectory: managedWorkingDirectory,
     slackMode: "managed",
     openCodeHostname: "127.0.0.1",
-    openCodePort: 4096,
+    openCodePort: managedPort,
   }));
   let managedError;
   try {
     await run(process.execPath, [installedCli, "start"], {
-      ...process.env,
+      ...runtime.env,
       PIPA_HOME: managedHome,
-      PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+      PATH: `${fakeBin}${path.delimiter}${runtime.env.PATH}`,
       EXPECTED_CWD: managedWorkingDirectory,
       ASSERT_FILE: assertionFile,
       OPENCODE_DB: "pack-sentinel",
@@ -145,21 +169,24 @@ if (process.argv[2] === "--version") {
       PIPA_EXECUTION_SECRET: "pack-sentinel",
       COMPOSIO_API_KEY: "pack-sentinel",
       OPENAI_API_KEY: "pack-sentinel",
+      PIPA_SLACK_BOT_TOKEN: "xoxb-forbidden-child-marker",
+      Slack_Client_Secret: "forbidden-child-marker",
     }, "", workingDirectory);
   } catch (error) {
     managedError = error;
   }
-  if (await readFile(assertionFile, "utf8") !== "managed-ok") throw new Error("Packed Managed start did not run OpenCode.");
+  const managedAssertion = await readFile(assertionFile, "utf8").catch((error) => {
+    throw new Error(`Packed Managed start did not run OpenCode: ${managedError?.message ?? error.message}`, { cause: managedError ?? error });
+  });
+  if (managedAssertion !== "managed-ok") throw new Error("Packed Managed start did not run OpenCode.");
   if (!managedError?.message.includes("OpenCode server exited unexpectedly with code 23")) throw new Error("Packed Managed start did not propagate the OpenCode exit.");
   if (managedError.message.includes("pack-sentinel")) throw new Error("Packed Managed start exposed an environment secret.");
-  process.stdout.write(`Packed CLI ${stdout.trim()} installed, loaded its runtimes, previewed a routine, initialized, cancelled, and ran Managed start successfully.\n`);
-} finally {
-  await rm(directory, { recursive: true, force: true });
+  process.stdout.write(`Packed CLI ${pipaVersion} loaded both adapters/client, previewed a routine, initialized, cancelled, and ran Managed start with native ${version} contract.\n`);
 }
 
 function run(command, args, environment, input, currentDirectory) {
   return new Promise((resolve, reject) => {
-    const child = crossSpawn(command, args, { cwd: currentDirectory, env: environment ?? process.env, stdio: ["pipe", "pipe", "pipe"] });
+    const { child } = runtime.spawn(command, args, { cwd: currentDirectory ?? process.cwd(), env: environment ?? runtime.env, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => stdout += chunk);
