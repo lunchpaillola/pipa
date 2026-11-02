@@ -10,6 +10,8 @@ import { assertRoutineDestinationAllowed, createRoutineScheduler, loadRoutineSta
 
 class RoutineDeniedError extends Error {}
 
+const WORKING_REACTION = "white_check_mark";
+
 export async function initializePipa(input, options = {}) {
   const paths = options.paths ?? pipaPaths();
   const manifest = createManifest(input.botName);
@@ -196,7 +198,7 @@ export async function startPipa(options = {}) {
     }
     if (!accepting) return;
 
-    await react(thread, message, "eyes");
+    await react(thread, message, WORKING_REACTION);
     const pending = pendingReactions.get(thread.id) ?? [];
     pending.push({ thread, message });
     pendingReactions.set(thread.id, pending);
@@ -920,7 +922,8 @@ async function react(thread, message, emoji) {
 
 async function finishReaction(thread, message, emoji) {
   if (!message.id) return;
-  await thread.adapter.removeReaction(thread.id, message.id, "eyes").catch(() => undefined);
+  if (emoji === WORKING_REACTION) return;
+  await thread.adapter.removeReaction(thread.id, message.id, WORKING_REACTION).catch(() => undefined);
   if (emoji) await react(thread, message, emoji);
 }
 

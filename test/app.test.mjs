@@ -710,15 +710,15 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   assert.equal(calls.find(({ prompt }) => prompt === "no declared size").attachments[0].size, undefined);
   assert.equal(restored.filter((item) => item === "subscribed").length, 3);
   assert.deepEqual([...reactions].sort(), [
-    "add:1:eyes", "remove:1:eyes", "add:1:white_check_mark",
-    "add:2:eyes", "remove:2:eyes", "add:2:white_check_mark",
-    "add:file-1:eyes", "remove:file-1:eyes", "add:file-1:white_check_mark",
-    "add:file-2:eyes", "remove:file-2:eyes", "add:file-2:white_check_mark",
-    "add:missing-size:eyes", "remove:missing-size:eyes", "add:missing-size:white_check_mark",
-    "add:broken:eyes", "remove:broken:eyes", "add:broken:warning",
-    "add:3:eyes", "remove:3:eyes", "add:3:white_check_mark",
-    "add:4:eyes", "remove:4:eyes", "add:4:warning",
-    "add:5:eyes", "remove:5:eyes", "add:5:white_check_mark",
+    "add:1:white_check_mark",
+    "add:2:white_check_mark",
+    "add:file-1:white_check_mark",
+    "add:file-2:white_check_mark",
+    "add:missing-size:white_check_mark",
+    "add:broken:white_check_mark", "remove:broken:white_check_mark", "add:broken:warning",
+    "add:3:white_check_mark",
+    "add:4:white_check_mark", "remove:4:white_check_mark", "add:4:warning",
+    "add:5:white_check_mark",
   ].sort());
   await app.shutdown();
   assert.deepEqual(restored.slice(-2), ["stopped", "shutdown"]);
@@ -772,7 +772,7 @@ test("Slack posts short text and artifacts once", async () => {
   await mention();
   await waitFor(() => posts.length === 1);
   assert.deepEqual(posts, [{ markdown: "Executive summary.", files }]);
-  assert.deepEqual(reactions, ["add:eyes", "remove:eyes", "add:white_check_mark"]);
+  assert.deepEqual(reactions, ["add:white_check_mark"]);
   await app.shutdown();
 
   const inline = await deliveryApp({ text: "Short answer.", files: [] });
@@ -797,11 +797,11 @@ test("failed artifact post retries declaration-free text once without files", as
     { markdown: "Summary.", files },
     { markdown: "Summary." },
   ]);
-  assert.deepEqual(delivery.reactions, ["add:eyes", "remove:eyes", "add:white_check_mark"]);
+  assert.deepEqual(delivery.reactions, ["add:white_check_mark"]);
   await delivery.app.shutdown();
 });
 
-test("interrupted Slack messages keep their eyes until the latest turn succeeds", async () => {
+test("interrupted Slack messages keep their checkmark until the latest turn succeeds", async () => {
   const handlers = {};
   const reactions = [];
   const posts = [];
@@ -849,15 +849,11 @@ test("interrupted Slack messages keep their eyes until the latest turn succeeds"
   await waitFor(() => firstStarted);
   await handlers.subscribed(thread, { id: "2", text: "second", author, raw: {} });
   await waitFor(() => secondStarted);
-  assert.deepEqual(reactions, ["add:1:eyes", "add:2:eyes"]);
+  assert.deepEqual(reactions, ["add:1:white_check_mark", "add:2:white_check_mark"]);
 
   finishSecond();
-  await waitFor(() => reactions.length === 6);
-  assert.deepEqual(reactions, [
-    "add:1:eyes", "add:2:eyes",
-    "remove:1:eyes", "add:1:white_check_mark",
-    "remove:2:eyes", "add:2:white_check_mark",
-  ]);
+  await waitFor(() => posts.length === 1);
+  assert.deepEqual(reactions, ["add:1:white_check_mark", "add:2:white_check_mark"]);
   assert.deepEqual(posts, [{ markdown: "second complete" }]);
   await app.shutdown();
 });
@@ -953,7 +949,7 @@ test("reports an intentional stop for an active Slack turn", async () => {
   await app.shutdown();
 
   assert.deepEqual(posts, ["Piper was stopped. It won't respond until it starts again."]);
-  assert.deepEqual(reactions, ["add:eyes", "remove:eyes"]);
+  assert.deepEqual(reactions, ["add:white_check_mark", "remove:white_check_mark"]);
 });
 
 test("restores a restarting thread and continues its session", async () => {
