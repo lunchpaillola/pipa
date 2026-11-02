@@ -530,7 +530,8 @@ test("already-exited group leader cannot hide a living child from cleanup", asyn
       import { existsSync, writeFileSync } from 'node:fs';
       import { waitFor } from ${JSON.stringify(new URL("../../test/helpers/runtime-fixture.mjs", import.meta.url).href)};
       const ready = process.argv[1] + '.ready';
-      const child = spawn(process.execPath, ['-e', "require('node:fs').writeFileSync(process.argv[1], 'ready'); setInterval(() => {}, 1000)", ready], { stdio: 'ignore' });
+      // Windows must detach from the leader's console to survive its exit.
+      const child = spawn(process.execPath, ['-e', "require('node:fs').writeFileSync(process.argv[1], 'ready'); setInterval(() => {}, 1000)", ready], { stdio: 'ignore', detached: process.platform === 'win32' });
       await waitFor(() => {
         if (child.exitCode !== null || child.signalCode !== null) throw new Error('Descendant exited before readiness');
         return existsSync(ready);
