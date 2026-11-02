@@ -447,8 +447,8 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
   }, "profile locks and file staging");
   const config = { botName: "Matrix", workingDirectory: runtime.workspace, slackAppToken: "xapp-synthetic", slackBotToken: "xoxb-synthetic", allowedSlackChannelIds: ["CMATRIX"], allowedSlackUserIds: ["UMATRIX"], allowedSlackBotIds: [] };
   const provider = await createProvider(runtime);
-  const definitions = await writeDefinitions(runtime, `DEFINITION_${randomUUID()}`, pin);
-  const engineConfig = { ...providerConfig(provider.url), ...definitions.config };
+  const definitions = smoke ? null : await writeDefinitions(runtime, `DEFINITION_${randomUUID()}`, pin);
+  const engineConfig = { ...providerConfig(provider.url), ...definitions?.config };
   if (pin.startsWith("2.") && (!caseIds || caseIds.some((id) => id.startsWith("models-")))) {
     const modelProvider = (id) => ({ package: "@opencode/ai/providers/openai-compatible", settings: { baseURL: provider.url, apiKey: "synthetic-local-only" }, headers: { "x-matrix-provider": id }, models: {
       matrix: { variants: [{ id: "measured", body: { temperature: 0.37 } }], limit: { context: 64000, output: 8000 } },
@@ -1474,8 +1474,11 @@ throw Error('Native file-command completion deadline exceeded');
       assert.deepEqual(await state.readInstanceLock(paths.lock), replacement);
       assert.equal(JSON.parse(await runCli("restart", "--status")).state, "completed");
       cell.evidence.restart = { requestId: outcome.id, old, replacement, workerPids: [...workerPids], ...(smoke ? { workerExitObserved: false } : { workersExited: true }), durableState: outcome.state, lifecycleStatus: "PASS", followupStatus: "FAIL" };
-      const result = await turn("after-restart", { onInteraction: async () => ({ type: "reply", reply: "once" }) }, { tool: environmentTool(textFor("after-restart")) });
+      const result = await turn("after-restart", smoke ? { sessionId: cell.evidence.sessionId } : { onInteraction: async () => ({ type: "reply", reply: "once" }) }, smoke
+        ? { verify: (messages) => assert.ok(JSON.stringify(messages).includes(promptFor("exact")), "Restart lost session history") }
+        : { tool: environmentTool(textFor("after-restart")) });
       assertTurnOutcome(result, { sessionId: result.sessionId, text: textFor("after-restart") });
+      if (smoke) assert.equal(result.sessionId, cell.evidence.sessionId);
       cell.evidence.restart.followupStatus = "PASS";
     },
     "socket-fixture-restart": async () => {
@@ -1543,12 +1546,14 @@ throw Error('Native file-command completion deadline exceeded');
         }
         await probe.waitFor(async () => (await snapshot())?.posts.some((post) => post.content === "Matrix restarted and is ready."), { timeoutMs: 5000, label: "routed ready notice" });
         const afterPrompt = promptFor("socket-after-restart");
-        provider.register({ prompt: afterPrompt, text: textFor("socket-after-restart"), tool: environmentTool(textFor("socket-after-restart")), verify: (messages) => assert.ok(JSON.stringify(messages).includes(prompt), "Restart lost session history") });
+        provider.register({ prompt: afterPrompt, text: textFor("socket-after-restart"), ...(!smoke ? { tool: environmentTool(textFor("socket-after-restart")) } : {}), verify: (messages) => assert.ok(JSON.stringify(messages).includes(prompt), "Restart lost session history") });
         await state.writePrivateJson(path.join(probe.state, "input.json"), { id: "after", thread, prompt: afterPrompt, mention: false });
-        const control = await probe.waitFor(async () => (await snapshot())?.controls.find((item) => item.thread === thread), { timeoutMs: 15000, label: "replacement native tool approval" });
-        const action = control.blocks.flatMap((block) => block.elements ?? []).find((item) => item.action_id.startsWith("pipa_permission_once_"));
-        assert.ok(action);
-        await state.writePrivateJson(path.join(probe.state, "input.json"), { id: "approve", action: { actionId: action.action_id, value: action.value, threadId: thread, user: { userId: "UMATRIX" } } });
+        if (!smoke) {
+          const control = await probe.waitFor(async () => (await snapshot())?.controls.find((item) => item.thread === thread), { timeoutMs: 15000, label: "replacement native tool approval" });
+          const action = control.blocks.flatMap((block) => block.elements ?? []).find((item) => item.action_id.startsWith("pipa_permission_once_"));
+          assert.ok(action);
+          await state.writePrivateJson(path.join(probe.state, "input.json"), { id: "approve", action: { actionId: action.action_id, value: action.value, threadId: thread, user: { userId: "UMATRIX" } } });
+        }
         const observed = await probe.waitFor(async () => {
           const value = await snapshot();
           return value?.pid === identity.pid && value.posts.some((post) => post.content?.markdown === textFor("socket-after-restart")) && value;

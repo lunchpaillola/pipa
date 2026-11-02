@@ -257,6 +257,8 @@ test("independent concurrent watchers atomically accept only once", async (t) =>
   }));
   await Promise.all(watchers.map((watcher) => watcher.poll()));
   watchers.forEach((watcher) => watcher.stop());
+  // Drain polls already in flight before the fixture directory is removed.
+  await Promise.all(watchers.map((watcher) => watcher.poll()));
   assert.equal(workers, 1);
   await assert.rejects(requestRestart({ home }), /manual stop\/start/);
   assert.equal((await restartStatus({ home })).state, "failed");

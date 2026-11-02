@@ -286,6 +286,8 @@ Anyone allowed by the existing Slack user and channel controls can request a res
 
 The running Pipa launches a detached worker before stopping intake, cleaning up, and releasing its instance lock. The worker waits for the original process and lock to disappear, then starts a detached replacement and confirms workspace readiness (and Slack readiness for Socket Mode). The replacement continues in the background without terminal output; use `pipa stop` to stop it. This works for Socket and Managed profiles on supported macOS, Linux, and Windows systems. Attached OpenCode servers remain externally owned and are never stopped by Pipa.
 
+On Windows, `pipa stop` forcibly terminates Pipa's owned process tree and clears only its unchanged instance lock after exit. It can interrupt active work; `pipa restart` uses the cooperative restart handoff instead.
+
 When a restart is requested from Slack, the bot reports that it is restarting and posts to the same thread after the replacement is ready. A manual stop instead reports that the bot will not respond until it starts again.
 
 Do not chain `pipa stop` and `pipa start` inside an agent turn: stopping owned OpenCode also kills that turn. OpenCode's `/instance/dispose` disposes an instance; it does not restart the server.

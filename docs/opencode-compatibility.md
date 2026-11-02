@@ -14,6 +14,10 @@ and history, the applicable Managed or deterministic Socket CLI restart, and
 stop ownership. The provider and Chat transport are scripted local fixtures;
 no Slack credentials, paid inference or provider quota is used.
 
+The smoke starts a plain provider configuration, without synthetic MCP servers,
+plugins or shell-tool probes. Post-restart checks use an ordinary follow-up and
+verify retained history; integration combinations stay in the manual matrix.
+
 The existing `selectGate`'s `beta-smoke` branch requires every selected applicable result and
 worker/preflight/cleanup/report diagnostic to PASS. Missing or duplicate required
 evidence fails. Unselected or inapplicable cases stay explicitly outside scope;
