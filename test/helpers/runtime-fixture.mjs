@@ -66,7 +66,7 @@ export async function createRuntimeFixture({ environment = process.env, allowEnv
       try { await stopOwned(ownership, cleanupTimeoutMs); }
       catch (error) {
         const known = ["Owned process tree identity could not be proven; roots retained", "Owned PID identity changed; refusing to signal reused PID", "Owned process tree is still alive; roots retained", "Cannot prove Windows process creation identity", "Cannot prove Windows descendant creation identity", "Windows parent PID has an older unowned child; refusing taskkill tree", "Exited Windows parent has an unproven descendant identity"];
-        const diagnostic = known.includes(error.message) || ["PIPA_TEST_WINDOWS_IDENTITY", "PIPA_TEST_WINDOWS_TERMINATION"].includes(error.code) ? error.message : "Unclassified ownership cleanup failure";
+        const diagnostic = known.includes(error.message) || ["PIPA_TEST_WINDOWS_IDENTITY", "PIPA_TEST_WINDOWS_TERMINATION", "PIPA_TEST_OWNERSHIP_UNCERTAIN"].includes(error.code) ? error.message : "Unclassified ownership cleanup failure";
         process.stderr.write(`Runtime fixture ownership cleanup: ${diagnostic}\n`);
         failures.push(error);
       }

@@ -13,7 +13,7 @@ import { createWireFixture, loadWireFixture } from "../../test/helpers/opencode-
 import { createProvider } from "./opencode-provider.mjs";
 import { command } from "../test-opencode-matrix.mjs";
 import { fileURLToPath } from "node:url";
-import { journal, windowsTree } from "../../test/helpers/runtime-ownership.mjs";
+import { journal, stopOwned, windowsTree } from "../../test/helpers/runtime-ownership.mjs";
 import { MIGRATION_TARGET_PIN, selectMigrationTarget } from "./opencode-migration.mjs";
 
 const facade = { checkOpenCodeConnection };
@@ -427,6 +427,110 @@ test("interrupted process registration fails cleanup and retains the owned root"
   assert.match(cell.cleanup.observed, /identity could not be proven/u);
   await access(runtime.root);
   await rm(runtime.root, { recursive: true, force: true });
+});
+
+test("ownership journal reconciles launch uncertainty with later actual process registration before cleanup PASS", async () => {
+  const runtime = await createRuntimeFixture();
+  const owned = runtime.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
+  try {
+    const entries = (await readFile(path.join(runtime.root, "ownership.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
+    const identity = entries.find(item => item.kind === "process" && item.pid === owned.child.pid);
+    assert.ok(identity && Number.isFinite(Date.parse(identity.birth)));
+    const id = identity.id;
+    journal(runtime.ownership, { kind: "intent", id });
+    journal(runtime.ownership, { kind: "unproven", phase: "launch", id, pid: identity.pid });
+    journal(runtime.ownership, { ...identity, id });
+    await stopOwned(runtime.ownership, 5000);
+    await owned.exited;
+    assert.throws(() => process.kill(identity.pid, 0), { code: "ESRCH" });
+    const cell = { cases: [] };
+    await finishCell(cell, runtime);
+    assert.equal(cell.cleanup.status, "PASS", cell.cleanup.observed);
+    await assert.rejects(access(runtime.root), { code: "ENOENT" });
+  } finally {
+    if (owned.child.exitCode === null && owned.child.signalCode === null) owned.child.kill("SIGKILL");
+    await runtime.teardown().catch(() => undefined);
+    await rm(runtime.root, { recursive: true, force: true });
+  }
+});
+
+test("ownership journal keeps exit and unknown uncertainty fatal despite actual process registration", async () => {
+  for (const phase of ["exit", undefined, "unrecognized"]) {
+    const runtime = await createRuntimeFixture();
+    const owned = runtime.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
+    try {
+      const entries = (await readFile(path.join(runtime.root, "ownership.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
+      const identity = entries.find(item => item.kind === "process" && item.pid === owned.child.pid);
+      journal(runtime.ownership, { kind: "unproven", phase, id: identity.id, pid: identity.pid });
+      journal(runtime.ownership, identity);
+      const cell = { cases: [] };
+      await finishCell(cell, runtime);
+      assert.equal(cell.cleanup.status, "FAIL");
+      assert.match(cell.cleanup.observed, /identity could not be proven/u);
+      await owned.exited;
+      assert.throws(() => process.kill(identity.pid, 0), { code: "ESRCH" });
+      await access(runtime.root);
+    } finally {
+      if (owned.child.exitCode === null && owned.child.signalCode === null) owned.child.kill("SIGKILL");
+      await runtime.teardown().catch(() => undefined);
+      await rm(runtime.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("ownership journal refuses launch reconciliation for mismatched PID, root, ID or invalid birth", async () => {
+  for (const mutation of [{ pid: 102 }, { root: "other-root" }, { id: "other-id" }, { birth: null }, { birth: "invalid" }]) {
+    const runtime = await createRuntimeFixture();
+    try {
+      const identity = { kind: "process", id: "synthetic-launch", pid: 101, birth: "2026-10-14T10:00:00.000Z", ...mutation };
+      journal(runtime.ownership, { kind: "intent", id: "synthetic-launch" });
+      journal(runtime.ownership, { kind: "unproven", phase: "launch", id: "synthetic-launch", pid: 101 });
+      const context = mutation.root ? { ...runtime.ownership, root: path.join(runtime.root, mutation.root) } : runtime.ownership;
+      journal(context, identity);
+      // Historical dead evidence prevents these synthetic identities ever being signaled.
+      journal(context, { kind: "dead", id: identity.id });
+      await assert.rejects(stopOwned(runtime.ownership, 5000), error => {
+        assert.equal(error.code, "PIPA_TEST_OWNERSHIP_UNCERTAIN");
+        assert.match(error.message, /launch=1 exit=0 unknown=0 pending-intents=0/u);
+        return true;
+      });
+      const cell = { cases: [] };
+      await finishCell(cell, runtime);
+      assert.equal(cell.cleanup.status, "FAIL");
+      await access(runtime.root);
+    } finally {
+      await runtime.teardown().catch(() => undefined);
+      await rm(runtime.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("ownership journal uncertainty diagnostics contain only bounded root-scoped counts", async () => {
+  const runtime = await createRuntimeFixture();
+  try {
+    for (const phase of ["launch", "exit", undefined]) journal(runtime.ownership, { kind: "unproven", phase, id: "private-id", pid: 123456789 });
+    journal(runtime.ownership, { kind: "intent", id: "private-pending-id" });
+    journal({ ...runtime.ownership, root: runtime.root + "-outside" }, { kind: "unproven", phase: "exit", id: "private-outside" });
+    await assert.rejects(stopOwned(runtime.ownership, 5000), error => {
+      assert.equal(error.code, "PIPA_TEST_OWNERSHIP_UNCERTAIN");
+      assert.equal(error.message, "Owned process tree identity could not be proven; roots retained: launch=1 exit=1 unknown=1 pending-intents=1");
+      for (const privateValue of [runtime.root, runtime.ownership.key, "private-id", "private-pending-id", "123456789", "private-outside"]) assert.ok(!error.message.includes(privateValue));
+      return true;
+    });
+    for (let index = 0; index < 10_000; index++) journal(runtime.ownership, { kind: "unproven", id: "private-overflow" });
+    await assert.rejects(stopOwned(runtime.ownership, 5000), error => {
+      assert.equal(error.code, "PIPA_TEST_OWNERSHIP_UNCERTAIN");
+      assert.equal(error.message, "Owned process tree identity could not be proven; roots retained: launch=1 exit=1 unknown=9999 pending-intents=1");
+      return true;
+    });
+    const cell = { cases: [] };
+    await finishCell(cell, runtime);
+    assert.equal(cell.cleanup.status, "FAIL");
+    await access(runtime.root);
+  } finally {
+    await runtime.teardown().catch(() => undefined);
+    await rm(runtime.root, { recursive: true, force: true });
+  }
 });
 
 test("ownership preload initialization failure does not expose its capability URL", async (t) => {

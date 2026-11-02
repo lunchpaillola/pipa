@@ -99,8 +99,9 @@ export function launchOwned(launch, command, args, options, context) {
   const identity = initial.find((item) => item.pid === child.pid);
   if (!identity) {
     // A fast-exiting leader may already have left descendants: retain uncertainty.
-    const registered = readFileSync(path.join(context.base, "ownership.jsonl"), "utf8").trim().split("\n").filter(Boolean).map(JSON.parse).some((item) => item.kind === "process" && item.id === id);
-    if (!registered) journal(context, { kind: "unproven", id, pid: child.pid });
+    const registered = readFileSync(path.join(context.base, "ownership.jsonl"), "utf8").trim().split("\n").filter(Boolean).map(JSON.parse).some((item) =>
+      item.kind === "process" && item.root === context.root && item.id === id && item.pid === child.pid && Number.isFinite(Date.parse(item.birth)));
+    if (!registered) journal(context, { kind: "unproven", phase: "launch", id, pid: child.pid });
   } else {
     journal(context, { kind: "process", id, ...identity, detached: Boolean(options.detached) });
     if (process.platform === "win32") journal(context, { kind: "witness", id, members: windowsTree(initial, [identity]) });
@@ -112,7 +113,7 @@ export function launchOwned(launch, command, args, options, context) {
       }
       catch {
         // The supervisor may already have verified death and removed the journal.
-        try { journal(context, { kind: "unproven", id, pid: child.pid }); } catch {}
+        try { journal(context, { kind: "unproven", phase: "exit", id, pid: child.pid }); } catch {}
       }
     });
   }
@@ -127,13 +128,15 @@ export async function stopOwned(context, timeoutMs) {
   const signal = (pid, value) => { try { process.kill(pid, value); } catch (error) { if (error.code !== "ESRCH") throw error; } };
   while (true) {
     const entries = records();
-    const uncertain = entries.some((item) => item.kind === "unproven") || entries.some((item) => item.kind === "intent" && !entries.some((end) => end.id === item.id && end.kind !== "intent"));
+    const unresolved = entries.filter((item) => item.kind === "unproven" && !(item.phase === "launch" && entries.some((end) =>
+      end.kind === "process" && end.root === item.root && end.id === item.id && end.pid === item.pid && Number.isFinite(Date.parse(end.birth)))));
+    const launch = unresolved.filter((item) => item.phase === "launch").length;
+    const exit = unresolved.filter((item) => item.phase === "exit").length;
+    const unknown = unresolved.length - launch - exit;
+    const pendingIntents = entries.filter((item) => item.kind === "intent" && !entries.some((end) => end.root === item.root && end.id === item.id && end.kind !== "intent")).length;
+    const uncertain = launch + exit + unknown + pendingIntents > 0;
     const processes = [...new Map(entries.filter((item) => item.kind === "process" && !entries.some((end) => end.kind === "dead" && end.id === item.id)).map((item) => [item.id, item])).values()];
-    if (!processes.length) {
-      if (uncertain) throw new Error("Owned process tree identity could not be proven; roots retained");
-      return;
-    }
-    const live = snapshot("cleanup");
+    const live = processes.length ? snapshot("cleanup") : [];
     let remaining = false;
     for (const owned of processes) {
       const leader = live.find((item) => item.pid === owned.pid);
@@ -177,7 +180,13 @@ export async function stopOwned(context, timeoutMs) {
       signal(owned.detached ? -owned.pid : owned.pid, "SIGKILL");
     }
     if (!remaining) {
-      if (uncertain) throw new Error("Owned process tree identity could not be proven; roots retained");
+      // A preload may register while the synchronous identity snapshot is running.
+      // Include our own appended death records: the next pass reduces fresh evidence.
+      if (records().length !== entries.length) {
+        if (Date.now() >= deadline) throw Object.assign(new Error("Owned process evidence changed after cleanup deadline; roots retained"), { code: "PIPA_TEST_OWNERSHIP_UNCERTAIN" });
+        continue;
+      }
+      if (uncertain) throw Object.assign(new Error(`Owned process tree identity could not be proven; roots retained: launch=${Math.min(launch, 9999)} exit=${Math.min(exit, 9999)} unknown=${Math.min(unknown, 9999)} pending-intents=${Math.min(pendingIntents, 9999)}`), { code: "PIPA_TEST_OWNERSHIP_UNCERTAIN" });
       return;
     }
     if (Date.now() >= deadline) throw new Error("Owned process tree is still alive; roots retained");
@@ -197,7 +206,7 @@ if (supplied) {
       process.once("exit", () => {
         const exitedAt = Date.now();
         try { journal(context, { kind: "witness", id: context.launchId, exitedAt, members: windowsTree(snapshot("exit"), [identity], exitedAt) }); }
-        catch { try { journal(context, { kind: "unproven", id: context.launchId, pid: process.pid }); } catch {} }
+        catch { try { journal(context, { kind: "unproven", phase: "exit", id: context.launchId, pid: process.pid }); } catch {} }
       });
     }
     cp.spawn = (command, args = [], options = {}) => {
