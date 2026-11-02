@@ -51,6 +51,22 @@ pipa start
 
 `pipa init` creates the Slack app manifest, opens the install flow, and saves the profile under `~/.pipa`. Invite Pipa to a channel and mention it. The [3-minute setup video](https://www.youtube.com/watch?v=rlTMdkPWPcA) shows the flow, and the [OpenCode Slack integration guide](https://www.usepipa.com/opencode-slack?utm_source=github&utm_medium=repo_readme&utm_campaign=signup&utm_content=readme_install_guide) is the current written path.
 
+### Opt-in 0.6 beta
+
+`0.6.0-beta.1` is being prepared for controlled testing, not stable release.
+Once published, opt in with:
+
+```sh
+npm install --global @usepipa/pipa@0.6.0-beta.1
+```
+
+Normal installs keep using npm's `latest` tag; subsequent betas use `@beta`.
+This updates Pipa only, not OpenCode. For an existing installation, arrange a
+maintenance window, stop Pipa and back up its profile before installing. Keep
+your current OpenCode version initially; do not rerun `pipa init` or create a
+second listener. See the [beta release notes](https://github.com/lunchpaillola/pipa/blob/main/docs/beta-release.md)
+for changes, limitations, and trial/rollback guidance.
+
 ## Security model
 
 In local mode, Pipa runs on your machine, not behind a relay. The local OpenCode server binds to `127.0.0.1` on an operating-system-assigned port; attached servers follow their own network controls. Slack access is limited by channel, user, and bot allowlists, rechecked on every turn. Tokens stay in the local profile with private file permissions, and OpenCode manages provider credentials.

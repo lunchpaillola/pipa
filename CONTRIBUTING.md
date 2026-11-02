@@ -66,7 +66,22 @@ Pipa follows Semantic Versioning:
 - Backward-compatible fix: patch release (`0.2.0` to `0.2.1`)
 - Breaking change: discuss the version before release
 
-To publish a release:
+### Controlled beta
+
+An opt-in beta is a limited trial, not full stable/platform qualification. For
+`0.6.0-beta.1`, use the [beta notes and publisher checklist](docs/beta-release.md).
+
+1. Confirm the version is unused on npm and record the current `latest` tag.
+2. Update both package files, beta notes and installation instructions in the PR.
+3. Run `npm test`, `npm run test:pack`, and `node --test scripts/verification/self-check.mjs` on that exact version. Inspect `npm publish --dry-run --tag beta --access public` for package contents and accidental private data. Confirm Linux PR CI passes.
+4. Record the scoped native smoke evidence and its platform/head limits. Retain known failures and gaps; do not label a beta `releaseQualified` or require the abandoned migration-status gate.
+5. Obtain explicit owner approval for merge, release tag and GitHub prerelease. Merge only after required CI passes, then tag the actual merged commit as `v0.6.0-beta.1`.
+6. The authorized publisher runs `npm publish --tag beta --access public` from that clean, versioned release checkout. Never omit `--tag beta`, move `latest`, or permanently set `publishConfig.tag` to beta.
+7. Verify npm's `beta` tag points to the new version and `latest` is unchanged. Create the matching GitHub release marked **Pre-release**. Installation into an existing daily profile is a separate owner-approved cutover.
+
+### Stable release
+
+The stronger qualification requirements still apply to a stable dual-engine release:
 
 1. Update `package.json` and `package-lock.json` in the feature pull request.
 2. Run `npm test` and `npm run test:pack`. For this dual-engine candidate, also collect the full required native OS/mode matrix, migration/rollback and private operator/live-client evidence. Missing required evidence blocks release; the automated Slack collector alone cannot certify it.
