@@ -525,9 +525,17 @@ test("already-exited group leader cannot hide a living child from cleanup", asyn
   const evidence = path.join(runtime.workspace, "child.pid");
   let pid;
   try {
-    const leader = runtime.spawn(process.execPath, ["-e", `
-      const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
-      require('node:fs').writeFileSync(process.argv[1], String(child.pid));
+    const leader = runtime.spawn(process.execPath, ["--input-type=module", "-e", `
+      import { spawn } from 'node:child_process';
+      import { existsSync, writeFileSync } from 'node:fs';
+      import { waitFor } from ${JSON.stringify(new URL("../../test/helpers/runtime-fixture.mjs", import.meta.url).href)};
+      const ready = process.argv[1] + '.ready';
+      const child = spawn(process.execPath, ['-e', "require('node:fs').writeFileSync(process.argv[1], 'ready'); setInterval(() => {}, 1000)", ready], { stdio: 'ignore' });
+      await waitFor(() => {
+        if (child.exitCode !== null || child.signalCode !== null) throw new Error('Descendant exited before readiness');
+        return existsSync(ready);
+      });
+      writeFileSync(process.argv[1], String(child.pid));
       child.unref();
     `, evidence]);
     pid = Number(await runtime.waitFor(() => readFile(evidence, "utf8").catch(() => false)));
