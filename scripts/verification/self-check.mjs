@@ -18,6 +18,32 @@ import { MIGRATION_TARGET_PIN, selectMigrationTarget } from "./opencode-migratio
 
 const facade = { checkOpenCodeConnection };
 
+test("Windows PowerShell identity diagnostics compare host and isolated startup/query timings", async (t) => {
+  if (process.platform !== "win32") return;
+  const runtime = await createRuntimeFixture({ timeoutMs: 120_000 });
+  t.after(() => runtime.teardown());
+  const probes = {
+    startup: "[Console]::Out.Write('READY')",
+    pid: `Get-CimInstance Win32_Process -Filter 'ProcessId=${process.pid}' -Property ProcessId,ParentProcessId,CreationDate | ForEach-Object { $_.ProcessId }`,
+    full: "@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate).Count",
+  };
+  for (const [environment, env] of [["host", process.env], ["isolated", runtime.env]]) {
+    for (const [probe, script] of Object.entries(probes)) {
+      const started = performance.now();
+      const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference='Stop'; [Console]::Error.WriteLine('PIPA_CIM_QUERY_STARTED'); ${script}`], {
+        cwd: runtime.workspace, env, encoding: "utf8", timeout: 15_000, windowsHide: true,
+      });
+      // Measurement only: no process records, error messages, paths or environment values.
+      t.diagnostic(JSON.stringify({ environment, probe, elapsedMs: Math.round(performance.now() - started),
+        stage: result.stderr?.includes("PIPA_CIM_QUERY_STARTED") ? "query" : "startup",
+        status: Number.isInteger(result.status) ? result.status : null,
+        errorCode: result.error ? (["ETIMEDOUT", "ENOENT", "EACCES", "EPERM", "ENOBUFS"].includes(result.error.code) ? result.error.code : "OTHER") : null,
+        stdoutBytes: Buffer.byteLength(result.stdout ?? ""), stderrBytes: Buffer.byteLength(result.stderr ?? ""),
+      }));
+    }
+  }
+});
+
 test("timed-out native workers retain bounded progress diagnostics", async (t) => {
   const runtime = await createRuntimeFixture({ timeoutMs: 5000 });
   t.after(() => runtime.teardown());
@@ -448,8 +474,9 @@ test("ownership preload initialization failure does not expose its capability UR
     assert.ok(missing.stderr.startsWith(prefix), "Expected a bounded CIM diagnostic, not a preload stack");
     assert.ok(!missing.stderr.includes(runtime.ownership.key) && !missing.stderr.includes(preload.href), "Private ownership capability was exposed");
     const diagnostic = JSON.parse(missing.stderr.slice(prefix.length));
-    assert.deepEqual(Object.keys(diagnostic), ["phase", "elapsedMs", "timeoutMs", "errorCode", "status", "signal", "stdoutBytes", "stderrBytes"]);
+    assert.deepEqual(Object.keys(diagnostic), ["phase", "stage", "elapsedMs", "timeoutMs", "errorCode", "status", "signal", "stdoutBytes", "stderrBytes"]);
     assert.equal(diagnostic.phase, "preload");
+    assert.equal(diagnostic.stage, "startup");
     assert.equal(diagnostic.errorCode, "ENOENT");
     assert.equal(diagnostic.timeoutMs, 5000);
     assert.ok(Number.isInteger(diagnostic.elapsedMs) && diagnostic.elapsedMs >= 0);

@@ -27,11 +27,11 @@ function snapshot(phase) {
   if (process.platform === "win32") {
     const started = performance.now();
     const timeoutMs = 5000;
-    const script = "$ErrorActionPreference='Stop'; @(Get-CimInstance Win32_Process | ForEach-Object { @{ pid=[int]$_.ProcessId; ppid=[int]$_.ParentProcessId; birth=$(if ($null -ne $_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('o') } else { $null }); state='R' } }) | ConvertTo-Json -Compress";
+    const script = "$ErrorActionPreference='Stop'; [Console]::Error.WriteLine('PIPA_CIM_QUERY_STARTED'); @(Get-CimInstance Win32_Process | ForEach-Object { @{ pid=[int]$_.ProcessId; ppid=[int]$_.ParentProcessId; birth=$(if ($null -ne $_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('o') } else { $null }); state='R' } }) | ConvertTo-Json -Compress";
     const result = cp.spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
     if (result.error || result.status !== 0) {
       const diagnostic = {
-        phase, elapsedMs: Math.round(performance.now() - started), timeoutMs,
+        phase, stage: result.stderr?.includes("PIPA_CIM_QUERY_STARTED") ? "query" : "startup", elapsedMs: Math.round(performance.now() - started), timeoutMs,
         errorCode: result.error ? (["ETIMEDOUT", "ENOENT", "EACCES", "EPERM", "ENOBUFS"].includes(result.error.code) ? result.error.code : "OTHER") : null,
         status: Number.isInteger(result.status) ? result.status : null,
         signal: ["SIGTERM", "SIGKILL"].includes(result.signal) ? result.signal : null,
