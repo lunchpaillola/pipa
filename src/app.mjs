@@ -253,7 +253,7 @@ export async function startPipa(options = {}) {
       await chat.thread(conversationKey).subscribe();
       options.signal?.throwIfAborted();
     }
-    await withTimeout(chat.initialize(), options.startupTimeoutMs ?? 30_000, "Slack Socket Mode startup timed out.");
+    await withTimeout(chat.initialize(), options.startupTimeoutMs, "Slack Socket Mode startup timed out.", options.signal);
     options.signal?.throwIfAborted();
     await routineScheduler?.start();
     options.signal?.throwIfAborted();
@@ -324,8 +324,11 @@ export function createPipaSlackAdapter(options, drainTimeoutMs = 3_000) {
   };
   const route = adapter.routeSocketEvent.bind(adapter);
   const disconnect = adapter.disconnect.bind(adapter);
+  const startSocketMode = adapter.startSocketMode.bind(adapter);
   const pending = new Set();
   let disconnecting;
+  // SDK auth may settle after shutdown; do not create a socket in that case.
+  adapter.startSocketMode = (...args) => disconnecting ? Promise.resolve() : startSocketMode(...args);
   // The pinned adapter's async EventEmitter listener neither observes route
   // rejections nor drains acknowledgments before closing its Socket Mode client.
   adapter.routeSocketEvent = (...args) => {
@@ -961,15 +964,25 @@ async function finishReaction(thread, message, emoji) {
   if (emoji) await react(thread, message, emoji);
 }
 
-async function withTimeout(promise, timeoutMs, message) {
+async function withTimeout(promise, timeoutMs, message, signal) {
   if (!promise) return;
+  if (timeoutMs === undefined && !signal) return promise;
   let timer;
+  let abort;
   try {
     return await Promise.race([
       promise,
-      new Promise((_, reject) => timer = setTimeout(() => reject(new Error(message)), timeoutMs)),
+      new Promise((_, reject) => {
+        if (timeoutMs !== undefined) timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+        if (signal) {
+          abort = () => reject(signal.reason);
+          if (signal.aborted) abort();
+          else signal.addEventListener("abort", abort, { once: true });
+        }
+      }),
     ]);
   } finally {
-    clearTimeout(timer);
+    if (timer !== undefined) clearTimeout(timer);
+    if (abort) signal.removeEventListener("abort", abort);
   }
 }

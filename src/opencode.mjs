@@ -47,7 +47,6 @@ export function cleanChildEnvironment(environment = process.env) {
 export async function startSocketOpenCodeServer(config, options = {}) {
   const environment = options.environment ?? process.env;
   const attachUrl = options.attachUrl ?? environment.PIPA_OPENCODE_ATTACH_URL?.trim();
-  const startupTimeoutMs = options.startupTimeoutMs ?? 30_000;
   if (attachUrl) {
     const baseUrl = normalizeBaseUrl(attachUrl);
     const connection = await checkOpenCodeConnection(baseUrl, config.workingDirectory, { ...options, environment });
@@ -76,7 +75,7 @@ export async function startSocketOpenCodeServer(config, options = {}) {
   const startupSignal = AbortSignal.any([controller.signal, ...(options.signal ? [options.signal] : [])]);
   try {
     const baseUrl = await Promise.race([
-      readListeningUrl(child, startupTimeoutMs, startupSignal),
+      readListeningUrl(child, options.startupTimeoutMs, startupSignal),
       exit.then((code) => { throw new Error(`OpenCode server exited before startup with code ${code}.`); }),
     ]);
     child.stdout?.resume();
@@ -110,10 +109,15 @@ export function createOpenCodeExecutor(options = {}) {
   let capabilities;
   let readiness;
   let stopReason;
+  // Readiness is shared across turns; only stopping the executor cancels its probe.
+  const readinessController = new AbortController();
 
   async function ready(workingDirectory) {
+    if (stopReason) throw stopReason;
     readiness ??= (async () => {
-      const connection = options.connection ?? await checkOpenCodeConnection(baseUrl, workingDirectory, { ...options, environment, fetch: fetchImpl });
+      const connection = options.connection ?? await checkOpenCodeConnection(baseUrl, workingDirectory, { ...options, environment, fetch: fetchImpl,
+        signal: AbortSignal.any([readinessController.signal, ...(options.signal ? [options.signal] : [])]),
+      });
       headers = connection.headers ?? headers;
       capabilities = Object.freeze({ modelDiscovery: true, liveModelSwitch: connection.major === 2 });
       adapter = connection.major === 2
@@ -183,7 +187,7 @@ export function createOpenCodeExecutor(options = {}) {
         controller.signal.throwIfAborted();
         const files = await stageAttachments(attachments, temporaryDirectory, useDataUrls, controller.signal);
         if (stopReason) throw stopReason;
-        await ready(workingDirectory);
+        await abortable(ready(workingDirectory), controller.signal);
         const prepared = await adapter.resolveSession(sessionId, workingDirectory, controller);
         const selectedSessionId = prepared.sessionId;
 
@@ -276,7 +280,7 @@ export function createOpenCodeExecutor(options = {}) {
       else signal?.addEventListener("abort", abort, { once: true });
       active.add(controller);
       try {
-        await ready(workingDirectory);
+        await abortable(ready(workingDirectory), controller.signal);
         controller.signal.throwIfAborted();
         if (!capabilities.liveModelSwitch) throw new Error("OpenCode live model switching is not supported by this adapter.");
         return await adapter.switchModel(sessionId, model, workingDirectory, controller.signal);
@@ -299,6 +303,7 @@ export function createOpenCodeExecutor(options = {}) {
     },
     stopAll(reason = new PipaStoppedError()) {
       stopReason ??= reason;
+      readinessController.abort(stopReason);
       for (const controller of active) controller.abort(stopReason);
     },
   };
@@ -337,7 +342,7 @@ export async function startOpenCodeServer(config, options = {}) {
   });
   void exit.catch(() => undefined);
 
-  const listening = config.openCodePort === 0 ? readListeningUrl(child, options.startupTimeoutMs ?? 30_000, options.signal) : null;
+  const listening = config.openCodePort === 0 ? readListeningUrl(child, options.startupTimeoutMs, options.signal) : null;
   void listening?.catch(() => undefined);
   const server = {
     async ready() {
@@ -368,7 +373,7 @@ export async function runOpenCodeVersion(options = {}) {
   options.signal?.throwIfAborted();
   const spawn = options.spawn ?? crossSpawn;
   const platform = options.platform ?? process.platform;
-  const timeoutMs = options.timeoutMs ?? 30_000;
+  const timeoutMs = options.timeoutMs;
   const child = spawn("opencode", ["--version"], {
     env: cleanChildEnvironment(options.environment ?? process.env),
     shell: false,
@@ -379,13 +384,14 @@ export async function runOpenCodeVersion(options = {}) {
   options.signal?.addEventListener("abort", abort, { once: true });
   try {
     const operation = Promise.all([collect(child.stdout), collect(child.stderr), waitForExit(child)]);
-    const timeout = new Promise((_, reject) => {
+    const timeout = timeoutMs === undefined ? null : new Promise((_, reject) => {
       timer = setTimeout(() => {
         terminateChild(child, platform);
         reject(new Error(`OpenCode version check timed out after ${timeoutMs}ms.`));
       }, timeoutMs);
     });
-    const [stdout, stderr, code] = await (options.signal ? abortable(Promise.race([operation, timeout]), options.signal) : Promise.race([operation, timeout]));
+    const result = timeout ? Promise.race([operation, timeout]) : operation;
+    const [stdout, stderr, code] = await (options.signal ? abortable(result, options.signal) : result);
     if (code !== 0) throw new Error(stderr.trim() || "OpenCode version check failed.");
     return stdout.trim();
   } catch (error) {
@@ -573,9 +579,8 @@ export async function checkOpenCodeConnection(baseUrl, workingDirectory, options
   const fetchImpl = options.fetch ?? fetch;
   const environment = options.environment ?? process.env;
   const signal = options.signal;
-  const deadline = Date.now() + (options.startupTimeoutMs ?? 30_000);
+  const deadline = options.startupTimeoutMs === undefined ? Infinity : Date.now() + options.startupTimeoutMs;
   let connection;
-  let stage = "workspace readiness";
   async function read(pathname, headers, directory, candidate = false) {
     const url = serverUrl(baseUrl, pathname, directory);
     const response = await fetchImpl(url, {
@@ -621,14 +626,6 @@ export async function checkOpenCodeConnection(baseUrl, workingDirectory, options
       }
       const headers = connection.headers;
       if (connection.major === 2) {
-        stage = "migration";
-        const migration = await read("/api/experimental/migration/v1", headers);
-        if (migration?.status === "error" && typeof migration.error === "string") throw new Error("OpenCode migration failed. Resolve the migration with OpenCode before starting Pipa; Pipa state has been retained.");
-        if (migration?.status === "required" || (migration?.status === "running" && typeof migration.progress?.label === "string")) {
-          throw new OpenCodeReadinessError("OpenCode migration is not complete.");
-        }
-        if (migration?.status !== "completed") throw new Error("OpenCode migration protocol has an invalid status. Check the supported runtime.");
-        stage = "workspace readiness";
         const locationUrl = `/api/location?${new URLSearchParams({ "location[directory]": workingDirectory })}`;
         const location = await read(locationUrl, headers);
         if (typeof location?.directory !== "string" || !path.isAbsolute(location.directory) || typeof location.project?.id !== "string"
@@ -649,7 +646,7 @@ export async function checkOpenCodeConnection(baseUrl, workingDirectory, options
     }
     await delay(Math.min(250, Math.max(0, deadline - Date.now())), signal);
   }
-  throw new OpenCodeReadinessError(`OpenCode ${stage} check timed out. ${stage === "migration" ? "Complete the migration with OpenCode before starting Pipa; Pipa state has been retained." : "Check the server and configured working directory."}`);
+  throw new OpenCodeReadinessError("OpenCode workspace readiness check timed out. Check the server and configured working directory.");
 }
 
 function readListeningUrl(child, timeoutMs, signal) {
@@ -672,10 +669,10 @@ function readListeningUrl(child, timeoutMs, signal) {
       if (!match) return;
       finish(resolve, normalizeBaseUrl(match[0]));
     };
-    const timer = setTimeout(() => finish(reject, new Error("OpenCode server did not report its listening URL.")), timeoutMs);
+    const timer = timeoutMs === undefined ? null : setTimeout(() => finish(reject, new Error("OpenCode server did not report its listening URL.")), timeoutMs);
     const closed = () => finish(reject, new Error("OpenCode stopped before reporting its listening URL."));
     const abort = () => finish(reject, signal.reason);
-    timer.unref?.();
+    timer?.unref?.();
     child.stdout?.on("data", inspect);
     child.stderr?.on("data", inspect);
     child.once("close", closed);
@@ -740,7 +737,10 @@ function delay(delayMs, signal) {
 }
 
 function abortable(operation, signal) {
-  if (signal.aborted) return Promise.reject(signal.reason);
+  if (signal.aborted) {
+    void Promise.resolve(operation).catch(() => undefined);
+    return Promise.reject(signal.reason);
+  }
   return new Promise((resolve, reject) => {
     const settle = (callback, value) => {
       signal.removeEventListener("abort", abort);

@@ -7,6 +7,7 @@ import { PassThrough } from "node:stream";
 import test from "node:test";
 import {
   cleanChildEnvironment,
+  checkOpenCodeConnection,
   createOpenCodeExecutor as createExecutor,
   OpenCodeReadinessError,
   parseOpenCodeVersion,
@@ -91,19 +92,21 @@ for (const status of [401, 403]) test(`U1 auth ${status} never downgrades`, asyn
   assert.equal(cancelled, true);
 });
 
-for (const state of ["required", "running", "error"]) test(`U1 v2 migration ${state} gates location readiness`, async () => {
-  let locations = 0;
-  await assert.rejects(startSocketOpenCodeServer({ workingDirectory: "/work" }, {
-    attachUrl: "http://localhost:5555", environment: {}, startupTimeoutMs: 20,
+test("U1 v2 startup checks workspace readiness without consulting migration status", async () => {
+  const calls = [];
+  const server = await startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    attachUrl: "http://localhost:5555", environment: {},
     fetch: async (url) => {
       const pathname = new URL(url).pathname;
+      calls.push(pathname);
       if (pathname === "/global/health") return new Response("<html>");
       if (pathname === "/api/info") return jsonResponse(v2Info);
-      if (pathname === "/api/experimental/migration/v1") return jsonResponse({ status: state, ...(state === "running" ? { progress: { label: "history" } } : {}), ...(state === "error" ? { error: "private details" } : {}) });
-      locations++; return jsonResponse(v2Location);
+      assert.equal(pathname, "/api/location");
+      return jsonResponse(v2Location);
     },
-  }), state === "error" ? /migration failed/iu : /migration.*timed out/iu);
-  assert.equal(locations, 0);
+  });
+  assert.deepEqual(calls, ["/global/health", "/api/info", "/api/location"]);
+  server.stop(); await server.wait();
 });
 
 test("owned v2 launch preserves regex-stack overrides, supports 10 MiB, authenticates and catches mismatch", async () => {
@@ -144,7 +147,7 @@ for (const invalid of ["html", "schema", "major"]) test(`U1 invalid identity ${i
   }), /unsupported|protocol|identity/iu);
 });
 
-test("U1 v2 credential failure stops before migration without a legacy downgrade", async () => {
+test("U1 v2 credential failure stops before workspace access without a legacy downgrade", async () => {
   for (const environment of [{}, { OPENCODE_SERVER_PASSWORD: "wrong", OPENCODE_SERVER_USERNAME: "custom" }, { OPENCODE_PASSWORD: "wrong", OPENCODE_SERVER_PASSWORD: "correct", OPENCODE_SERVER_USERNAME: "custom" }]) {
     const calls = [];
     await assert.rejects(startSocketOpenCodeServer({ workingDirectory: "/work" }, {
@@ -161,9 +164,9 @@ test("U1 v2 credential failure stops before migration without a legacy downgrade
   }
 });
 
-test("U1 migration completes before location; identity is negotiated once", async () => {
+test("U1 workspace readiness retries without renegotiating identity", async () => {
   const calls = [];
-  let migrationReads = 0;
+  let locationReads = 0;
   const server = await startSocketOpenCodeServer({ workingDirectory: "/work" }, {
     attachUrl: "http://localhost:5555", environment: {}, startupTimeoutMs: 1000,
     fetch: async (url) => {
@@ -171,12 +174,100 @@ test("U1 migration completes before location; identity is negotiated once", asyn
       calls.push(pathname);
       if (pathname === "/global/health") return new Response("<html>");
       if (pathname === "/api/info") return jsonResponse(v2Info);
-      if (pathname === "/api/experimental/migration/v1") return jsonResponse(++migrationReads === 1 ? { status: "running", progress: { label: "history" } } : { status: "completed" });
-      return jsonResponse(v2Location);
+      assert.equal(pathname, "/api/location");
+      return ++locationReads === 1 ? jsonResponse({}, 503) : jsonResponse(v2Location);
     },
   });
-  assert.deepEqual(calls, ["/global/health", "/api/info", "/api/experimental/migration/v1", "/api/experimental/migration/v1", "/api/location"]);
+  assert.deepEqual(calls, ["/global/health", "/api/info", "/api/location", "/api/location"]);
   server.stop(); await server.wait();
+});
+
+test("ordinary workspace readiness can take longer than thirty seconds", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"] });
+  let locations = 0;
+  const connection = await checkOpenCodeConnection("http://localhost:5555", "/work", { environment: {},
+    fetch: async (url) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/global/health") return jsonResponse({ healthy: true, version: "1.19.0" });
+      if (pathname === "/session/status") return jsonResponse({});
+      assert.equal(pathname, "/path");
+      if (++locations === 1) { t.mock.timers.tick(31_000); return jsonResponse({}, 503); }
+      return jsonResponse({ directory: "/work" });
+    },
+  });
+  assert.equal(connection.major, 1);
+  assert.equal(locations, 2);
+});
+
+test("ordinary version preflight has no default thirty-second deadline", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const child = childProcess();
+  let killed = false;
+  child.kill = () => { killed = true; return true; };
+  const checking = runOpenCodeVersion({ spawn: () => child, environment: {} });
+  void checking.catch(() => undefined);
+  t.mock.timers.tick(31_000);
+  assert.equal(killed, false);
+  child.stdout.end("OpenCode 1.19.0");
+  child.stderr.end();
+  child.emit("close", 0);
+  assert.equal(await checking, "OpenCode 1.19.0");
+});
+
+test("ordinary owned startup can wait for a listening URL beyond thirty seconds", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const child = childProcess();
+  let killed = false;
+  child.kill = () => { killed = true; queueMicrotask(() => child.emit("close", 0)); return true; };
+  const starting = startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    checkOpenCode: async () => "1.19.0", spawn: () => child, environment: {}, platform: "linux",
+    fetch: async (url) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/global/health") return jsonResponse({ healthy: true, version: "1.19.0" });
+      if (pathname === "/path") return jsonResponse({ directory: "/work" });
+      assert.equal(pathname, "/session/status");
+      return jsonResponse({});
+    },
+  });
+  void starting.catch(() => undefined);
+  await new Promise(setImmediate);
+  t.mock.timers.tick(31_000);
+  await new Promise(setImmediate);
+  assert.equal(killed, false);
+  child.stdout.write("http://127.0.0.1:5555\n");
+  const server = await starting;
+  assert.equal(server.connection.major, 1);
+  server.stop(); await server.wait();
+});
+
+test("a turn can be cancelled while unbounded readiness is pending, and stopAll cancels the probe", async (t) => {
+  const requested = Promise.withResolvers();
+  const executor = createExecutor({ baseUrl: "http://localhost:5555", environment: {},
+    fetch: async (_url, { signal }) => {
+      requested.resolve(signal);
+      return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    },
+  });
+  t.after(() => executor.stopAll());
+  const controller = new AbortController();
+  const turn = executor.runTurn({ prompt: "go", workingDirectory: "/work", signal: controller.signal });
+  const cancelled = assert.rejects(turn, /cancel pending startup/u);
+  const probeSignal = await requested.promise;
+  controller.abort(new Error("cancel pending startup"));
+  await cancelled;
+  executor.stopAll();
+  assert.equal(probeSignal.aborted, true);
+});
+
+for (const method of ["switchModel", "listModels", "runTurn"]) test(`cancelled ${method} observes a readiness failure without an unhandled rejection`, async (t) => {
+  const executor = createExecutor({ baseUrl: "http://localhost:5555", environment: {}, fetch: async () => jsonResponse({}, 401) });
+  t.after(() => executor.stopAll());
+  const controller = new AbortController();
+  if (method !== "runTurn") controller.abort(new Error("cancel readiness"));
+  const operation = executor[method]({ prompt: "go", sessionId: "ses_1", workingDirectory: "/work", signal: controller.signal });
+  if (method === "runTurn") controller.abort(new Error("cancel readiness"));
+  await assert.rejects(operation, /cancel readiness/u);
+  await new Promise(setImmediate);
 });
 
 test("U1 owned preflight missing executable and unsupported version never launch serve", async () => {

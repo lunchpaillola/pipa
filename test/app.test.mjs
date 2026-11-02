@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -114,7 +115,7 @@ for (const version of ["OpenCode v1.19.0", "OpenCode 2.0.29"]) test(`init accept
   assert.equal(JSON.parse(await readFile(pipaPaths(home).config, "utf8")).botName, "Pipa");
 });
 
-for (const migration of ["required", "running", "error"]) test(`U1 Socket migration ${migration} preserves state and blocks subscriptions/scheduler`, async (t) => {
+for (const readiness of ["ready", "auth", "workspace"]) test(`U1 Socket v2 ${readiness} checks readiness without migration calls and preserves state`, async (t) => {
   const runtime = await createRuntimeFixture();
   t.after(() => runtime.teardown());
   const paths = pipaPaths(runtime.home);
@@ -124,25 +125,42 @@ for (const migration of ["required", "running", "error"]) test(`U1 Socket migrat
   await writePrivateJson(paths.routines, { version: 1, routines: [] });
   const files = [paths.config, paths.sessions, paths.routines];
   const before = await Promise.all(files.map((file) => readFile(file, "utf8")));
-  let initialized = false;
-  let scheduler = false;
-  let subscribed = false;
-  await assert.rejects(startPipaRuntime({
-    paths, config, startupTimeoutMs: 20, checkSlackToken: async () => ({ ok: true }),
-    chat: { initialize() { initialized = true; }, thread() { subscribed = true; } },
-    createRoutineScheduler() { scheduler = true; },
+  const events = [];
+  const requests = [];
+  const starting = startPipaRuntime({
+    paths, config, checkSlackToken: async () => ({ ok: true }),
+    chat: { onNewMention() {}, onSubscribedMessage() {},
+      async initialize() { events.push("initialized"); }, async shutdown() {},
+      thread(id) { return { async subscribe() { events.push(id); } }; } },
+    createExecutor: ({ connection }) => {
+      assert.equal(connection.major, 2);
+      return { stopAll() {} };
+    },
+    createRoutineScheduler: () => ({ start() { events.push("scheduler"); }, stop() {}, async drain() {} }),
     startServer: (config, options) => startSocketOpenCodeServer(config, { ...options,
       attachUrl: "http://localhost:5555", environment: {},
       fetch: async (url) => {
         const pathname = new URL(url).pathname;
+        requests.push(pathname);
         if (pathname === "/global/health") return new Response("<html>");
-        if (pathname === "/api/info") return Response.json({ version: "2.0.29", pid: 1, urls: [], paths: { tmp: "/tmp" } });
-        assert.equal(pathname, "/api/experimental/migration/v1");
-        return Response.json({ status: migration, progress: { label: "history" }, error: "not for logs" });
+        if (pathname === "/api/info") return readiness === "auth" ? Response.json({}, { status: 401 })
+          : Response.json({ version: "2.0.29", pid: 1, urls: [], paths: { tmp: "/tmp" } });
+        assert.equal(pathname, "/api/location");
+        assert.equal(new URL(url).searchParams.get("location[directory]"), runtime.workspace);
+        return Response.json({ directory: readiness === "workspace" ? runtime.home : runtime.workspace,
+          project: { id: "prj_test", directory: runtime.workspace, canonical: runtime.workspace } });
       },
     }),
-  }), /migration/iu);
-  assert.equal(initialized || scheduler || subscribed, false);
+  });
+  if (readiness === "ready") {
+    const app = await starting;
+    t.after(() => app.shutdown());
+    assert.deepEqual(events, ["slack:C1:1", "initialized", "scheduler"]);
+  } else {
+    await assert.rejects(starting, readiness === "auth" ? /authentication/iu : /workspace identity mismatch/iu);
+    assert.deepEqual(events, []);
+  }
+  assert.deepEqual(requests, ["/global/health", "/api/info", ...(readiness === "auth" ? [] : ["/api/location"])]);
   assert.deepEqual(await Promise.all(files.map((file) => readFile(file, "utf8"))), before);
 });
 
@@ -157,7 +175,7 @@ test("U1 init attached identity ignores local CLI and preserves config on auth f
     const pathname = new URL(url).pathname;
     if (pathname === "/global/health") return new Response("<html>");
     if (pathname === "/api/info") return Response.json({ version: "2.0.29", pid: 1, urls: [], paths: { tmp: "/tmp" } });
-    if (pathname === "/api/experimental/migration/v1") return Response.json({ status: "completed" });
+    assert.equal(pathname, "/api/location");
     return Response.json({ directory: runtime.workspace, project: { id: "prj_test", directory: runtime.workspace, canonical: runtime.workspace } });
   } });
   const before = await readFile(paths.config, "utf8");
@@ -1183,6 +1201,54 @@ for (const allowedSlackUserIds of [["U1"], []]) test(`handles only allowed Slack
   assert.deepEqual(posts, [{ markdown: "alert fired" }, { markdown: "triage this" }]);
 });
 
+for (const phase of ["auth", "socket"]) test(`Socket startup cancellation during ${phase} prevents late connections and intake`, { timeout: 1_000 }, async (t) => {
+  const adapter = createPipaSlackAdapter({ mode: "socket", appToken: "xapp-test", botToken: "xoxb-test" });
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const events = [];
+  let socket = adapter.socketClient;
+  // Stub only this adapter's newly allocated client, before the SDK starts it.
+  Object.defineProperty(adapter, "socketClient", {
+    get: () => socket,
+    set(value) {
+      socket = value;
+      if (!value) return;
+      events.push("created");
+      value.start = async () => {
+        if (phase === "socket") { entered.resolve(); await release.promise; }
+      };
+      value.disconnect = async () => { events.push("disconnected"); };
+    },
+  });
+  adapter._client.auth.test = async () => {
+    if (phase === "auth") { entered.resolve(); await release.promise; }
+    return { user_id: "UPIPA" };
+  };
+  const chat = new Chat({ adapters: { slack: adapter }, state: createMemoryState(), logger: "silent" });
+  const controller = new AbortController();
+  const reason = new Error("cancel pending Slack startup");
+  const starting = startPipa({
+    chat, signal: controller.signal,
+    checkSlackToken: async () => ({ ok: true }),
+    executor: { stopAll() {} },
+    sessionStore: { keys: () => [] },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+  });
+  const rejected = assert.rejects(starting, (error) => error === reason);
+  t.after(async () => { release.resolve(); await rejected; await chat.shutdown(); });
+  await entered.promise;
+  const initialization = chat.initialize();
+  controller.abort(reason);
+  await rejected;
+  assert.deepEqual(events, phase === "auth" ? [] : ["created", "disconnected"]);
+  release.resolve();
+  await initialization;
+  await adapter.routeSocketEvent({ get type() { assert.fail("late intake after cancellation"); } }, "interactive", async () => assert.fail("late acknowledgment"));
+  await chat.shutdown();
+  assert.deepEqual(events, phase === "auth" ? [] : ["created", "disconnected"]);
+  assert.equal(adapter.socketClient, null);
+});
+
 test("Socket shutdown drains a modal-close acknowledgment before disconnecting", async (t) => {
   const adapter = createPipaSlackAdapter({ mode: "socket", appToken: "xapp-test", botToken: "xoxb-test", botUserId: "UPIPA" });
   const socket = new SocketModeClient({ appToken: "xapp-test", logLevel: "error" });
@@ -1587,6 +1653,53 @@ test("startup timeout shuts Chat down", async () => {
     config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
   }), /startup timed out/u);
   assert.deepEqual(events, ["stopped", "shutdown"]);
+});
+
+test("default Chat startup can finish after 30 seconds", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const entered = Promise.withResolvers();
+  const initialized = Promise.withResolvers();
+  const starting = startPipa({
+    chat: { onNewMention() {}, onSubscribedMessage() {},
+      initialize() { entered.resolve(); return initialized.promise; }, async shutdown() {} },
+    state: { connect: async () => undefined },
+    checkSlackToken: async () => ({ ok: true }),
+    executor: { stopAll() {} },
+    sessionStore: { keys: () => [] },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+  });
+  await entered.promise;
+  t.mock.timers.tick(30_001);
+  initialized.resolve();
+  const app = await starting;
+  await app.shutdown();
+});
+
+for (const startupTimeoutMs of [undefined, 60_000]) test(`aborting pending Chat initialization cleans resources (deadline ${startupTimeoutMs})`, { timeout: 1_000 }, async () => {
+  const controller = new AbortController();
+  const entered = Promise.withResolvers();
+  const events = [];
+  const reason = new Error("cancel pending initialization");
+  const starting = startPipaRuntime({
+    signal: controller.signal, startupTimeoutMs,
+    chat: { onNewMention() {}, onSubscribedMessage() {},
+      initialize() { entered.resolve(); return new Promise(() => undefined); },
+      async shutdown() { events.push("chat-stop"); } },
+    state: { connect: async () => undefined },
+    checkSlackToken: async () => ({ ok: true }),
+    executor: { stopAll() { events.push("executor-stop"); } },
+    server: { stop() { events.push("server-stop"); }, async wait() { events.push("server-wait"); } },
+    createRoutineScheduler: () => ({ start() { assert.fail("must not start routines"); },
+      stop() { events.push("scheduler-stop"); }, async drain() { events.push("scheduler-drain"); } }),
+    sessionStore: { keys: () => [] },
+    config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
+  });
+  await entered.promise;
+  const rejected = assert.rejects(starting, (error) => error === reason);
+  controller.abort(reason);
+  await rejected;
+  assert.deepEqual(events, ["scheduler-stop", "executor-stop", "scheduler-stop", "scheduler-drain", "executor-stop", "chat-stop", "server-stop", "server-wait"]);
+  assert.deepEqual(getEventListeners(controller.signal, "abort"), []);
 });
 
 test("surfaces an unexpected owned-server exit and still shuts Slack down", async () => {

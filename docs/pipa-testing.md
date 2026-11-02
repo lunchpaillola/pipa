@@ -44,6 +44,15 @@ The Socket-owned engine cell composes the real Pipa application, executor, sched
 
 Mock only the model for deterministic real-engine cases. Drive real tool/question/permission flows and use stage barriers to force retries, lost responses, disconnections, revocation, and cancellation races. Tests must not impose their deadlines on valid production turns. Use controlled clocks for DST/long horizons and actual scheduler dispatch for short one-time/recurring runs.
 
+Startup checks must cover v1/v2 detection and listening/workspace readiness plus
+Slack initialization beyond 30 seconds without a default overall limit or runtime
+migration-status request. Explicit harness startup deadlines may bound a test;
+per-network-request safety timeouts retry, but terminal auth/protocol/wrong-workspace
+errors fail. Ctrl+C must stop owned children and leave attached servers alive.
+Detached background restart and shutdown deadlines remain unchanged. OpenCode owns
+schema/data upgrades; the manual migration/rollback lane below is separate from
+Pipa startup and does not authorize Pipa data conversion.
+
 The former spike's 58 comparison checks and 55 routine/restart/CLI baseline passes are supporting evidence, not a substitute for running this harness on the implemented dual-adapter package.
 
 ## Isolate local state and recover migration failures
@@ -86,7 +95,7 @@ Both evaluators use:
 | `SLACK_USER_TOKEN` | Existing human-message evaluation path |
 | `PIPA_HOME` | Selects the candidate's private profile |
 | `PIPA_TEST_SOLE_CONSUMER` | Set to `confirmed` only after stopping all other consumers of the selected app, including other hosts |
-| `PIPA_TEST_ENGINE_URL`, `PIPA_TEST_ENGINE_PIN` | Exact serving URL and native version; authenticated identity/migration/workspace readiness are checked read-only |
+| `PIPA_TEST_ENGINE_URL`, `PIPA_TEST_ENGINE_PIN` | Exact serving URL and native version; authenticated identity/workspace preflight is read-only and does not inspect migration status |
 | `PIPA_TEST_CLI` | Optional absolute installed candidate `bin/pipa.mjs`; defaults to the checkout CLI |
 | `SLACK_SENDER_BOT_TOKEN` | Optional separate sender; actual posted `bot_id` must be allowed. Human token still reads channel history/replies |
 

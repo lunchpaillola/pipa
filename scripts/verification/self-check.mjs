@@ -171,7 +171,7 @@ test("migration selects exact 2.2.5 target without falling back to historical 2.
   }
 });
 
-test("native readiness observer validates generation, auth, migration and configured workspace", async () => {
+test("native readiness observer validates generation, auth and configured workspace without inspecting migration", async () => {
   const runtime = await createRuntimeFixture();
   try {
     for (const generation of ["v1", "v2"]) {
@@ -189,17 +189,21 @@ test("native readiness observer validates generation, auth, migration and config
       assert.equal(connection.major, generation === "v1" ? 1 : 2);
       assert.equal(connection.workingDirectory, runtime.workspace);
       assert.deepEqual(calls.at(-1), { path: identityPath, authenticated: false });
+      assert.equal(calls.some(call => call.path === "/api/experimental/migration/v1"), false, "Runtime readiness must never inspect migration status");
     }
     const common = { facade, baseUrl: "http://127.0.0.1:4096", workingDirectory: runtime.workspace, environment: { OPENCODE_SERVER_PASSWORD: "synthetic" }, pin: "2.0.29", startupTimeoutMs: 20 };
-    for (const defect of ["pin", "location", "migration", "unauthenticated", "HTML"]) {
+    for (const defect of ["pin", "location", "unauthenticated", "HTML"]) {
+      const calls = [];
       await assert.rejects(observeRuntimeReadiness({ ...common, fetch: async (url, init) => {
         const pathname = new URL(url).pathname;
+        calls.push(pathname);
+        assert.notEqual(pathname, "/api/experimental/migration/v1", "Unexpected runtime migration request");
         if (!init.headers?.authorization) return Response.json({}, { status: defect === "unauthenticated" ? 200 : 401 });
         if (pathname === "/global/health") return new Response("<html>");
         if (pathname === "/api/info") return defect === "HTML" ? new Response("<html>") : Response.json({ version: defect === "pin" ? "2.0.30" : "2.0.29", pid: 1, urls: [], paths: { tmp: runtime.temp } });
-        if (pathname === "/api/experimental/migration/v1") return Response.json({ status: defect === "migration" ? "running" : "completed", progress: { label: "history" } });
         return Response.json({ directory: defect === "location" ? runtime.home : runtime.workspace, project: { id: "prj_test", directory: runtime.workspace, canonical: runtime.workspace } });
-      } }), defect === "pin" ? /exact pin/u : defect === "location" ? /workspace identity mismatch/u : defect === "migration" ? /migration.*timed out/u : defect === "unauthenticated" ? /require authentication/u : /identity protocol/u);
+      } }), defect === "pin" ? /exact pin/u : defect === "location" ? /workspace identity mismatch/u : defect === "unauthenticated" ? /require authentication/u : /identity protocol/u);
+      assert.equal(calls.includes("/api/experimental/migration/v1"), false);
     }
   } finally { await runtime.teardown(); }
 });

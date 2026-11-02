@@ -11,7 +11,7 @@ import { Writable } from "node:stream";
 import { stdin, stdout } from "node:process";
 import { acquireInstanceLock, createManifest, createManifestUrl, loadConfig, stopInstance } from "../src/state.mjs";
 import { initializePipa, startPipa } from "../src/app.mjs";
-import { OpenCodeReadinessError, PipaRestartingError, startOpenCodeServer } from "../src/opencode.mjs";
+import { PipaRestartingError, startOpenCodeServer } from "../src/opencode.mjs";
 import { createRoutine, deleteRoutine, editRoutine, loadRoutineState, requestRoutineRun } from "../src/routines.mjs";
 import { requestRestart, restartStatus, startRestartWatcher, reportRestartReady, reportRestartFailure } from "../src/restart.mjs";
 
@@ -411,7 +411,6 @@ async function start(io) {
   let failure;
   let stopping = false;
   let ready = false;
-  let workspaceReady = true;
   const stop = (termination = "SIGTERM", reason) => {
     stopping = true;
     app?.stop(reason);
@@ -435,16 +434,9 @@ async function start(io) {
     if (config.slackMode === "managed") {
       server = await startOpenCodeServer(config, { signal: startup.signal });
       io.output.write(`Pipa is starting OpenCode on ${config.openCodeHostname}:${config.openCodePort}.\n`);
-      // Ordinary Managed starts retain their lifetime even if health is unavailable.
-      // Such an instance cannot accept cooperative restart until it is ready.
-      try {
-        await Promise.race([server.ready(), signal.promise]);
-      } catch (error) {
-        if (process.env.PIPA_RESTART_ID || !(error instanceof OpenCodeReadinessError)) throw error;
-        process.stderr.write("Managed restart unavailable: workspace readiness failed.\n");
-        workspaceReady = false;
-      }
+      await Promise.race([server.ready(), signal.promise]);
     } else {
+      io.output.write("Waiting for OpenCode... Ctrl+C to stop.\n");
       app = await startPipa({ config, signal: startup.signal });
       io.output.write(app.server.owned
         ? `Pipa started a private OpenCode server at ${app.server.baseUrl}.\n`
@@ -454,7 +446,7 @@ async function start(io) {
     const lifetime = app ? app.wait() : server.wait();
     // Observe startup failures already reported by the runtime before ready IPC.
     await Promise.race([lifetime, Promise.resolve()]);
-    if (!stopping && workspaceReady) {
+    if (!stopping) {
       watcher = startRestartWatcher({
         identity: releaseLock.identity,
         shutdown: () => { stop("SIGTERM", new PipaRestartingError()); return finished.promise; },

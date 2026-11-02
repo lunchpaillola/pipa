@@ -53,7 +53,7 @@ the actual connection's required contracts; other majors fail before intake.
 | Surface | v1 | v2 candidate |
 | --- | --- | --- |
 | Identity | Authenticated `/global/health` | Authenticated `/api/info` |
-| Workspace readiness | Configured directory and session status | Completed v1 migration and matching configured location |
+| Workspace readiness | Configured directory and session status | Matching configured location and native readiness |
 | Prompts and sessions | Native prompt/system instructions | Stable input ID, scoped instruction journal, correlated terminal projections |
 | Questions and permissions | Existing native controls | Native question fields/permission decisions normalized into the same Slack controls |
 | Model discovery | Available through executor capability API | Connected providers, variants and native defaults |
@@ -91,6 +91,20 @@ from the server/restart and client environments. Without an explicit password,
 Pipa generates a private per-launch password that is unavailable to external
 clients; unauthenticated clients no longer connect. Keep the generated password
 private; use an explicit shared password for external access instead.
+
+### Startup contract
+
+Ordinary OpenCode version probing, listening/readiness waits and Slack initialization
+have no default overall startup limit, including no default 30-second cutoff.
+Pipa detects v1/v2 and waits for native workspace readiness, not migration status:
+it never calls `GET /api/experimental/migration/v1` at runtime. OpenCode alone owns
+schema/data upgrades; Pipa never converts OpenCode data.
+
+An explicit harness startup deadline is supported. Per-network-request safety
+timeouts remain bounded and retry while waiting; terminal authentication, protocol
+and wrong-workspace errors fail rather than retry indefinitely. Ctrl+C cancels
+startup and stops an owned child; attached external servers survive.
+Detached background restart and shutdown deadlines are unchanged.
 
 Socket startup waits for native readiness before Slack subscriptions or routines.
 Ordinary Managed startup can remain running without workspace readiness, but
@@ -134,8 +148,9 @@ migration target is each pinned v1 release (**1.18.35 / 1.19.0**) to native
 3. Select the exact **2.2.5** executable for the current qualification rehearsal in
    the candidate's private PATH, or select an
    independently managed v2 server. Preserve Pipa's config, session mappings and
-   routine state; OpenCode owns schema/history migration. Wait for completed
-   migration and configured-location readiness before dispatching work.
+   routine state; OpenCode owns schema/history migration. In this operator
+   rehearsal, verify its upgrade completed and the configured location is ready
+   before dispatching work; Pipa startup does not probe migration status.
 4. Continue the same mapped sessions and recall pre-migration history. Inspect
    active/inactive/completed routine definitions, exact prompts and destinations.
    Restart v2 and repeat continuation. Do not treat a migration/auth/location
@@ -155,6 +170,8 @@ records and `opencode-recovery.json` when present. Keep credentials private.
 Preserve OpenCode's actual database/storage plus database companions, credentials,
 configuration, definitions, plugins and their package sources from the same
 checkpoint. Include project-local `.opencode` definitions/configuration too.
+These matched backups protect the operator's OpenCode upgrade and session continuity,
+not a Pipa-driven data conversion.
 
 Discover paths from the selected release's CLI help/path commands and configured
 HOME/XDG/Windows app-data/DB overrides; do not assume one universal DB path.

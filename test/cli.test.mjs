@@ -13,8 +13,8 @@ import { createRuntimeFixture, waitFor } from "./helpers/runtime-fixture.mjs";
 
 const cli = fileURLToPath(new URL("../bin/pipa.mjs", import.meta.url));
 
-for (const failure of ["authentication", "protocol", "temporary"]) test(`U1 ordinary Managed readiness policy: ${failure}`, { timeout: 45000 }, async (t) => {
-  const runtime = await createRuntimeFixture({ timeoutMs: 42000 });
+for (const failure of ["authentication", "permission", "protocol", "temporary"]) test(`U1 ordinary Managed readiness policy: ${failure}`, { timeout: 10000 }, async (t) => {
+  const runtime = await createRuntimeFixture({ timeoutMs: 9000 });
   t.after(() => runtime.teardown());
   const paths = pipaPaths(runtime.home);
   const reservation = createServer();
@@ -27,12 +27,14 @@ for (const failure of ["authentication", "protocol", "temporary"]) test(`U1 ordi
   const fakeBin = path.join(runtime.root, "bin");
   await mkdir(fakeBin);
   const script = path.join(fakeBin, "fake.cjs");
+  const healthProbed = path.join(runtime.root, "health-probed");
   await writeFile(script, `
     if (process.argv.includes('--version')) { console.log('OpenCode 1.19.0'); process.exit(0); }
     const http = require('node:http');
     const server = http.createServer((req, res) => {
       if (req.url === '/fixture-shutdown' && req.headers.authorization === 'Basic ' + Buffer.from('opencode:' + process.env.OPENCODE_SERVER_PASSWORD).toString('base64')) { res.end(); server.close(); return; }
-      res.writeHead(${failure === "authentication" ? 401 : failure === "temporary" ? 503 : 200}, { 'content-type': 'application/json' }); res.end('{}');
+      if (req.url === '/global/health') require('node:fs').writeFileSync(${JSON.stringify(healthProbed)}, 'probed');
+      res.writeHead(${failure === "authentication" ? 401 : failure === "permission" ? 403 : failure === "temporary" ? 503 : 200}, { 'content-type': 'application/json' }); res.end('{}');
     });
     server.listen(Number(process.argv[process.argv.indexOf('--port') + 1]), '127.0.0.1');
     process.on('SIGTERM', () => server.close());
@@ -44,14 +46,19 @@ for (const failure of ["authentication", "protocol", "temporary"]) test(`U1 ordi
   runtime.env.OPENCODE_SERVER_PASSWORD = "synthetic-readiness-password";
   const { child, exited } = runtime.spawn(process.execPath, [cli, "start"]);
   let stderr = "";
+  let stdout = "";
   child.stderr.on("data", (data) => { stderr += data; });
+  child.stdout.on("data", (data) => { stdout += data; });
   if (failure === "temporary") {
-    await runtime.waitFor(() => stderr.includes("Managed restart unavailable"), { timeoutMs: 35000, label: "temporary readiness policy" });
+    await runtime.waitFor(() => readFile(healthProbed, "utf8").catch(() => false), { timeoutMs: 3000, label: "first private health probe" });
+    assert.match(stdout, /Pipa is starting OpenCode/u);
     assert.equal(child.exitCode, null);
     assert.ok(await readInstanceLock(paths.lock));
     const request = spawnSync(process.execPath, [cli, "restart"], { env: runtime.env, encoding: "utf8" });
     assert.equal(request.status, 0, request.stderr);
     await delay(300);
+    assert.equal(child.exitCode, null, "Temporary 503 must leave ordinary startup waiting");
+    assert.doesNotMatch(stderr, /warning|Managed restart unavailable|timed out/iu);
     assert.equal((await restartStatus({ home: runtime.home })).state, "requested", "unready Managed must not claim restart readiness");
     // End the fake engine without assuming Windows delivers POSIX signals.
     assert.equal((await fetch(`http://127.0.0.1:${port}/fixture-shutdown`, {
@@ -61,7 +68,7 @@ for (const failure of ["authentication", "protocol", "temporary"]) test(`U1 ordi
     assert.equal((await exited).code, 1, "Unexpected engine exit must stop the CLI and release its lock");
   } else {
     assert.equal((await exited).code, 1);
-    assert.match(stderr, failure === "authentication" ? /authentication failed/iu : /identity protocol/iu);
+    assert.match(stderr, ["authentication", "permission"].includes(failure) ? /authentication failed/iu : /identity protocol/iu);
     assert.doesNotMatch(stderr, /Managed restart unavailable/u);
   }
   assert.equal(await readInstanceLock(paths.lock), null);
@@ -132,7 +139,6 @@ for (const version of ["1.19.0", "2.0.29"]) for (const mode of ["ready", "unread
       const body = ${JSON.stringify(version)}.startsWith('1.')
         ? url.pathname === '/global/health' ? { healthy: true, version: ${JSON.stringify(version)} } : url.pathname === '/path' ? { directory: ${JSON.stringify(home)} } : url.pathname === '/session/status' ? {} : null
         : url.pathname === '/api/info' ? { version: ${JSON.stringify(version)}, pid: process.pid, urls: [], paths: { tmp: ${JSON.stringify(runtime.temp)} } }
-        : url.pathname === '/api/experimental/migration/v1' ? { status: 'completed', progress: null }
         : url.pathname === '/api/location' ? { directory: ${JSON.stringify(home)}, project: { id: 'prj_fixture', directory: ${JSON.stringify(home)}, canonical: ${JSON.stringify(home)} } } : null;
       if (!body && res.statusCode === 200) res.statusCode = 404;
       res.end(JSON.stringify(body ?? {}));
@@ -230,9 +236,9 @@ for (const version of ["1.19.0", "2.0.29"]) for (const mode of ["ready", "unread
     const status = await restartStatus({ home });
     const lock = await readInstanceLock(paths.lock);
     if (lock && lock.pid !== original.pid) replacement = lock;
-    if (status?.state === "unconfirmed") assert.fail(JSON.stringify(status));
+    if (status?.state === "unconfirmed" && mode !== "unready") assert.fail(JSON.stringify(status));
     return ["completed", "failed"].includes(status?.state) ? status : false;
-  }, 45_000);
+  }, mode === "unready" ? 90_000 : 45_000);
   assert.equal(await originalExit, 0);
   assert.doesNotMatch(output + JSON.stringify(outcome), /synthetic-private-password|forbidden-child-marker/u);
   if (mode !== "ready") {

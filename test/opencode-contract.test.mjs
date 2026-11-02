@@ -1655,6 +1655,45 @@ test("R1 U1: attached identity and workspace readiness select both generations",
   }
 });
 
+test("U1 temporary workspace readiness with an explicit test deadline preserves state and blocks Slack intake", async (t) => {
+  const runtime = await createRuntimeFixture();
+  t.after(() => runtime.teardown());
+  const paths = pipaPaths(runtime.home);
+  await mkdir(path.dirname(paths.config), { recursive: true });
+  const config = { botName: "Pipa", workingDirectory: runtime.workspace };
+  const saved = new Map([
+    [paths.config, JSON.stringify(config)],
+    [paths.sessions, JSON.stringify({ "slack:C123:1.0": "ses_saved" })],
+    [paths.routines, JSON.stringify({ version: 1, routines: [] })],
+    [paths.openCodeRecovery, JSON.stringify({ version: 1, records: [{ sessionId: "ses_saved", phase: "admitted" }] })],
+  ]);
+  for (const [file, bytes] of saved) await writeFile(file, bytes);
+  const calls = [];
+  const intake = [];
+  await assert.rejects(startPipa({ config, paths, startupTimeoutMs: 50,
+    checkSlackToken: async () => ({}),
+    sessionStore: { keys: () => { intake.push("subscriptions"); return []; } },
+    state: { connect: () => intake.push("state") },
+    chat: { initialize: () => intake.push("Slack") },
+    createRoutineScheduler: () => intake.push("routines"),
+    startServer: (config, options) => startSocketOpenCodeServer(config, {
+      ...options, environment: runtime.env, attachUrl: "http://127.0.0.1:4096",
+      fetch: async (url) => {
+        const pathname = new URL(url).pathname;
+        calls.push(pathname);
+        if (pathname === "/global/health") return new Response("<html>");
+        if (pathname === "/api/info") return Response.json({ version: "2.0.29", pid: 1, urls: [], paths: { tmp: runtime.temp } });
+        assert.equal(pathname, "/api/location", "Only ordinary workspace readiness may be probed");
+        return Response.json({}, { status: 503 });
+      },
+    }),
+  }), /workspace readiness check timed out/u);
+  assert.ok(calls.includes("/api/location"));
+  assert.equal(calls.includes("/api/experimental/migration/v1"), false);
+  assert.deepEqual(intake, []);
+  for (const [file, bytes] of saved) assert.equal(await readFile(file, "utf8"), bytes);
+});
+
 test("U2 standalone facade negotiates authenticated identity before selecting either adapter", async (t) => {
   for (const generation of ["v1", "v2"]) {
     const { runtime, wire, document, input, fetch: fixtureFetch } = await fixture(t, generation);

@@ -574,7 +574,7 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
   const startApp = async (serverOverride) => {
     // Targeted case selection must not depend on package-cli having saved config.
     await state.writePrivateJson(paths.config, config);
-    app = await appModule.startPipa({ config, paths, chat, checkSlackToken: async () => ({ ok: true }), shutdownTimeoutMs: 5000, routineIntervalMs: 100,
+    app = await appModule.startPipa({ config, paths, chat, signal: runtime.signal, checkSlackToken: async () => ({ ok: true }), shutdownTimeoutMs: 5000, routineIntervalMs: 100,
       createRoutineScheduler: (options) => { routineScheduler = routines.createRoutineScheduler(options); return routineScheduler; },
       createExecutor: makeExecutor,
       ...(serverOverride ? { server: serverOverride } : {}),
