@@ -20,7 +20,7 @@ Harness ownership:
 
 | Surface | Responsibility |
 |---|---|
-| `test/helpers/runtime-fixture.mjs` | Private roots, controlled environment, process/port tracking, bounded polling, cross-platform teardown |
+| `test/helpers/runtime-fixture.mjs` | Private roots, controlled environment, direct child handles and ports, bounded teardown |
 | `test/helpers/opencode-contract.mjs` | Shared product assertions independent of native endpoint spelling |
 | `test/opencode-contract.test.mjs` | Both fixture generations in default `npm test` |
 | `scripts/test-opencode-matrix.mjs` | Pinned real engines and installed Pipa tarball, with a deterministic local model |
@@ -28,6 +28,15 @@ Harness ownership:
 | `scripts/slack-release-eval.mjs` | Serial opt-in Slack/provider collection, shared live checklist, routine evaluator reuse, optional independent restart observation; human/integration gates remain blocked |
 
 Keep the default `npm test`/`npm run test:pack` lane free of downloaded engines and live credentials. The opt-in `test:engines` lane exercises pins **1.18.35, 1.19.0, 2.0.29, and 2.2.5** against Socket-owned, Managed, and attached modes on Linux/macOS/Windows where supported. Native **2.2.5** is the current v2 qualification target; **2.0.29** remains a historical comparison pin. The SDK remains `@opencode/client@2.0.29` pending real qualification. Pin inclusion does not claim passing native tests or release readiness; historical reports qualify only their recorded cases and versions. Node 22 is the baseline. The downloaded executable's identity and package integrity must match the selected cell; no global executable is replaced. Use `--migration` for synthetic upgrade/rollback. See [runner options](../scripts/verification/README.md).
+
+PR CI uses `npm run test:beta`: start, exact prompt/history, restart and stop on
+1.19.0 and 2.2.5 in three modes. This labelled smoke is not full qualification;
+the broader matrix remains a manual workflow. See the [beta scope](opencode-compatibility.md#small-beta-smoke).
+
+Fixtures launch ordinary processes without a global spawn override or ownership
+preload. Cleanup uses live child handles and explicit private-profile shutdown;
+it does not reconstruct arbitrary orphan trees after their leaders exit.
+Failed or uncertain cleanup retains the private root and fails the selected check.
 
 The Socket-owned engine cell composes the real Pipa application, executor, scheduler and state with injected fake Chat/auth. Managed cells use the actual installed CLI and detached restart chain. Attached cells use an independently launched server and prove ownership preservation. Real Socket CLI restart and visible Slack controls still require the live lane; fake Chat does not prove them.
 

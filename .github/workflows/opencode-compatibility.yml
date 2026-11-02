@@ -2,6 +2,11 @@ name: OpenCode compatibility
 
 on:
   workflow_dispatch:
+    inputs:
+      full_qualification:
+        description: Collect the broad deterministic matrix and migration (not release certification)
+        type: boolean
+        default: false
   pull_request:
     paths:
       - "src/**"
@@ -33,12 +38,15 @@ jobs:
           cache: npm
       - run: npm ci
       - run: node --test scripts/verification/self-check.mjs
-      # Baseline labels collection only. Deterministic failures remain strict;
-      # live/deployment evidence stays BLOCKED and releaseQualified stays false.
-      # Local opt-in transition command: npm run test:engines -- --baseline --migration
-      - run: npm run test:engines -- --baseline --migration --gate=deterministic --report=opencode-compatibility.json
+      # Two pins x three modes: 24 journey observations per host, no provider secrets.
+      - if: github.event_name != 'workflow_dispatch' || !inputs.full_qualification
+        run: npm run test:beta -- --report=beta-smoke.json
+      - if: github.event_name == 'workflow_dispatch' && inputs.full_qualification
+        run: npm run test:engines -- --migration --gate=deterministic --report=opencode-compatibility.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: opencode-compatibility-${{ matrix.os }}
-          path: opencode-compatibility.json
+          path: |
+            beta-smoke.json
+            opencode-compatibility.json

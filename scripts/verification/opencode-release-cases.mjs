@@ -416,10 +416,10 @@ export async function recordSharedCase(rows, definition, observe, provider) {
   });
 }
 
-export async function runCell({ candidate, pin, mode, migration = false, caseIds }) {
+export async function runCell({ candidate, pin, mode, migration = false, caseIds, smoke = false }) {
   if (caseIds !== undefined) assert.ok(Array.isArray(caseIds) && caseIds.length && new Set(caseIds).size === caseIds.length && caseIds.every((id) => releaseCases.some((row) => row.id === id)), "Invalid targeted case selection");
   const engineBinaries = JSON.parse(process.env.PIPA_MATRIX_ENGINE_BINARIES ?? "{}");
-  const runtime = await createRuntimeFixture({ timeoutMs: 7 * 60_000 });
+  const runtime = await createRuntimeFixture({ timeoutMs: 7 * 60_000, cleanupTimeoutMs: 10_000 });
   // This code runs only in the privately spawned cell process, never in the host.
   for (const key of Object.keys(process.env)) delete process.env[key];
   Object.assign(runtime.env, {
@@ -434,7 +434,7 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
   Object.assign(process.env, runtime.env);
   const load = (file) => import(pathToFileURL(path.join(candidate, "src", `${file}.mjs`)).href);
   const [appModule, facade, state, routines, restart] = await Promise.all(["app", "opencode", "state", "routines", "restart"].map(load));
-  const cell = { cases: [], adapterSelected: null, clientVersion: null, client: "Production native fetch facade", engineReported: null, migrationRequested: migration, ...(caseIds ? { collection: "targeted-diagnostic", caseSelection: caseIds } : {}), evidence: {} };
+  const cell = { cases: [], adapterSelected: null, clientVersion: null, client: "Production native fetch facade", engineReported: null, migrationRequested: migration, ...(caseIds ? { collection: "targeted-diagnostic", caseSelection: caseIds } : {}), ...(smoke ? { collection: "reduced-beta-smoke" } : {}), evidence: {} };
   if (runtime.env.BUN_JSC_maxRegExpStackSize) cell.evidence.serverRegexStackBytes = Number(runtime.env.BUN_JSC_maxRegExpStackSize);
   const cli = path.join(candidate, "bin", "pipa.mjs");
   const paths = state.pipaPaths(runtime.home);
@@ -488,6 +488,30 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
   const promptFor = (id) => `MATRIX_${id}_${nonce}`;
   const textFor = (id) => `RESULT_${id}_${nonce}`;
   const runCli = (...args) => command(runtime, process.execPath, [cli, ...args]);
+  const stopProfile = async (home, urls, pids) => {
+    const lockFile = state.pipaPaths(home).lock;
+    const recordedPids = new Set();
+    await waitFor(async () => {
+      const status = await restart.restartStatus({ home });
+      if (status?.state === "failed" && status.phase === "starting") throw new Error("Restart failed during replacement startup; retain the private profile for inspection.");
+      if (status?.replacement?.pid) recordedPids.add(status.replacement.pid);
+      // A handoff may still publish a replacement after the original lock disappears.
+      if (status?.state === "running" || status?.phase === "arming"
+        || (status?.state === "unconfirmed" && status.phase !== "acceptance")) return false;
+      const stopped = await state.stopInstance(lockFile);
+      if (stopped) recordedPids.add(stopped);
+      for (const pid of pids().filter(Boolean)) recordedPids.add(pid);
+      const [lock, portsClosed] = await Promise.all([
+        state.readInstanceLock(lockFile),
+        Promise.all((await urls()).filter(Boolean).map((url) => fetch(url, { signal: AbortSignal.timeout(500) }).then(() => false, () => true))),
+      ]);
+      if (lock || !portsClosed.every(Boolean) || [...recordedPids].some((pid) => state.isRunning(pid))) return false;
+      const settled = await restart.restartStatus({ home });
+      if (settled?.state === "failed" && settled.phase === "starting") throw new Error("Restart failed during replacement startup; retain the private profile for inspection.");
+      return settled?.state !== "running" && settled?.phase !== "arming"
+        && !(settled?.state === "unconfirmed" && settled.phase !== "acceptance");
+    }, { timeoutMs: 8_000, label: "private profile handoff/stop/lock/ports/processes" });
+  };
   const connectedFetch = async (url, init = {}) => {
     const request = url instanceof Request ? url.clone() : null;
     const address = request?.url ?? String(url);
@@ -635,7 +659,10 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
             await new Promise((resolve) => reservation.close(resolve));
             baseUrl = `http://127.0.0.1:${port}`;
             await state.writePrivateJson(paths.config, { ...config, slackMode: "managed", openCodeHostname: "127.0.0.1", openCodePort: port });
-            managed = runtime.spawn(process.execPath, [cli, "start"]);
+            const managedUrl = baseUrl;
+            let original;
+            runtime.defer(() => stopProfile(runtime.home, () => [managedUrl], () => [original?.child.pid, replacement?.pid]), "Managed CLI/replacement/lock/port");
+            managed = original = runtime.spawn(process.execPath, [cli, "start"]);
             output = "";
             for (const stream of [managed.child.stdout, managed.child.stderr]) stream.on("data", (data) => { output = (output + data).slice(-8192); });
             try {
@@ -650,16 +677,6 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
               await bounded(managed.exited, { timeoutMs: 5000 });
             }
           }
-          const managedUrl = baseUrl;
-          runtime.defer(async () => {
-            const lock = await state.readInstanceLock(paths.lock);
-            if (lock) {
-              process.kill(lock.pid, "SIGTERM");
-              await waitFor(async () => !await state.readInstanceLock(paths.lock), { timeoutMs: 4000, label: "Managed lock release" });
-            }
-            await waitFor(() => fetch(managedUrl, { signal: AbortSignal.timeout(500) }).then(() => false, () => true), { timeoutMs: 4000, label: "Managed port close" });
-            if (replacement?.pid) await waitFor(() => !state.isRunning(replacement.pid), { timeoutMs: 4000, label: "replacement exit" });
-          }, "Managed CLI/replacement/lock/port");
           const connection = await health();
           makeExecutor({ baseUrl, connection, artifactRoot: runtime.artifactRoot });
         } else {
@@ -1156,11 +1173,10 @@ throw Error('Native file-command completion deadline exceeded');
         const enginePid = async () => {
           if (mode === "attached") return independent.child.pid;
           if (mode === "socket-owned") return ownedNative.child.pid;
-          const identity = await state.readInstanceLock(paths.lock);
-          const registrations = (await readFile(path.join(runtime.ownership.base, "ownership.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
-          const children = [...new Set(registrations.filter(item => item.kind === "process" && item.ppid === identity.pid && state.isRunning(item.pid)).map(item => item.pid))];
-          assert.equal(children.length, 1, "Expected one live fixture-owned Managed engine child");
-          return children[0];
+          const loads = (await readFile(definitions.pluginLog, "utf8")).trim().split("\n").map(JSON.parse);
+          const pid = loads.findLast((item) => item.kind === "loaded")?.pid;
+          assert.ok(Number.isSafeInteger(pid) && pid > 0 && state.isRunning(pid), "Expected a live native Managed engine PID from the synthetic plugin");
+          return pid;
         };
         const oldPid = await enginePid();
         const oldUrl = baseUrl;
@@ -1440,7 +1456,7 @@ throw Error('Native file-command completion deadline exceeded');
       await runCli("restart");
       const workerPids = new Set();
       const outcome = await runtime.waitFor(async () => {
-        for (const pid of await observeWorker(old.generation)) workerPids.add(pid);
+        if (!smoke) for (const pid of await observeWorker(old.generation)) workerPids.add(pid);
         const status = await restart.restartStatus({ home: runtime.home });
         if (status?.state === "failed" || status?.state === "unconfirmed") assert.fail(JSON.stringify(status));
         return status?.state === "completed" ? status : false;
@@ -1450,12 +1466,14 @@ throw Error('Native file-command completion deadline exceeded');
       assert.notEqual(replacement.generation, old.generation);
       assert.equal((await bounded(managed.exited, { timeoutMs: 5000 })).code, 0);
       assert.ok(!state.isRunning(old.pid));
-      assert.ok(workerPids.size, "Restart worker PID was not observed externally");
-      await runtime.waitFor(() => [...workerPids].every((pid) => !state.isRunning(pid)), { timeoutMs: 5000, label: "detached worker exit" });
+      if (!smoke) {
+        assert.ok(workerPids.size, "Restart worker PID was not observed externally");
+        await runtime.waitFor(() => [...workerPids].every((pid) => !state.isRunning(pid)), { timeoutMs: 5000, label: "detached worker exit" });
+      }
       await health();
       assert.deepEqual(await state.readInstanceLock(paths.lock), replacement);
       assert.equal(JSON.parse(await runCli("restart", "--status")).state, "completed");
-      cell.evidence.restart = { requestId: outcome.id, old, replacement, workerPids: [...workerPids], workersExited: true, durableState: outcome.state, lifecycleStatus: "PASS", followupStatus: "FAIL" };
+      cell.evidence.restart = { requestId: outcome.id, old, replacement, workerPids: [...workerPids], ...(smoke ? { workerExitObserved: false } : { workersExited: true }), durableState: outcome.state, lifecycleStatus: "PASS", followupStatus: "FAIL" };
       const result = await turn("after-restart", { onInteraction: async () => ({ type: "reply", reply: "once" }) }, { tool: environmentTool(textFor("after-restart")) });
       assertTurnOutcome(result, { sessionId: result.sessionId, text: textFor("after-restart") });
       cell.evidence.restart.followupStatus = "PASS";
@@ -1465,7 +1483,7 @@ throw Error('Native file-command completion deadline exceeded');
       // Stop the in-process app before exercising the real installed CLI. Only
       // Chat/auth are injected; CLI, watcher, worker, facade and engine are real.
       await app.shutdown();
-      const probe = await createRuntimeFixture({ timeoutMs: 90000, parent: runtime });
+      const probe = await createRuntimeFixture({ timeoutMs: 90000, cleanupTimeoutMs: 10_000 });
       runtime.defer(() => probe.teardown(), "Socket CLI fixture resources");
       Object.assign(probe.env, runtime.env, {
         ...Object.fromEntries(Object.entries(probe.env).filter(([key]) => key !== "PATH")),
@@ -1486,15 +1504,11 @@ throw Error('Native file-command completion deadline exceeded');
       await state.writePrivateJson(probePaths.config, probeConfig);
       const snapshot = () => readFile(path.join(probe.state, "chat.json"), "utf8").then(JSON.parse).catch(() => null);
       let identity;
-      const original = probe.spawn(process.execPath, [cli, "start"]);
       const invoke = (...args) => command(probe, process.execPath, [cli, ...args]);
-      probe.defer(async () => {
-        const lock = await state.readInstanceLock(probePaths.lock);
-        if (lock) process.kill(lock.pid, "SIGTERM");
-        await waitFor(async () => !await state.readInstanceLock(probePaths.lock), { timeoutMs: 8000, label: "Socket CLI lock release" });
-        if (identity) await waitFor(() => !state.isRunning(identity.pid), { timeoutMs: 5000, label: "Socket replacement exit" });
-      }, "Socket CLI replacement and lock");
+      let original;
+      probe.defer(() => stopProfile(probe.home, async () => mode === "attached" ? [] : [(await snapshot())?.nativeUrl], () => [original?.child.pid, identity?.pid]), "Socket CLI replacement and lock");
       try {
+        original = probe.spawn(process.execPath, [cli, "start"]);
         await probe.waitFor(async () => (await snapshot())?.ready, { timeoutMs: 20000, label: "Socket native and Chat startup" });
         const old = await state.readInstanceLock(probePaths.lock);
         assert.equal(old.pid, original.child.pid);
@@ -1513,7 +1527,7 @@ throw Error('Native file-command completion deadline exceeded');
         assert.ok(requested.every((output) => output.includes(old.generation) && !output.includes("completed")));
         const workerPids = new Set();
         const outcome = await probe.waitFor(async () => {
-          for (const pid of await observeWorker(old.generation)) workerPids.add(pid);
+          if (!smoke) for (const pid of await observeWorker(old.generation)) workerPids.add(pid);
           const status = await restart.restartStatus({ home: probe.home });
           assert.ok(!["failed", "unconfirmed"].includes(status?.state), JSON.stringify(status));
           return status?.state === "completed" && status;
@@ -1522,8 +1536,11 @@ throw Error('Native file-command completion deadline exceeded');
         assert.notEqual(identity.pid, old.pid);
         assert.notEqual(identity.generation, old.generation);
         assert.equal((await bounded(original.exited, { timeoutMs: 5000 })).code, 0);
-        assert.ok(workerPids.size);
-        await probe.waitFor(() => [...workerPids].every((pid) => !state.isRunning(pid)), { timeoutMs: 5000, label: "Socket restart worker exit" });
+        assert.ok(!state.isRunning(old.pid));
+        if (!smoke) {
+          assert.ok(workerPids.size);
+          await probe.waitFor(() => [...workerPids].every((pid) => !state.isRunning(pid)), { timeoutMs: 5000, label: "Socket restart worker exit" });
+        }
         await probe.waitFor(async () => (await snapshot())?.posts.some((post) => post.content === "Matrix restarted and is ready."), { timeoutMs: 5000, label: "routed ready notice" });
         const afterPrompt = promptFor("socket-after-restart");
         provider.register({ prompt: afterPrompt, text: textFor("socket-after-restart"), tool: environmentTool(textFor("socket-after-restart")), verify: (messages) => assert.ok(JSON.stringify(messages).includes(prompt), "Restart lost session history") });
@@ -1571,7 +1588,7 @@ throw Error('Native file-command completion deadline exceeded');
           assert.equal(independent.child.exitCode, null);
           await health();
         } else await probe.waitFor(() => fetch(observed.nativeUrl, { signal: AbortSignal.timeout(500) }).then(() => false, () => true), { timeoutMs: 5000, label: "Socket replacement owned port close" });
-        cell.evidence.socketFixtureRestart = { requestId: outcome.id, old, replacement: identity, workerPids: [...workerPids], workersExited: true, sessionId, readyNotices: notices.length, routine: { id: created.routine.id, trigger: completed.lastRun.trigger, resultCount: results.length, reconciliations: 2, nativeAdmission }, attachedPid: mode === "attached" ? independent.child.pid : null, transport: "fake Chat/auth; actual installed CLI and native engine; not live Slack" };
+        cell.evidence.socketFixtureRestart = { requestId: outcome.id, old, replacement: identity, workerPids: [...workerPids], ...(smoke ? { workerExitObserved: false } : { workersExited: true }), sessionId, readyNotices: notices.length, routine: { id: created.routine.id, trigger: completed.lastRun.trigger, resultCount: results.length, reconciliations: 2, nativeAdmission }, attachedPid: mode === "attached" ? independent.child.pid : null, transport: "fake Chat/auth; actual installed CLI and native engine; not live Slack" };
       } finally { await probe.teardown(); await startApp(); }
     },
   };
@@ -1639,7 +1656,7 @@ throw Error('Native file-command completion deadline exceeded');
   async function managedFailure(kind) {
     if (mode !== "managed") return { status: "BLOCKED", observed: "Managed CLI fault case runs in the Managed cell; full Socket CLI fault requires real Slack" };
     if (startupError) return { status: "BLOCKED", observed: `Actual Managed startup failed: ${startupError.message.split("\n")[0]}` };
-    const fault = await createRuntimeFixture({ timeoutMs: 65000, cleanupTimeoutMs: 8000 });
+    const fault = await createRuntimeFixture({ timeoutMs: 65000, cleanupTimeoutMs: 10_000 });
     runtime.defer(() => fault.teardown(), `Managed ${kind} fault resources`);
     Object.assign(fault.env, { OPENCODE_CONFIG_CONTENT: JSON.stringify(providerConfig(provider.url)), OPENCODE_SERVER_PASSWORD: "synthetic-loopback-only", OPENCODE_PASSWORD: "synthetic-loopback-only", OPENCODE_PURE: "1", OPENCODE_DISABLE_DEFAULT_PLUGINS: "1" });
     const faultPaths = state.pipaPaths(fault.home);
@@ -1648,6 +1665,7 @@ throw Error('Native file-command completion deadline exceeded');
     let url;
     let blocker;
     const invoke = (...args) => command(fault, process.execPath, [cli, ...args]);
+    fault.defer(() => stopProfile(fault.home, () => [url], () => [original?.child.pid, replacementIdentity?.pid]), "fault replacement identity and lock");
     try {
       const reservation = createServer();
       await fault.listen(reservation);
@@ -1660,11 +1678,6 @@ throw Error('Native file-command completion deadline exceeded');
       original = fault.spawn(process.execPath, [cli, "start"]);
       await fault.waitFor(() => observeRuntimeReadiness({ facade, baseUrl: url, workingDirectory: fault.workspace, environment: fault.env, pin }).catch(() => false), { timeoutMs: 10000, label: "fault original native workspace readiness" });
       const old = await state.readInstanceLock(faultPaths.lock);
-      fault.defer(async () => {
-        const lock = await state.readInstanceLock(faultPaths.lock);
-        if (lock && state.isRunning(lock.pid)) { process.kill(lock.pid, "SIGTERM"); await waitFor(async () => !await state.readInstanceLock(faultPaths.lock), { timeoutMs: 5000 }); }
-        if (replacementIdentity?.pid) await waitFor(() => !state.isRunning(replacementIdentity.pid), { timeoutMs: 5000 });
-      }, "fault replacement identity and lock");
       if (kind === "bind") {
         blocker = createServer();
         await fault.listen(blocker);

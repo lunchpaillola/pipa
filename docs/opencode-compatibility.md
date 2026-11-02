@@ -4,6 +4,35 @@ This guide describes the dual-adapter candidate on `feat/opencode-v1-v2`.
 It is not a release-qualified upgrade recommendation. See the [native blocker follow-up](research/opencode-native-blockers-verification.md), [U7 evidence](research/opencode-u7-verification.md)
 and [testing procedure](pipa-testing.md) before choosing a deployment pin.
 
+## Small-beta smoke
+
+`npm run test:beta -- --report=beta-smoke.json` runs real native **1.19.0** and
+**2.2.5** in Socket-owned, attached and Managed modes: **six cells per host**.
+The central `BETA_CASE_IDS` selects five case IDs, **24 applicable case observations**
+per default run (four per cell): authenticated workspace startup, exact prompts
+and history, the applicable Managed or deterministic Socket CLI restart, and
+stop ownership. The provider and Chat transport are scripted local fixtures;
+no Slack credentials, paid inference or provider quota is used.
+
+The existing `selectGate`'s `beta-smoke` branch requires every selected applicable result and
+worker/preflight/cleanup/report diagnostic to PASS. Missing or duplicate required
+evidence fails. Unselected or inapplicable cases stay explicitly outside scope;
+their recorded failures are never rewritten. Restart smoke skips only the external
+worker-PID scan and records `workerExitObserved:false`, not `workersExited:true`.
+It still checks durable completion, changed PID/generation, readiness, follow-up
+and ownership. This is not proof of live Slack or detached-worker exit.
+
+PR CI runs this smoke on Linux, macOS and Windows (18 cells total). The same
+workflow's manual `full_qualification` input runs the broad four-pin deterministic
+matrix with migration; locally use `npm run test:engines -- --migration`.
+Full deterministic/release gate semantics are unchanged. Richer files, approvals
+and routine coverage remains in retained unit tests and the broad manual matrix,
+not the native beta promise; the existing Socket restart case still checks its
+routine flow. Deep crash recovery, plugin/model combinations, migration/rollback,
+remote hosts and live client/operator qualification remain in the full/manual lanes. Smoke and
+targeted `caseIds` are never full qualification: `releaseQualified` stays false.
+No smoke result authorizes a release, version bump, publish or production change.
+
 ## Versions and capabilities
 
 Pipa requires Node 22 or newer and automatically selects a native v1 or v2 HTTP

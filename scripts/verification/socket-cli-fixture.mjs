@@ -8,7 +8,20 @@ import { pathToFileURL } from "node:url";
 import { fakeChat, observeNativeAdmissions } from "./opencode-release-cases.mjs";
 
 const candidate = process.env.PIPA_FIXTURE_CANDIDATE;
-assert.ok(candidate && process.env.PIPA_TEST_OWNERSHIP, "Socket fixture requires an isolated owned runtime");
+assert.ok(candidate && path.isAbsolute(candidate) && process.env.PIPA_TEST_RUNTIME === "1", "Socket fixture requires a private test runtime");
+const home = process.env.HOME;
+assert.ok(home && path.isAbsolute(home), "Socket fixture requires a private HOME");
+const root = path.dirname(home);
+assert.ok(path.basename(root).startsWith("pipa-contract-"), "Socket fixture requires a disposable fixture root");
+assert.equal(home, path.join(root, "home"));
+assert.equal(process.env.USERPROFILE, home);
+assert.equal(process.env.PIPA_HOME, home);
+assert.equal(process.env.XDG_STATE_HOME, path.join(root, "state"));
+for (const [key, value] of Object.entries(process.env)) {
+  if (/(?:^|_)SLACK.*(?:TOKEN|SECRET)$/iu.test(key)) assert.ok(["xoxb-forbidden-child-marker", "forbidden-child-marker"].includes(value), "Socket fixture rejects live Slack credentials");
+}
+const config = JSON.parse(await readFile(path.join(home, ".pipa", "config.json"), "utf8"));
+assert.ok(config.slackAppToken === "xapp-synthetic" && config.slackBotToken === "xoxb-synthetic", "Socket fixture requires synthetic Slack credentials");
 const appUrl = pathToFileURL(path.join(candidate, "src", "app.mjs")).href;
 registerHooks({
   load(url, context, next) {

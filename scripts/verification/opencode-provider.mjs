@@ -119,7 +119,7 @@ export async function writeDefinitions(runtime, marker, pin) {
   await mkdir(pluginDirectory);
   const plugin = path.join(pluginDirectory, "index.js");
   await writeFile(path.join(pluginDirectory, "package.json"), JSON.stringify({ name: "matrix-plugin", type: "module", main: "index.js" }));
-  const rewritePlugin = (version) => writeFile(plugin, `import {appendFileSync} from 'node:fs';\nconst log = item => appendFileSync(${JSON.stringify(pluginLog)}, JSON.stringify({version:${version},...item})+'\\n');\n${v2
+  const rewritePlugin = (version) => writeFile(plugin, `import {appendFileSync} from 'node:fs';\nconst log = item => appendFileSync(${JSON.stringify(pluginLog)}, JSON.stringify({version:${version},pid:process.pid,...item})+'\\n');\n${v2
     ? "export default {id:'matrix-fixture', async setup(ctx) { log({kind:'loaded'}); await ctx.tool.hook('execute.before', async input => log({kind:'hook',tool:input.tool})); }};"
     : "export const Matrix = async () => { log({kind:'loaded'}); return {'tool.execute.before': async input => log({kind:'hook',tool:input.tool})}; };"}\n`);
   await rewritePlugin(1);

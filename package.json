@@ -22,6 +22,7 @@
     "test": "node --test",
     "test:pack": "node scripts/pack-smoke.mjs",
     "test:engines": "node scripts/test-opencode-matrix.mjs",
+    "test:beta": "node scripts/test-opencode-matrix.mjs --smoke",
     "test:slack:routines": "node scripts/slack-routine-eval.mjs",
     "test:slack:release": "node scripts/slack-release-eval.mjs"
   },

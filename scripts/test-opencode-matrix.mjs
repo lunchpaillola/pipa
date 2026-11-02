@@ -10,6 +10,11 @@ import { MIGRATION_TARGET_PIN } from "./verification/opencode-migration.mjs";
 
 export const PINS = ["1.18.35", "1.19.0", "2.0.29", MIGRATION_TARGET_PIN];
 export const MODES = ["socket-owned", "attached", "managed"];
+export const BETA_PINS = ["1.19.0", "2.2.5"];
+export const BETA_CASE_IDS = Object.freeze([
+  "startup-readiness", "exact-prompt-continuation", "managed-restart",
+  "socket-fixture-restart", "stop-ownership",
+]);
 export const CELL_WORKER_TIMEOUT_MS = 9 * 60_000;
 const self = fileURLToPath(import.meta.url);
 const repo = fileURLToPath(new URL("../", import.meta.url));
@@ -35,7 +40,7 @@ export function compatibilityExit(rows) {
 // Select from catalog metadata, never observed reason text. Keep evidence intact;
 // missing requirements are gate entries, not fabricated collection results.
 export function selectGate(report, { gate = "deterministic", pins = PINS, modes = MODES } = {}) {
-  assert.ok(["deterministic", "release"].includes(gate), "Unknown gate");
+  assert.ok(["deterministic", "release", "beta-smoke"].includes(gate), "Unknown gate");
   assert.ok(pins.length && pins.every((pin) => PINS.includes(pin)), "Unknown gate pins");
   assert.ok(modes.length && modes.every((mode) => MODES.includes(mode)), "Unknown gate modes");
   const included = [];
@@ -52,9 +57,10 @@ export function selectGate(report, { gate = "deterministic", pins = PINS, modes 
     const rows = cell?.cases ?? [];
     for (const definition of releaseCases) {
       const reasons = [];
+      if (gate === "beta-smoke" && !BETA_CASE_IDS.includes(definition.id)) reasons.push("Outside beta-smoke scope: not collected");
       if (!definition.modes.includes(mode)) reasons.push(`Mode ${mode} outside applicable modes: ${definition.modes.join(", ")}`);
       if (!definition.generations.includes(engine.split(".")[0])) reasons.push(`Engine ${engine} outside applicable generations: ${definition.generations.join(", ")}`);
-      if (gate === "deterministic" && definition.lane === "live") reasons.push("Live/deployment lane belongs to release gate");
+      if (gate !== "release" && definition.lane === "live") reasons.push("Live/deployment lane belongs to release gate");
       if (!definition.required) reasons.push("Catalog case is not required");
       const matches = rows.filter((row) => row.id === definition.id);
       if (matches.length > 1) add({ ...identity, id: definition.id }, null, "Duplicate evidence identity");
@@ -71,7 +77,7 @@ export function selectGate(report, { gate = "deterministic", pins = PINS, modes 
   }
   for (const row of report.cases ?? []) add({ id: row.id }, row, "Report diagnostic is always gating");
   add({ id: "report-cleanup" }, report.cleanup, "Required collection cleanup");
-  for (const row of report.unobservedPlatforms ?? []) add({ id: "platform", platform: row.platform }, row, "Separate OS evidence required for release", gate === "deterministic");
+  for (const row of report.unobservedPlatforms ?? []) add({ id: "platform", platform: row.platform }, row, "Separate OS evidence required for release", gate !== "release");
   return { gate, included, excluded, exitCode: included.some((entry) => entry.status !== "PASS") ? 1 : 0 };
 }
 
@@ -141,20 +147,22 @@ async function installEngine(runtime, pin) {
 
 async function main(argv) {
   const value = (flag) => argv.find((arg) => arg.startsWith(`${flag}=`))?.slice(flag.length + 1);
-  for (const arg of argv) assert.ok(["--baseline", "--migration"].includes(arg) || ["--pins=", "--modes=", "--report=", "--gate="].some((flag) => arg.startsWith(flag)), `Unknown argument ${arg}`);
-  const gate = value("--gate") ?? "deterministic";
-  assert.ok(["deterministic", "release"].includes(gate), "Unknown gate");
-  const pins = value("--pins")?.split(",") ?? PINS;
+  for (const arg of argv) assert.ok(["--baseline", "--migration", "--smoke"].includes(arg) || ["--pins=", "--modes=", "--report=", "--gate="].some((flag) => arg.startsWith(flag)), `Unknown argument ${arg}`);
+  const smoke = argv.includes("--smoke");
+  assert.ok(!smoke || (!argv.includes("--migration") && !argv.includes("--baseline") && value("--gate") === undefined), "--smoke cannot be combined with baseline, migration or gate overrides");
+  const gate = smoke ? "beta-smoke" : value("--gate") ?? "deterministic";
+  assert.ok(["deterministic", "release", "beta-smoke"].includes(gate) && (smoke || gate !== "beta-smoke"), "Unknown gate");
+  const pins = value("--pins")?.split(",") ?? (smoke ? BETA_PINS : PINS);
   const modes = value("--modes")?.split(",") ?? MODES;
-  assert.ok(pins.length && pins.every((pin) => PINS.includes(pin)), "Only qualified exact engine pins are supported");
-  assert.ok(modes.length && modes.every((mode) => MODES.includes(mode)), "Unknown mode");
+  assert.ok(pins.length && new Set(pins).size === pins.length && pins.every((pin) => PINS.includes(pin)), "Only unique qualified exact engine pins are supported");
+  assert.ok(modes.length && new Set(modes).size === modes.length && modes.every((mode) => MODES.includes(mode)), "Unknown or duplicate mode");
   const runtime = await createRuntimeFixture({ timeoutMs: 30 * 60_000 });
   // npm configuration and its cache are private too; never consult ~/.npmrc.
   Object.assign(runtime.env, { npm_config_cache: path.join(runtime.cache, "npm"), npm_config_userconfig: path.join(runtime.config, "npmrc"), npm_config_registry: "https://registry.npmjs.org" });
   await writeFile(runtime.env.npm_config_userconfig, "");
   const reportPath = path.resolve(value("--report") ?? path.join(os.tmpdir(), `pipa-engines-${Date.now()}.json`));
   const pkg = JSON.parse(await readFile(path.join(repo, "package.json"), "utf8"));
-  const report = { schema: "pipa-opencode-matrix/v1", gate, matrix: { pins, modes }, migrationRequested: argv.includes("--migration"), collection: argv.includes("--baseline") ? "pre-port-baseline" : "compatibility", releaseQualified: false, date: new Date().toISOString(), pipa: pkg.version, node: process.version, platform: process.platform, arch: process.arch, cells: [], cases: [] };
+  const report = { schema: "pipa-opencode-matrix/v1", gate, matrix: { pins, modes }, migrationRequested: argv.includes("--migration"), collection: smoke ? "beta-smoke" : argv.includes("--baseline") ? "pre-port-baseline" : "compatibility", releaseQualified: false, date: new Date().toISOString(), pipa: pkg.version, node: process.version, platform: process.platform, arch: process.arch, cells: [], cases: [] };
   report.unobservedPlatforms = ["linux", "darwin", "win32"].filter((platform) => platform !== process.platform).map((platform) => ({ platform, status: "BLOCKED", observed: "Not executed by this host; separate OS CI evidence required" }));
   try {
     const pack = npmSingle(await command(runtime, "npm", ["pack", "--ignore-scripts", "--json", "--pack-destination", runtime.root], { cwd: repo }));
@@ -172,30 +180,37 @@ async function main(argv) {
       let engine;
       try { engine = engines.get(pin) ?? await installEngine(runtime, pin); if (engine.error) throw engine.error; }
       catch (error) {
-        for (const mode of modes) report.cells.push({ engine: pin, mode, pipa: pkg.version, platform: process.platform, arch: process.arch, cases: [{ id: "engine-preflight", status: "FAIL", observed: error.message }, ...releaseCases.map((row) => ({ ...row, status: "BLOCKED", observed: `Engine install/preflight failed: ${error.message}` }))], cleanup: { status: "PASS", observed: "No cell launched" } });
+        for (const mode of modes) report.cells.push({ engine: pin, mode, ...(smoke ? { smoke: true, collection: "beta-smoke" } : {}), pipa: pkg.version, platform: process.platform, arch: process.arch, cases: [{ id: "engine-preflight", status: "FAIL", observed: error.message }, ...releaseCases.filter((row) => !smoke || BETA_CASE_IDS.includes(row.id) && row.modes.includes(mode) && row.generations.includes(pin.split(".")[0])).map((row) => ({ ...row, status: "BLOCKED", observed: `Engine install/preflight failed: ${error.message}` }))], cleanup: { status: "PASS", observed: "No cell launched" } });
         continue;
       }
       for (const mode of modes) {
-        const cellRuntime = await createRuntimeFixture({ timeoutMs: CELL_WORKER_TIMEOUT_MS + 60_000, parent: runtime });
+        const cellRuntime = await createRuntimeFixture({ timeoutMs: CELL_WORKER_TIMEOUT_MS + 60_000 });
         Object.assign(cellRuntime.env, { PATH: `${engine.bin}${path.delimiter}${cellRuntime.env.PATH}` });
         if (argv.includes("--migration")) cellRuntime.env.PIPA_MATRIX_ENGINE_BINARIES = JSON.stringify(Object.fromEntries([...engines].filter(([, engine]) => engine.binary).map(([pin, engine]) => [pin, engine.binary])));
         const output = path.join(cellRuntime.root, "cell.json");
         let cell;
         try {
-          await command(cellRuntime, process.execPath, [self, "--cell", candidate, pin, mode, output, ...(argv.includes("--migration") ? ["--migration"] : [])], { timeoutMs: CELL_WORKER_TIMEOUT_MS });
+          await command(cellRuntime, process.execPath, [self, "--cell", candidate, pin, mode, output, ...(smoke ? ["--smoke"] : []), ...(argv.includes("--migration") ? ["--migration"] : [])], { timeoutMs: CELL_WORKER_TIMEOUT_MS });
           cell = JSON.parse(await readFile(output, "utf8"));
         } catch (error) {
-          cell = { cases: releaseCases.map((row) => ({ ...row, status: "BLOCKED", observed: `Cell worker failed: ${error.message}` })) };
+          cell = { cases: releaseCases.filter((row) => !smoke || BETA_CASE_IDS.includes(row.id) && row.modes.includes(mode) && row.generations.includes(pin.split(".")[0])).map((row) => ({ ...row, status: "BLOCKED", observed: `Cell worker failed: ${error.message}` })) };
           cell.cases.push({ id: "worker", status: "FAIL", observed: error.message });
         }
+        if (smoke) { cell.smoke = true; cell.collection = "beta-smoke"; }
         cell.engine = pin; cell.enginePackage = engine.package; cell.engineIntegrity = engine.integrity;
         cell.mode = mode; cell.pipa = pkg.version; cell.platform = process.platform; cell.arch = process.arch;
         for (const row of cell.cases) row.evidenceRef = `#/cells/${report.cells.length}/evidence`;
         const workerCleanup = cell.cleanup;
+        if (workerCleanup?.status !== "PASS") cellRuntime.defer(() => {
+          throw new Error("Native worker cleanup was not confirmed; preserve its enclosing fixture.");
+        }, "native worker evidence");
         await finishCell(cell, cellRuntime);
-        if (workerCleanup?.status === "FAIL") cell.cleanup = workerCleanup;
+        if (cell.cleanup.status === "PASS" && (workerCleanup?.status === "FAIL" || smoke && workerCleanup?.status !== "PASS")) cell.cleanup = workerCleanup ?? { status: "FAIL", observed: "Missing native cell cleanup evidence" };
         report.cells.push(cell);
-        for (const row of cell.cases) process.stdout.write(`${pin} ${mode} ${row.id}: ${row.status} — ${row.observed.split("\n")[0]}\n`);
+        for (const row of cell.cases) {
+          if (smoke && !BETA_CASE_IDS.includes(row.id) && releaseCases.some((definition) => definition.id === row.id)) continue;
+          process.stdout.write(`${pin} ${mode} ${row.id}: ${row.status} — ${row.observed.split("\n")[0]}\n`);
+        }
         await writeFile(reportPath, JSON.stringify(report, null, 2), { mode: 0o600 });
       }
     }
@@ -214,7 +229,13 @@ async function main(argv) {
 if (!process.env.NODE_TEST_CONTEXT && process.argv[1] && path.resolve(process.argv[1]) === self) {
   if (process.argv[2] === "--cell") {
     const [, , , candidate, pin, mode, output] = process.argv;
-    const cell = await runCell({ candidate, pin, mode, migration: process.argv.includes("--migration") });
+    const flags = process.argv.slice(7);
+    for (const flag of flags) assert.ok(["--smoke", "--migration"].includes(flag), `Unknown cell argument ${flag}`);
+    const smoke = flags.includes("--smoke");
+    assert.ok(!smoke || !flags.includes("--migration"), "--smoke cannot collect migration");
+    const caseIds = smoke ? BETA_CASE_IDS.filter((id) => releaseCases.some((row) => row.id === id && row.modes.includes(mode) && row.generations.includes(pin.split(".")[0]))) : undefined;
+    const cell = await runCell({ candidate, pin, mode, migration: flags.includes("--migration"), ...(smoke ? { smoke: true, caseIds } : {}) });
+    if (smoke) { cell.smoke = true; cell.collection = "beta-smoke"; }
     await writeFile(output, JSON.stringify(cell, null, 2), { mode: 0o600 });
   } else await main(process.argv.slice(2));
 }

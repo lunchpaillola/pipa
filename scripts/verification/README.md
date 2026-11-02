@@ -6,14 +6,42 @@ Run from the repository with Node 22 or newer:
 npm test
 npm run test:pack
 node --test scripts/verification/self-check.mjs
+npm run test:beta -- --report=beta-smoke.json
+# Explicit broad qualification collection:
 npm run test:engines -- --baseline --migration --gate=deterministic
 ```
 
-The engine command installs one Pipa tarball and verifies private native binaries
+The full engine command installs one Pipa tarball and verifies private native binaries
 for OpenCode **1.18.35, 1.19.0, 2.0.29, and 2.2.5**. It exercises Socket-owned, Managed,
 and attached connections. Only the model and Chat transport are deterministic
 fixtures; engine execution, tools, state, scheduler and Managed CLI restart are
 real. No Slack or paid-provider credentials are required.
+
+## Small-beta collection
+
+`test:beta` maps to the existing runner's `--smoke`: two pins (**1.19.0 / 2.2.5**)
+x three modes = **six cells per host**, with five centrally exported `BETA_CASE_IDS`
+and **24 applicable case observations** (four per cell).
+Coverage is authenticated real-engine startup, exact prompt/history, the applicable
+Managed or deterministic Socket CLI restart, and stop ownership. The scripted
+local provider consumes no paid-provider quota; fake Chat is not live Slack proof.
+
+Workers receive `{ smoke:true, caseIds }` with only applicable IDs; reports and
+cells are labeled `beta-smoke`. Only the external restart worker-PID scan is
+skipped (`workerExitObserved:false`, no claim that `workersExited` was observed).
+The existing `selectGate`'s `beta-smoke` branch requires all selected applicable cases and
+worker/preflight/cleanup/report diagnostics to PASS; missing/duplicate required
+evidence fails. Other catalog rows, including uncollected BLOCKED placeholders,
+are outside scope with explicit reasons and unchanged statuses.
+
+PR CI uses `beta-smoke.json` on three OS hosts (18 cells). Manual workflow input
+`full_qualification` opts into the full deterministic/migration matrix. Richer files,
+approvals and routines remain covered by retained unit tests and the broad manual
+matrix, not the native beta promise; the existing Socket restart case still checks
+its routine flow. Deep crash,
+plugin/model, boundary-file, migration, remote/live/operator checks are deferred
+to those broader lanes, not waived. Both smoke and direct targeted `caseIds`
+leave `releaseQualified:false`; neither is a supported-minimum or release claim.
 
 Native **2.2.5** is the current v2 qualification target; **2.0.29** remains a
 historical comparison pin. The SDK stays pinned to `@opencode/client@2.0.29`
@@ -45,6 +73,8 @@ cleanup retains the private root for diagnosis.
 ## Options and evidence
 
 - `--pins=1.18.35,2.2.5` and `--modes=attached` select a smaller matrix.
+- `--smoke` selects beta collection through the existing gate; `--pins`/`--modes`
+  can narrow it. It rejects `--baseline`, `--migration` and `--gate` overrides.
 - `--migration` seeds each v1 pin, stops its writers, snapshots the entire private
   profile, attempts continuation on native **2.2.5** on a disposable copy, and tests rollback on
   a separate pristine v1 copy. Omitting it leaves required migration evidence
@@ -53,7 +83,7 @@ cleanup retains the private root for diagnosis.
   exist. By default the command prints a unique report path in the OS temp area.
 - `--baseline` labels pre-port collection. It does **not** turn known failures
   into passes or suppress a failing exit code.
-- `--gate=deterministic` is the default and the no-secret CI gate. It requires
+- `--gate=deterministic` is the full runner's default and manual no-secret gate. It requires
   every applicable deterministic case and cleanup result. Reports also retain
   live and mode-inapplicable observations, with explicit gate exclusion reasons.
 - `--gate=release` additionally requires applicable live/deployment and missing

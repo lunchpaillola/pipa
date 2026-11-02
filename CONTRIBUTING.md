@@ -15,7 +15,18 @@ npm run test:pack
 Keep changes small, include a regression test for behavior changes, and never commit Slack tokens or files from `~/.pipa`.
 
 For runtime compatibility changes, also run `node --test scripts/verification/self-check.mjs`
-and the applicable pinned native cells (`npm run test:engines -- --migration`).
+and `npm run test:beta -- --report=beta-smoke.json`: real 1.19.0 / 2.2.5 engines,
+three modes, six cells and 24 applicable case observations per host, with scripted
+local provider/Chat fixtures and no credentials or paid-provider quota.
+PR CI runs this slim smoke; use the workflow's manual `full_qualification` input
+or `npm run test:engines -- --migration` for the broad matrix. Smoke covers basic
+startup, prompts/history, applicable restart and stop ownership. Richer files,
+approvals and routines stay in retained unit tests and the broad manual matrix,
+not the native beta promise; the existing Socket restart case retains its routine
+flow. Deep crash/plugin/model/migration and live-client qualification stay separate.
+It skips external restart worker-PID observation only, records that gap, and
+keeps all selected failures and cleanup diagnostics strict. `releaseQualified`
+remains false; no smoke or targeted subset authorizes publish or production changes.
 Keep the no-secret PR lane separate from opt-in real Slack/provider execution.
 See [testing](docs/pipa-testing.md) and [compatibility/rollback](docs/opencode-compatibility.md).
 No supported minimum or release qualification is implied by a subset of native passes.

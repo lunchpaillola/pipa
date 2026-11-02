@@ -3,27 +3,44 @@ import test from "node:test";
 import { spawnSync } from "node:child_process";
 import { request } from "node:http";
 import { access, readFile, rm } from "node:fs/promises";
-import path from "node:path";
 import { createRuntimeFixture, waitFor, FIXTURE_TEARDOWN_TIMEOUT_MS } from "../../test/helpers/runtime-fixture.mjs";
 import { assertTurnOutcome } from "../../test/helpers/opencode-contract.mjs";
-import { assertPin, compatibilityExit, selectGate, recordCase, finishCell, CELL_WORKER_TIMEOUT_MS, PINS, MODES } from "../test-opencode-matrix.mjs";
+import { assertPin, compatibilityExit, selectGate, recordCase, finishCell, CELL_WORKER_TIMEOUT_MS, PINS, MODES, BETA_PINS, BETA_CASE_IDS } from "../test-opencode-matrix.mjs";
 import { observeRuntimeReadiness, observeNativeAdmissions, assertRestartRoutineAdmission, releaseCases, runCell, protectedToolCommand, recordSharedCase } from "./opencode-release-cases.mjs";
 import { checkOpenCodeConnection } from "../../src/opencode.mjs";
 import { createWireFixture, loadWireFixture } from "../../test/helpers/opencode-contract.mjs";
 import { createProvider } from "./opencode-provider.mjs";
 import { command } from "../test-opencode-matrix.mjs";
 import { fileURLToPath } from "node:url";
-import { journal, stopOwned, windowsTree } from "../../test/helpers/runtime-ownership.mjs";
 import { MIGRATION_TARGET_PIN, selectMigrationTarget } from "./opencode-migration.mjs";
 
 const facade = { checkOpenCodeConnection };
 
-test("timed-out native workers retain bounded progress diagnostics", async (t) => {
+test("fixture launches Node without injecting arguments or a spawn supervisor", async (t) => {
   const runtime = await createRuntimeFixture();
   t.after(() => runtime.teardown());
-  // Cold Windows PowerShell startup can exceed five seconds; warm the inspector
-  // before testing the command's separate 500 ms execution deadline.
-  if (process.platform === "win32") await command(runtime, process.execPath, ["-e", ""]);
+  const script = "process.stdout.write(JSON.stringify(process.execArgv))";
+  assert.deepEqual(JSON.parse(await command(runtime, process.execPath, ["-e", script])), ["-e", script]);
+});
+
+test("fixture runs explicit resource shutdown before its direct-process fallback", async () => {
+  const runtime = await createRuntimeFixture();
+  let worker;
+  runtime.defer(async () => {
+    assert.equal(worker.child.exitCode, null);
+    assert.equal(worker.child.signalCode, null);
+    worker.child.kill("SIGTERM");
+    await worker.exited;
+  }, "explicit worker shutdown");
+  worker = runtime.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
+  await runtime.teardown();
+  assert.ok(worker.child.exitCode !== null || worker.child.signalCode !== null);
+  await assert.rejects(access(runtime.root), { code: "ENOENT" });
+});
+
+test("timed-out native workers retain bounded progress diagnostics", async (t) => {
+  const runtime = await createRuntimeFixture({ timeoutMs: 5000 });
+  t.after(() => runtime.teardown());
   await assert.rejects(command(runtime, process.execPath, ["-e", "process.stderr.write('case-progress:synthetic-barrier'); setInterval(() => {}, 1000)"], { timeoutMs: 500 }), error => {
     assert.match(error.message, /timed out/u);
     assert.match(error.message, /case-progress:synthetic-barrier/u);
@@ -193,6 +210,32 @@ const gateFixture = () => ({
     cases: releaseCases.map((definition) => ({ id: definition.id, status: definition.lane === "live" || !definition.modes.includes(mode) ? "BLOCKED" : !definition.generations.includes(engine.split(".")[0]) ? "NOT_APPLICABLE" : "PASS", observed: "fixture" })),
   }))),
   unobservedPlatforms: [{ platform: "linux", status: "BLOCKED", observed: "separate host required" }],
+});
+
+test("beta smoke requires every selected journey and cleanup without qualifying the full matrix", () => {
+  const report = gateFixture();
+  report.cells = report.cells.filter((cell) => BETA_PINS.includes(cell.engine));
+  for (const cell of report.cells) cell.cases = cell.cases.filter((row) => BETA_CASE_IDS.includes(row.id));
+  const options = { gate: "beta-smoke", pins: BETA_PINS };
+  const before = JSON.stringify(report);
+  const smoke = selectGate(report, options);
+  assert.equal(smoke.exitCode, 0);
+  assert.equal(smoke.included.filter((row) => BETA_CASE_IDS.includes(row.id)).length, 24);
+  assert.equal(selectGate(report, { pins: BETA_PINS }).exitCode, 1);
+  assert.equal(selectGate(report, { gate: "release", pins: BETA_PINS }).exitCode, 1);
+  assert.equal(JSON.stringify(report), before);
+  assert.equal(report.releaseQualified, false);
+  for (const defect of ["missing", "duplicate", "failed", "cleanup", "worker"]) {
+    const changed = structuredClone(report);
+    const cell = changed.cells[0];
+    const row = cell.cases.find((row) => row.id === "startup-readiness");
+    if (defect === "missing") cell.cases.splice(cell.cases.indexOf(row), 1);
+    if (defect === "duplicate") cell.cases.push({ ...row });
+    if (defect === "failed") row.status = "FAIL";
+    if (defect === "cleanup") cell.cleanup.status = "FAIL";
+    if (defect === "worker") cell.cases.push({ id: "worker", status: "FAIL" });
+    assert.equal(selectGate(changed, options).exitCode, 1, defect);
+  }
 });
 
 test("targeted cell diagnostics reject invalid selections and cannot qualify the full gate", async () => {
@@ -416,279 +459,4 @@ test("default test discovery cannot download or launch engines", async () => {
 
 test("cell worker deadline exceeds bounded cell plus teardown", () => {
   assert.ok(CELL_WORKER_TIMEOUT_MS > 7 * 60_000 + FIXTURE_TEARDOWN_TIMEOUT_MS);
-});
-
-test("interrupted process registration fails cleanup and retains the owned root", async () => {
-  const runtime = await createRuntimeFixture();
-  journal(runtime.ownership, { kind: "intent", id: "interrupted-spawn" });
-  const cell = { cases: [] };
-  await finishCell(cell, runtime);
-  assert.equal(cell.cleanup.status, "FAIL");
-  assert.match(cell.cleanup.observed, /identity could not be proven/u);
-  await access(runtime.root);
-  await rm(runtime.root, { recursive: true, force: true });
-});
-
-test("ownership journal reconciles launch uncertainty with later actual process registration before cleanup PASS", async () => {
-  const runtime = await createRuntimeFixture();
-  const owned = runtime.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
-  try {
-    const entries = (await readFile(path.join(runtime.root, "ownership.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
-    const identity = entries.find(item => item.kind === "process" && item.pid === owned.child.pid);
-    assert.ok(identity && Number.isFinite(Date.parse(identity.birth)));
-    const id = identity.id;
-    journal(runtime.ownership, { kind: "intent", id });
-    journal(runtime.ownership, { kind: "unproven", phase: "launch", id, pid: identity.pid });
-    journal(runtime.ownership, { ...identity, id });
-    await stopOwned(runtime.ownership, 5000);
-    await owned.exited;
-    assert.throws(() => process.kill(identity.pid, 0), { code: "ESRCH" });
-    const cell = { cases: [] };
-    await finishCell(cell, runtime);
-    assert.equal(cell.cleanup.status, "PASS", cell.cleanup.observed);
-    await assert.rejects(access(runtime.root), { code: "ENOENT" });
-  } finally {
-    if (owned.child.exitCode === null && owned.child.signalCode === null) owned.child.kill("SIGKILL");
-    await runtime.teardown().catch(() => undefined);
-    await rm(runtime.root, { recursive: true, force: true });
-  }
-});
-
-test("ownership journal keeps exit and unknown uncertainty fatal despite actual process registration", async () => {
-  for (const phase of ["exit", undefined, "unrecognized"]) {
-    const runtime = await createRuntimeFixture();
-    const owned = runtime.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
-    try {
-      const entries = (await readFile(path.join(runtime.root, "ownership.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
-      const identity = entries.find(item => item.kind === "process" && item.pid === owned.child.pid);
-      journal(runtime.ownership, { kind: "unproven", phase, id: identity.id, pid: identity.pid });
-      journal(runtime.ownership, identity);
-      const cell = { cases: [] };
-      await finishCell(cell, runtime);
-      assert.equal(cell.cleanup.status, "FAIL");
-      assert.match(cell.cleanup.observed, /identity could not be proven/u);
-      await owned.exited;
-      assert.throws(() => process.kill(identity.pid, 0), { code: "ESRCH" });
-      await access(runtime.root);
-    } finally {
-      if (owned.child.exitCode === null && owned.child.signalCode === null) owned.child.kill("SIGKILL");
-      await runtime.teardown().catch(() => undefined);
-      await rm(runtime.root, { recursive: true, force: true });
-    }
-  }
-});
-
-test("ownership journal refuses launch reconciliation for mismatched PID, root, ID or invalid birth", async () => {
-  for (const mutation of [{ pid: 102 }, { root: "other-root" }, { id: "other-id" }, { birth: null }, { birth: "invalid" }]) {
-    const runtime = await createRuntimeFixture();
-    try {
-      const identity = { kind: "process", id: "synthetic-launch", pid: 101, birth: "2026-10-14T10:00:00.000Z", ...mutation };
-      journal(runtime.ownership, { kind: "intent", id: "synthetic-launch" });
-      journal(runtime.ownership, { kind: "unproven", phase: "launch", id: "synthetic-launch", pid: 101 });
-      const context = mutation.root ? { ...runtime.ownership, root: path.join(runtime.root, mutation.root) } : runtime.ownership;
-      journal(context, identity);
-      // Historical dead evidence prevents these synthetic identities ever being signaled.
-      journal(context, { kind: "dead", id: identity.id });
-      await assert.rejects(stopOwned(runtime.ownership, 5000), error => {
-        assert.equal(error.code, "PIPA_TEST_OWNERSHIP_UNCERTAIN");
-        assert.match(error.message, /launch=1 exit=0 unknown=0 pending-intents=0/u);
-        return true;
-      });
-      const cell = { cases: [] };
-      await finishCell(cell, runtime);
-      assert.equal(cell.cleanup.status, "FAIL");
-      await access(runtime.root);
-    } finally {
-      await runtime.teardown().catch(() => undefined);
-      await rm(runtime.root, { recursive: true, force: true });
-    }
-  }
-});
-
-test("ownership journal uncertainty diagnostics contain only bounded root-scoped counts", async () => {
-  const runtime = await createRuntimeFixture();
-  try {
-    for (const phase of ["launch", "exit", undefined]) journal(runtime.ownership, { kind: "unproven", phase, id: "private-id", pid: 123456789 });
-    journal(runtime.ownership, { kind: "intent", id: "private-pending-id" });
-    journal({ ...runtime.ownership, root: runtime.root + "-outside" }, { kind: "unproven", phase: "exit", id: "private-outside" });
-    await assert.rejects(stopOwned(runtime.ownership, 5000), error => {
-      assert.equal(error.code, "PIPA_TEST_OWNERSHIP_UNCERTAIN");
-      assert.equal(error.message, "Owned process tree identity could not be proven; roots retained: launch=1 exit=1 unknown=1 pending-intents=1");
-      for (const privateValue of [runtime.root, runtime.ownership.key, "private-id", "private-pending-id", "123456789", "private-outside"]) assert.ok(!error.message.includes(privateValue));
-      return true;
-    });
-    for (let index = 0; index < 10_000; index++) journal(runtime.ownership, { kind: "unproven", id: "private-overflow" });
-    await assert.rejects(stopOwned(runtime.ownership, 5000), error => {
-      assert.equal(error.code, "PIPA_TEST_OWNERSHIP_UNCERTAIN");
-      assert.equal(error.message, "Owned process tree identity could not be proven; roots retained: launch=1 exit=1 unknown=9999 pending-intents=1");
-      return true;
-    });
-    const cell = { cases: [] };
-    await finishCell(cell, runtime);
-    assert.equal(cell.cleanup.status, "FAIL");
-    await access(runtime.root);
-  } finally {
-    await runtime.teardown().catch(() => undefined);
-    await rm(runtime.root, { recursive: true, force: true });
-  }
-});
-
-test("ownership preload initialization failure does not expose its capability URL", async (t) => {
-  const runtime = await createRuntimeFixture();
-  t.after(() => runtime.teardown());
-  const preload = new URL("../../test/helpers/runtime-ownership.mjs", import.meta.url);
-  preload.searchParams.set("ownership", JSON.stringify({ ...runtime.ownership, key: "synthetic-private-capability" }));
-  const result = spawnSync(process.execPath, ["--import", preload.href, "-e", "process.stdout.write('BODY_RAN')"], {
-    cwd: runtime.workspace, env: runtime.env, encoding: "utf8", timeout: 5000,
-  });
-  assert.equal(result.status, 1);
-  assert.equal(result.stdout, "");
-  assert.equal(result.stderr, "Ownership preload initialization failed.\n");
-  if (process.platform === "win32") {
-    preload.searchParams.set("ownership", JSON.stringify({ ...runtime.ownership, launchId: "missing-powershell" }));
-    const missing = spawnSync(process.execPath, ["--import", preload.href, "-e", "process.stdout.write('BODY_RAN')"], {
-      cwd: runtime.workspace, env: { ...runtime.env, PATH: runtime.workspace }, encoding: "utf8", timeout: 5000,
-    });
-    assert.equal(missing.status, 1);
-    assert.equal(missing.stdout, "");
-    const prefix = "Cannot verify Windows process identities with WMI: ";
-    assert.ok(missing.stderr.startsWith(prefix), "Expected a bounded WMI diagnostic, not a preload stack");
-    assert.ok(!missing.stderr.includes(runtime.ownership.key) && !missing.stderr.includes(preload.href), "Private ownership capability was exposed");
-    const diagnostic = JSON.parse(missing.stderr.slice(prefix.length));
-    assert.deepEqual(Object.keys(diagnostic), ["phase", "stage", "elapsedMs", "timeoutMs", "errorCode", "status", "signal", "stdoutBytes", "stderrBytes"]);
-    assert.equal(diagnostic.phase, "preload");
-    assert.equal(diagnostic.stage, "startup");
-    assert.equal(diagnostic.errorCode, "ENOENT");
-    assert.equal(diagnostic.timeoutMs, 10_000);
-    assert.ok(Number.isInteger(diagnostic.elapsedMs) && diagnostic.elapsedMs >= 0);
-    assert.equal(diagnostic.stdoutBytes, 0);
-    assert.equal(diagnostic.stderrBytes, 0);
-  }
-});
-
-test("ownership preload preserves the spawn command-options overload", async (t) => {
-  const runtime = await createRuntimeFixture();
-  t.after(() => runtime.teardown());
-  const output = await command(runtime, process.execPath, ["--input-type=module", "-e", `
-    import { spawn } from 'node:child_process';
-    import assert from 'node:assert/strict';
-    const child = spawn(process.execPath, { stdio: ['pipe', 'pipe', 'pipe'] });
-    let output = '';
-    child.stdout.setEncoding('utf8').on('data', chunk => { output += chunk; });
-    child.stdin.end("process.stdout.write('OVERLOAD_OK')");
-    const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
-    assert.equal(code, 0);
-    assert.equal(output, 'OVERLOAD_OK');
-    process.stdout.write(output);
-  `]);
-  assert.equal(output, "OVERLOAD_OK");
-});
-
-test("killed nested worker releases fixture engines and independent detached restart groups before PASS", async () => {
-  const outer = await createRuntimeFixture();
-  const unrelated = await createRuntimeFixture();
-  const helper = new URL("../../test/helpers/runtime-fixture.mjs", import.meta.url).href;
-  const evidence = path.join(outer.workspace, "nested.json");
-  const survivor = unrelated.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
-  const cell = { cases: [] };
-  let observed;
-  try {
-    const worker = outer.spawn(process.execPath, ["--input-type=module", "-e", `
-      import { createRuntimeFixture } from ${JSON.stringify(helper)};
-      import { spawn } from 'node:child_process';
-      import { writeFileSync, readFileSync } from 'node:fs';
-      const nested = await createRuntimeFixture();
-      const engine = nested.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)']);
-      const restartFile = nested.workspace + '/replacement.pid';
-      const restart = spawn(process.execPath, ['-e', "const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' }); require('node:fs').writeFileSync(process.argv[1], String(child.pid)); child.unref();", restartFile], { detached: true, stdio: 'ignore', env: nested.env });
-      const restarted = new Promise(resolve => restart.once('exit', resolve));
-      restart.unref();
-      const replacement = await nested.waitFor(() => { try { return Number(readFileSync(restartFile, 'utf8')); } catch { return false; } });
-      await restarted;
-      writeFileSync(process.argv[1], JSON.stringify({ root: nested.root, engine: engine.child.pid, restart: replacement }));
-      setInterval(() => {}, 1000);
-    `, evidence]);
-    observed = JSON.parse(await outer.waitFor(() => readFile(evidence, "utf8").catch(() => false)));
-    worker.child.kill("SIGKILL");
-    await worker.exited;
-    await access(observed.root);
-    await finishCell(cell, outer);
-    assert.equal(cell.cleanup.status, "PASS", cell.cleanup.observed);
-    for (const pid of [observed.engine, observed.restart]) assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
-    await assert.rejects(access(observed.root), { code: "ENOENT" });
-    assert.equal(survivor.child.exitCode, null, "unrelated fixture was killed");
-  } finally {
-    // Explicit test-owned fallback only, so a regression cannot leak test engines.
-    for (const pid of [observed?.engine, observed?.restart]) if (pid) { try { process.kill(process.platform === "win32" ? pid : -pid, "SIGKILL"); } catch {} }
-    await outer.teardown().catch(() => undefined);
-    await unrelated.teardown().catch(() => undefined);
-    await rm(outer.root, { recursive: true, force: true });
-    await rm(unrelated.root, { recursive: true, force: true });
-  }
-});
-
-test("already-exited group leader cannot hide a living child from cleanup", async () => {
-  const runtime = await createRuntimeFixture();
-  const evidence = path.join(runtime.workspace, "child.pid");
-  let pid;
-  try {
-    const leader = runtime.spawn(process.execPath, ["--input-type=module", "-e", `
-      import { spawn } from 'node:child_process';
-      import { existsSync, writeFileSync } from 'node:fs';
-      import { waitFor } from ${JSON.stringify(new URL("../../test/helpers/runtime-fixture.mjs", import.meta.url).href)};
-      const ready = process.argv[1] + '.ready';
-      // Windows must detach from the leader's console to survive its exit.
-      const child = spawn(process.execPath, ['-e', "require('node:fs').writeFileSync(process.argv[1], 'ready'); setInterval(() => {}, 1000)", ready], { stdio: 'ignore', detached: process.platform === 'win32' });
-      await waitFor(() => {
-        if (child.exitCode !== null || child.signalCode !== null) throw new Error('Descendant exited before readiness');
-        return existsSync(ready);
-      });
-      writeFileSync(process.argv[1], String(child.pid));
-      child.unref();
-    `, evidence]);
-    pid = Number(await runtime.waitFor(() => readFile(evidence, "utf8").catch(() => false)));
-    await leader.exited;
-    process.kill(pid, 0);
-    const cell = { cases: [] };
-    await finishCell(cell, runtime);
-    assert.equal(cell.cleanup.status, "PASS", cell.cleanup.observed);
-    assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
-  } finally {
-    if (pid) { try { process.kill(pid, "SIGKILL"); } catch {} }
-    await runtime.teardown().catch(() => undefined);
-    await rm(runtime.root, { recursive: true, force: true });
-  }
-});
-
-test("Windows tree discovery retains exited-leader children and rejects reused identities", () => {
-  const leader = { pid: 10, ppid: 1, birth: "2026-10-14T10:00:00.000Z" };
-  const child = { pid: 11, ppid: 10, birth: "2026-10-14T10:00:01.000Z" };
-  const grandchild = { pid: 12, ppid: 11, birth: "2026-10-14T10:00:03.000Z" };
-  const unrelated = { pid: 13, ppid: 1, birth: "2026-10-14T10:00:01.000Z" };
-  const exitedAt = Date.parse("2026-10-14T10:00:02.000Z");
-  assert.deepEqual(windowsTree([child, grandchild, unrelated], [leader], exitedAt).map((item) => item.pid), [11, 12]);
-  assert.deepEqual(windowsTree([{ ...grandchild, birth: child.birth }, unrelated], [leader, child], exitedAt).map((item) => item.pid), [12]);
-  assert.throws(() => windowsTree([{ ...leader, birth: child.birth }, child], [leader], exitedAt), /reused PID/u);
-  assert.throws(() => windowsTree([{ ...child, birth: grandchild.birth }], [leader], exitedAt), /unproven descendant/u);
-  assert.throws(() => windowsTree([{ ...child, birth: null }], [leader], exitedAt), /creation identity/u);
-  assert.throws(() => windowsTree([{ ...child, birth: "2026-10-14T09:00:00.000Z" }], [leader], exitedAt), /older unowned child/u);
-});
-
-test("changed birth in the ownership journal refuses to signal an unrelated live PID", async () => {
-  const runtime = await createRuntimeFixture();
-  const unrelated = await createRuntimeFixture();
-  const survivor = unrelated.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
-  try {
-    journal(runtime.ownership, { kind: "process", id: "stale-pid", pid: survivor.child.pid, birth: "not-the-current-birth", detached: false });
-    const cell = { cases: [] };
-    await finishCell(cell, runtime);
-    assert.equal(cell.cleanup.status, "FAIL");
-    assert.match(cell.cleanup.observed, /identity changed.*reused PID/u);
-    process.kill(survivor.child.pid, 0);
-    assert.equal(survivor.child.exitCode, null);
-    await access(runtime.root);
-  } finally {
-    await unrelated.teardown();
-    await rm(runtime.root, { recursive: true, force: true });
-  }
 });
