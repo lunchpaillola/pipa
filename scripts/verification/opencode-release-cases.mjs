@@ -40,7 +40,7 @@ export const releaseCases = [
   caseOf("socket-fixture-restart", "Detached restart, Socket/attached", "Installed CLI detached restart with fake Chat: native readiness, worker exit, one routed notice, history follow-up and attached PID survival", "U6", chatCase),
   caseOf("reconnect-stream", "Reconnect/reload", "Close a real production event response, reconnect, settle one permission and deliver once", "U2/U3", chatCase),
   caseOf("reload-location", "Reconnect/reload", "Native location reload preserves session history and admits exactly one continuation", "U2/U3"),
-  caseOf("crash-after-instruction-registration", "Abrupt crash/recovery", "Death after owned instruction registration recovers only Pipa-owned context without admitting new work", "U2/U6"),
+  caseOf("crash-after-instruction-registration", "Abrupt crash/recovery", "Death after owned instruction registration recovers only Pipa-owned context without admitting new work; v1 has no separate registration boundary", "U2/U6", { native: true, generations: ["2"] }),
   caseOf("crash-after-admission", "Abrupt crash/recovery", "Abrupt executor death after native acceptance retains session identity without replay or false success", "U2/U6"),
   caseOf("crash-during-approval", "Abrupt crash/recovery", "Abrupt executor death at a real pending approval recovers/cancels abandoned work without false success", "U2/U6"),
   caseOf("crash-after-completion", "Abrupt crash/recovery", "Death after engine completion before delivery retains history without automatic replay/redelivery", "U2/U6"),
@@ -64,7 +64,7 @@ export const releaseCases = [
   caseOf("models-switch", "Models/providers", "Production model discovery/switch seam retains history and changes the next provider request", "U5", { native: true, generations: ["2"] }),
   ...["variants", "default", "reset"].map((kind) => caseOf(`models-${kind}`, "Models/providers", `Native ${kind} semantics preserve history and prove the next provider request`, "U5", { native: true, generations: ["2"] })),
   caseOf("definitions-mcp-skill", "MCP/skills/agents/commands/plugins", "Invoke real stdio MCP and file skill through actual native tools; plugin loads", "U7"),
-  caseOf("definitions-command", "MCP/skills/agents/commands/plugins", "Production tool path invokes the installed native CLI file command and returns its result", "U7"),
+  caseOf("definitions-command", "MCP/skills/agents/commands/plugins", "Production tool path invokes the installed native CLI file command and returns its result; dedicated native v1 commands are outside the existing Pipa baseline", "U7", { native: true, generations: ["2"] }),
   caseOf("migration-seed", "Package/platform/rollback", "Generate synthetic v1 histories/mappings/routines/approval; stop all writers and checkpoint-copy", "U9", transitionCase),
   caseOf("migration-upgrade", "Package/platform/rollback", "Migrate only a disposable copy with production Pipa v2, then continue and restart same sessions", "U7", transitionCase),
   caseOf("migration-rollback", "Package/platform/rollback", "Restore a matched pristine v1+Pipa copy and continue old sessions separately from v2-written data", "U9", transitionCase),
@@ -397,7 +397,7 @@ function toolEnvironmentAllowed(environment) {
 }
 
 export function protectedToolCommand(marker) {
-  return `"${process.execPath}" -e "if(!(${toolEnvironmentAllowed.toString()})(process.env))process.exit(23);console.log('${marker}')"`;
+  return `"${process.execPath}" -e "if(!(${toolEnvironmentAllowed.toString().replace(/[\r\n]+/gu, " ")})(process.env))process.exit(23);console.log('${marker}')"`;
 }
 
 export async function recordSharedCase(rows, definition, observe, provider) {
@@ -1146,7 +1146,7 @@ throw Error('Native file-command completion deadline exceeded');
       assertTurnOutcome(result, { sessionId: session, text: textFor("reload-recall") });
       assertNativeAdmissionCount(wires, promptFor("reload-recall"), 1);
     },
-    "crash-after-instruction-registration": () => pin.startsWith("2.") ? crashed("registration") : { status: "BLOCKED", observed: "V1 instructions are inline prompt system bytes; no separate durable instruction-registration boundary qualified." },
+    "crash-after-instruction-registration": () => crashed("registration"),
     "crash-after-admission": () => crashed("admission"),
     "crash-during-approval": () => crashed("approval"),
     "crash-after-completion": () => crashed("completion"),
@@ -1747,6 +1747,7 @@ throw Error('Native file-command completion deadline exceeded');
           assert.equal(executor.capabilities.liveModelSwitch, false);
           return { status: "NOT_APPLICABLE", observed: "Native v1 has no live v2 HTTP switch operation; ordinary model execution is covered separately" };
         }
+        if (definition.native && !definition.generations.includes(pin.split(".")[0])) return { status: "NOT_APPLICABLE", observed: `Outside applicable generations ${definition.generations.join(", ")}: ${definition.expected}` };
         if (definition.blocked) return { status: "BLOCKED", observed: definition.blocked };
         return execute[definition.id]();
       }, provider);

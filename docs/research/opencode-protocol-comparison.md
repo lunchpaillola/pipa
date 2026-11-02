@@ -75,13 +75,15 @@ The product promise should describe supported capabilities and automatic connect
 
 ## Still required before implementation/release qualification
 
+Historical spike checklist, not current implementation or qualification status. The migration plan's Latest Owner Scope governs current work; these observations do not authorize v1 feature expansion or claim any remaining gate passed.
+
 - User confirmation of compatibility scope; do not silently override the earlier v2-only decision.
 - Full v2 executor implementation, including robust event reconnection, final-result attribution, cancellation during admission, and child-session routing.
 - Actual v1-to-v2 database migration and preserved session mappings. Loading an HTTP-created session into ACP on the same engine is **not** a cross-version migration test.
 - Full Pipa Socket and Managed restart with each supported runtime, not merely restarting an ACP process.
 - Real scheduled routine delivery and result-thread continuation with each supported runtime.
 - Real Slack permission/form controls and attachment/artifact upload flows.
-- Exact 20 MiB boundary and outgoing artifact limits; the image probe used a small fixture.
+- Exact incoming boundary, revised from 20 MiB to 10 MiB (10,485,760 bytes) by R8 on 2026-10-15; outgoing limits remain 10 files and 100 MB per file or response. The image probe used a small fixture and does not qualify these boundaries.
 - Required provider/MCP/plugin/agent/skill/command compatibility, background-child behavior, and disconnect/reload recovery.
 - A separately hosted attached server, supported-platform package checks, and a rollback trial.
 - Real-provider inference smoke tests. A mock provider deliberately avoids credential exposure and paid-model dependence in the protocol comparison.

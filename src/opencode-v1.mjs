@@ -175,7 +175,7 @@ function watchInteractions({ baseUrl, fetchImpl, headers, sessionId, workingDire
     while (candidate && !visited.has(candidate)) {
       if (candidate === sessionId) { interactionSessionIds.add(original); return true; }
       visited.add(candidate);
-      if (!parents.has(candidate)) parents.set(candidate, requestTurn(`/session/${encodeURIComponent(candidate)}`, { method: "GET" }, workingDirectory, readController).then((session) => !session.directory || session.directory === workingDirectory ? session?.parentID : undefined));
+      if (!parents.has(candidate)) parents.set(candidate, requestTurn(`/session/${encodeURIComponent(candidate)}`, { method: "GET" }, workingDirectory, readController).then((session) => !session?.directory || session.directory === workingDirectory ? session?.parentID : undefined));
       candidate = await parents.get(candidate);
     }
     return false;

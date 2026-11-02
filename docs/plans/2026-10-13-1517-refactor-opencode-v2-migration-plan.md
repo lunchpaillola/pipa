@@ -11,9 +11,16 @@ execution: code
 # OpenCode v1 and v2 Compatibility - Plan
 
 **Target repository:** [lunchpaillola/pipa](https://github.com/lunchpaillola/pipa).
-One Pipa package automatically selects a native v1 or v2 HTTP adapter. This plan is ready for local implementation, not a claim that the new runtime or harness already exists. Required release qualification and live deployment remain gated by the Verification Contract.
+One Pipa package automatically selects a native v1 or v2 HTTP adapter. This document retains historical planning context; the adapters, harness entry points, and independently shipped Slack model picker are now implemented, not evidence that qualification has passed. Required release qualification and live deployment remain gated by the Verification Contract.
 
 Product Contract preservation: R1 and R14 now cover both supported generations, superseding v2-only scope with the user's explicit approval. R2–R13 retain their behavioral intent; R12 distinguishes the v2-only live-model-switch capability. Existing R, AE, KTD, and U IDs remain stable.
+
+### Latest Owner Scope
+
+- Migrate to v2 while preserving the current Pipa-on-v1 baseline, including the pre-existing model picker. No v1 feature expansion is authorized; broader historical requirements below are read within this boundary.
+- Instruction registration and its recovery journal are v2-only. V1 retains its existing per-prompt system instructions; do not add v1 instruction registration or automatic recovery merely to make the engines symmetrical.
+- A pre-existing v1 attached-command limitation is not a new migration blocker. Keep its failed observation visible and distinguish it from a candidate-introduced regression; do not expand v1 command support to clear the migration gate.
+- Approval-crash parity with the current Pipa-on-v1 baseline is unproven. Compare the observed behavior before claiming parity or a regression; this gap does not automatically require new v1 post-crash recovery. Failures and unproven coverage remain explicit, not passes.
 
 ## Goal Capsule
 
@@ -58,7 +65,7 @@ Pipa currently requires OpenCode v1 during initialization and uses v1 HTTP paylo
 
 - R10. Routines retain exact saved prompts, destination/responder authorization checks, overlap prevention, cancellation, and result-thread continuation.
 - R11. Qualify native v2 delegated execution, result return, and child approvals against Pipa's existing delegation/delivery behavior. Preserve the current Slack experience; do not add a new acknowledgement, late-result notification, or background-job interface as part of the migration.
-- R12. Verify connected-model discovery and v2 native live switching on the existing session, including variants/default semantics and history preservation. V1 must not claim next-provider-step switching; defer the Slack picker/help UI and its v1 capability-specific behavior to follow-up work.
+- R12. Verify connected-model discovery and v2 native live switching on the existing session, including variants/default semantics and history preservation. V1 must not claim next-provider-step switching. The Slack model picker is now pre-existing behavior to preserve; additional picker/help UI and v1 capability expansion remain outside this migration.
 - R13. Keep supported existing OpenCode configuration and file-based definitions initially; identify required plugins that need a separate v2 implementation.
 - R14. Verify the common feature contract against both adapters and the qualified real-runtime matrix, including actual scheduler dispatch and detached Socket/Managed restart. Record missing environments, capabilities, or responders as blocked coverage, never passed.
 
@@ -86,7 +93,7 @@ Port the protocol boundary and qualify the existing product behaviors. Add only 
 
 #### Deferred to Follow-Up Work
 
-- Slack model picker, message shortcut, local model/help commands, and help app action.
+- Additional model/help UI, message shortcut, and help app action. The original Slack picker deferral is historical: the implemented picker and existing model commands are baseline behavior, not deferred migration deliverables.
 - Wholesale conversion of supported v1 configuration to native v2 syntax.
 - Adoption of the shared user service as Pipa's default process model.
 - Durable replay infrastructure or an embedded OpenCode server solely to enable event persistence.
@@ -95,7 +102,7 @@ Port the protocol boundary and qualify the existing product behaviors. Add only 
 
 ### Execution-Time Qualification
 
-- Initial engine pins are 1.18.35, 1.19.0, and 2.0.29; pin the v2 client to 2.0.29. These are the real-spike baselines, not completed release qualification. Establish a supported minimum per major from passing production-harness cells and check required contracts at startup; do not promise every historical/future release or reject newer patches solely for not matching an exact binary pin.
+- Current native v2 qualification target is 2.2.5; 2.0.29 remains a historical comparison pin alongside v1 pins 1.18.35 and 1.19.0. The v2 client remains pinned to 2.0.29. Pin inclusion is not completed release qualification. Establish a supported minimum per major from passing production-harness cells and check required contracts at startup; do not promise every historical/future release or reject newer patches solely for not matching an exact binary pin.
 - **Deferred to operator trial — plugin availability:** Inventory required plugins in a private test profile; block cutover if a required v1 plugin has no working v2 port. Do not publish that profile's secrets or personal configuration.
 - **Deferred to live validation — credentials and operator handoff:** Supply the chosen app, channel, sender, and responder through private environment/profile configuration. If reusing an app, confirm its existing consumer is stopped before candidate startup. Local implementation can proceed before this handoff; checked-in plans and examples contain no operator-specific channel or app IDs.
 
@@ -129,7 +136,7 @@ See `docs/research/opencode-protocol-comparison.md`: 58 real-engine comparison c
 - KTD5. **Normalize protocol data into existing Slack interactions.** V1 keeps its question arrays and permission reply payloads. V2 native question forms (`metadata.kind: question`, ordered `q0` fields) map to the current choices/multiselect/custom-answer callback and back to keyed values. Preserve native request/field IDs internally. Normalize v2 permission action/resources/source and map decisions to its `decision` field. Retain existing permission callbacks; add backward-compatible optional submission-confirmation/settlement signals where needed. Keep the pending interaction and existing controls until native acceptance; rejected answers remain editable with an error/retry, and an externally settled request removes stale controls without another rejection. Do not flatten generic numeric, conditional, or external forms into text questions: explain that the unsupported form requires an OpenCode client response and reconcile its settlement; do not add generic-form UI or fabricate acceptance.
 - KTD6. **Keep trusted turn context separate and recover its cleanup.** V1 retains per-prompt system instructions. V2 uses a profile-scoped Pipa-owned instruction entry, placed before admission and removed after settlement. Preserve exact user/routine prompt bytes. Register session/input/key ownership in a small private atomic recovery file before writing the entry; use the existing private JSON writer and keep state handling in the v2 adapter. Cleanup uses an independent bounded signal, not the aborted turn signal. On startup reconcile abandoned Pipa entries/admissions before intake, including newly created routine sessions; delete only owned keys and clear records only after acknowledged cleanup. A new turn waits for prior settlement/cleanup. Do not mutate global environment or promise no stale-context exposure while an independently managed attached service is running without Pipa.
 - KTD7. **Leave OpenCode data migration and grants with OpenCode.** V1 profiles continue without conversion. When the operator chooses v2, wait for schema/history migration completion and configured-location readiness before restoring subscriptions or dispatching routines. Preserve Pipa's config, routine state, and thread-ID mapping format. Only a verified missing-session lookup after identity/auth/location readiness permits ordinary stale-session recovery; a wrong route, missing message/location, or failed migration does not. Document upstream reset of remembered approvals and verify configured rules; do not recreate grants or introduce a Pipa approval store. Rollback restores matched snapshots rather than pointing v1 at a v2-written database.
-- KTD8. **Describe model capabilities honestly.** Verify v2 model discovery/variants/default and native `session.switchModel` for R12 without a redundant preference store. V1's capability descriptor must not claim live switching; do not implement speculative picker fallback plumbing. User-facing model UI remains deferred.
+- KTD8. **Describe model capabilities honestly.** Verify v2 model discovery/variants/default and native `session.switchModel` for R12 without a redundant preference store. V1's capability descriptor must not claim live switching; do not implement speculative picker fallback plumbing. Preserve the pre-existing picker; additional user-facing model UI remains deferred.
 - KTD9. **Separate incoming and outgoing size constants.** The existing `MAX_ATTACHMENT_BYTES` also limits outgoing artifact reads. Introduce separate incoming and outgoing limits and update all callers, so implementing R8 does not reduce R9. The incoming boundary is 10 MiB (10,485,760 bytes), per the user's 2026-10-15 revision of R8. Display the incoming limit as MiB consistently in errors and docs.
 - KTD10. **Preserve Pipa's behavior while adopting native v2 delegation.** Characterize the existing delegated-work delivery with a representative v1 fixture, then compare the v2 path under R11. V2 documents foreground/background child sessions and background command results returning to the parent. Its `session.background` operation moves active backgroundable foreground tools into background observation; it is not a generic job-submission endpoint. Do not automatically call it, add Slack controls for it, or invent a completion policy. Report a concrete incompatibility if upstream semantics cannot preserve the existing experience.
 - KTD11. **Preserve the executor boundary and existing caller semantics.** Both adapters sit behind `runTurn`, `abortTurn`, and `stopAll`, returning the existing text/session/files result and existing callback meanings. KTD5's optional submission-confirmation/settlement signals are additive; older callers remain valid. The Pipa interaction handler uses confirmation without causing the adapter to submit a decision twice. Internally separate session resolution, execution of a prepared turn, and server cancellation. The facade calls `onSession` before artifact allocation/admission, stages/collects files once, and retains the active-controller registry. The thread runner, scheduler, reactions, and delivery authorization do not branch on engine version. This implements R1's session-settled dual-adapter decision.
@@ -348,6 +355,8 @@ Implement in dependency order: U8, U9, U1, U2, U3, U4, U5, U6, U7. U8/U9 establi
 
 ### U5. Qualify the model-selection foundation
 
+Historical unit framing: the picker has since shipped independently. Qualify the native v2 foundation while preserving that baseline; references below to a later UI do not defer or authorize rebuilding the existing picker.
+
 **Goal:** Supply a proven v2 capability seam for the later model UI.
 
 **Requirements:** R12. **Dependencies:** U2, U4.
@@ -408,7 +417,7 @@ Build the live evaluator around existing routine polling/confirmation/cleanup he
 
 ### Gates and Commands
 
-Commands marked planned are implementation deliverables, not commands already present in `package.json`.
+The commands and checklist below are implemented entry points, not passing qualification evidence. Qualification remains pending until the required scoped evidence is collected; retain failures and blocked coverage.
 
 | Gate | Evidence/entry point | Trigger and pass condition |
 |---|---|---|
@@ -416,10 +425,10 @@ Commands marked planned are implementation deliverables, not commands already pr
 | Shared app/state/routines | `node --test test/app.test.mjs test/state.test.mjs test/routines.test.mjs` | Authorization, callback ordering, scheduler dispatch, and stale-output protection compose with either adapter |
 | CLI/restart | `node --test test/cli.test.mjs test/restart.test.mjs` | Both fake native contracts preserve process/generation/readiness failure semantics |
 | Default PR CI | Existing `npm test`, `npm run test:pack` | Linux/macOS/Windows, Node 22; no live Slack/provider or downloaded engine requirement |
-| Pinned production-engine matrix | Planned `npm run test:engines` → `scripts/test-opencode-matrix.mjs` | Adapter/harness/package-affecting PRs and release candidates; all required version/mode/platform cells pass |
-| Actual upgrade/rollback | Planned engine-runner `--migration` mode | Each seeded v1 pin migrates on a disposable copy to v2 and continues; matched-snapshot rollback works |
-| Real Slack/provider release gate | Planned `npm run test:slack:release` → `scripts/slack-release-eval.mjs` | Protected manual/release run; critical cases pass sequentially on both generations with visible-client evidence |
-| Operator definitions/integrations | Checklist in planned `docs/opencode-compatibility.md` | Required credentials, MCP, plugins, agents, skills, commands work on the selected deployment |
+| Pinned production-engine matrix | Implemented `npm run test:engines` → `scripts/test-opencode-matrix.mjs` | Adapter/harness/package-affecting PRs and release candidates; all required version/mode/platform cells pass |
+| Actual upgrade/rollback | Implemented engine-runner `--migration` mode | Each seeded v1 pin migrates on a disposable copy to v2 and continues; matched-snapshot rollback works |
+| Real Slack/provider release gate | Implemented `npm run test:slack:release` → `scripts/slack-release-eval.mjs` | Protected manual/release run; critical cases pass sequentially on both generations with visible-client evidence |
+| Operator definitions/integrations | Existing checklist in `docs/opencode-compatibility.md` | Required credentials, MCP, plugins, agents, skills, commands work on the selected deployment |
 
 Run the existing full suite/package baseline before extraction and record pre-existing failures separately. The previous 55-test baseline is scoped evidence, not a substitute for this full baseline. Real-engine matrix tests call the production-selected facade and installed package; direct adapter tests alone cannot prove automatic selection.
 
@@ -439,7 +448,7 @@ Use existing Windows `.cmd`/`cross-spawn` patterns and process-tree termination;
 
 ### Runtime and Mode Matrix
 
-Initial pins: **1.18.35, 1.19.0, 2.0.29**. Require the same Pipa candidate on Linux, macOS, and Windows where these binaries are supported. `opencode-compatibility.yml` uses a separate no-secret job matrix; version/mode cells can share one job's cached binary installation. No paid/Slack secrets are exposed to fork pull requests.
+Qualification pins: **1.18.35, 1.19.0, 2.0.29, 2.2.5**. Native **2.2.5** is the current v2 target; **2.0.29** remains historical. Require the same Pipa candidate on Linux, macOS, and Windows where these binaries are supported. `opencode-compatibility.yml` uses a separate no-secret job matrix; version/mode cells can share one job's cached binary installation. No paid/Slack secrets are exposed to fork pull requests.
 
 | Mode | Real-engine CI composition | Additional live qualification |
 |---|---|---|
@@ -447,7 +456,7 @@ Initial pins: **1.18.35, 1.19.0, 2.0.29**. Require the same Pipa candidate on Li
 | Managed | Actual installed CLI/profile and real owned engine, authenticated readiness and full external restart observer | No Slack or routine execution is expected in this mode |
 | Attached | Independently launched authenticated engine, real app/facade with fake Chat; stop/start preserves engine PID | Actual attached Socket restart and configured separately hosted server; Pipa never stops that host |
 
-This is **3 engine pins × 3 modes × 3 supported OS jobs** for common real-engine qualification. The fake Chat Socket cell does not claim full Socket CLI restart proof; that belongs to the live gate. All common matrix rows apply to both adapters. V2-only live model switching and upstream-specific reload/delegation details are named capability cases, not reasons to skip common questions, permissions, or routines.
+This is **4 engine pins × 3 modes × 3 supported OS jobs** for common real-engine qualification, not a record of passing cells. The fake Chat Socket cell does not claim full Socket CLI restart proof; that belongs to the live gate. Common matrix rows preserve the current Pipa-on-v1 baseline under the Latest Owner Scope; they do not require v1 feature expansion. V2-only live model switching and upstream-specific reload/delegation details are named capability cases, not reasons to skip common questions, permissions, or routines.
 
 Exercise remote-style data-URI encoding and missing shared paths with dedicated fixtures. Loopback attachment is not proof of a remote filesystem/host; a configured separately hosted server is a deployment qualification gate. If unavailable, report remote coverage as blocked rather than silently declaring remote support verified.
 
@@ -457,7 +466,7 @@ For **each v1 pin**, generate synthetic sessions with history markers, configure
 
 Copy Pipa/OpenCode state through fixture tooling; never copy only a live SQLite main file or touch the user's sole database. Assert configured rules remain effective and upstream saved-approval reset is explained, with no Pipa-created grants. Restore the pristine old-engine snapshot for rollback; do not test downgrade by opening a v2-written database in v1.
 
-Separately force process death after Pipa instruction registration, after admission, during approval, and after engine completion. Verify KTD6/KTD13 cleanup/recovery and the existing routine crash-window behavior. Missing/unknown completion must not be converted into success, fresh admission, or a new exactly-once delivery promise.
+Separately force process death after v2-only Pipa instruction registration, and on both generations after admission, during approval, and after engine completion. Verify v2 KTD6 cleanup/recovery and compare v1 with the current Pipa-on-v1 baseline under KTD13. Approval-crash parity remains unproven, not an automatic requirement to add v1 recovery. Preserve failed observations and the existing routine crash-window behavior. Missing/unknown completion must not be converted into success, fresh admission, or a new exactly-once delivery promise.
 
 ### Real Slack Release Environment
 

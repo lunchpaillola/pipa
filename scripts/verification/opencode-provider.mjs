@@ -14,6 +14,7 @@ export async function createProvider(runtime) {
     try {
       assert.equal(req.method, "POST", "Unexpected provider method");
       assert.equal(req.url, "/v1/chat/completions", "Unexpected provider route");
+      req.setEncoding("utf8");
       let data = "";
       for await (const chunk of req) {
         data += chunk;

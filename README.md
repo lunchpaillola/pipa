@@ -68,7 +68,7 @@ Profiles created by `pipa init` use Socket Mode. Profiles written before mode su
 ### Requirements
 
 - Node.js 22 or newer
-- [OpenCode](https://opencode.ai) installed and authenticated; the dual-adapter candidate selects native v1/v2 automatically (qualification pins: 1.18.35, 1.19.0, 2.0.29; release-qualified minimums pending)
+- [OpenCode](https://opencode.ai) installed and authenticated; the dual-adapter candidate selects native v1/v2 automatically (current native v2 qualification target: 2.2.5; historical v2 pin: 2.0.29; v1 pins: 1.18.35, 1.19.0; release-qualified minimums pending)
 - A Slack workspace where you can create an app
 
 Invite the Slack app only to channels whose members may use OpenCode in the configured working directory.

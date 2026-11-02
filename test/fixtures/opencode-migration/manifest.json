@@ -2,7 +2,7 @@
   "schema": "pipa-opencode-migration/v1",
   "synthetic": true,
   "sourcePins": ["1.18.35", "1.19.0"],
-  "targetPin": "2.0.29",
+  "targetPin": "2.2.5",
   "historyMarker": "GENERATE_PER_PRIVATE_RUN",
   "sessions": ["channel-result", "existing-thread-result"],
   "routineStates": ["active", "inactive", "completed"],

@@ -179,8 +179,11 @@ if (supplied) {
       catch { try { journal(context, { kind: "unproven", id: context.launchId, pid: process.pid }); } catch {} }
     });
   }
-  cp.spawn = (command, args = [], options = {}) => options[launching]
-    ? originalSpawn(command, args, options)
-    : launchOwned(originalSpawn, command, args, options, options.env?.PIPA_TEST_OWNERSHIP ? validate(JSON.parse(options.env.PIPA_TEST_OWNERSHIP)) : context);
+  cp.spawn = (command, args = [], options = {}) => {
+    if (args && typeof args === "object" && !Array.isArray(args)) { options = args; args = []; }
+    return options[launching]
+      ? originalSpawn(command, args, options)
+      : launchOwned(originalSpawn, command, args, options, options.env?.PIPA_TEST_OWNERSHIP ? validate(JSON.parse(options.env.PIPA_TEST_OWNERSHIP)) : context);
+  };
   syncBuiltinESMExports();
 }

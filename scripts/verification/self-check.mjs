@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
+import { request } from "node:http";
 import { access, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { createRuntimeFixture, waitFor, FIXTURE_TEARDOWN_TIMEOUT_MS } from "../../test/helpers/runtime-fixture.mjs";
@@ -30,6 +31,7 @@ test("timed-out native workers retain bounded progress diagnostics", async (t) =
 test("protected shell admission accepts only loopback bypasses without exposing environment values", () => {
   const sentinel = { PIPA_INTEGRATION_SENTINEL: "matrix-integration" };
   const marker = "SYNTHETIC_ENV_OK";
+  assert.doesNotMatch(protectedToolCommand(marker), /[\r\n]/u, "cmd.exe must receive one physical command line");
   const probe = (env) => spawnSync(protectedToolCommand(marker), { shell: true, env, encoding: "utf8", timeout: 5000 });
   for (const env of [sentinel, ...["localhost", "127.0.0.1", "::1", "[::1]", "localhost,127.0.0.1,::1,[::1]", " localhost , 127.0.0.1 "].map(value => ({ ...sentinel, NO_PROXY: value, no_proxy: value }))]) {
     const result = probe(env);
@@ -125,8 +127,10 @@ test("wrong reported pin fails, including prefixed output", () => {
   assert.throws(() => assertPin("2.0.29\n1.18.35", "2.0.29"));
 });
 
-test("migration selects exact 2.2.5 target without falling back to historical 2.0.29", () => {
+test("migration selects exact 2.2.5 target without falling back to historical 2.0.29", async () => {
   assert.equal(MIGRATION_TARGET_PIN, "2.2.5");
+  const manifest = JSON.parse(await readFile(new URL("../../test/fixtures/opencode-migration/manifest.json", import.meta.url), "utf8"));
+  assert.equal(manifest.targetPin, MIGRATION_TARGET_PIN);
   const binaries = Object.fromEntries(PINS.map((pin) => [pin, `/synthetic/${pin}/opencode`]));
   for (const sourcePin of ["1.18.35", "1.19.0"]) {
     assert.equal(selectMigrationTarget(binaries, sourcePin), "2.2.5");
@@ -230,7 +234,7 @@ test("required deterministic defects, missing cases/cells, diagnostics and empty
   for (const engine of PINS) for (const mode of MODES) for (const status of ["FAIL", "BLOCKED", "NOT_APPLICABLE"]) {
     const report = gateFixture();
     const cell = report.cells.find((cell) => cell.engine === engine && cell.mode === mode);
-    for (const id of ["exact-prompt-continuation", "crash-after-instruction-registration", "crash-after-admission", "crash-during-approval", "crash-after-completion", ...(mode === "managed" ? ["managed-restart"] : ["socket-fixture-restart"]), ...(engine.startsWith("2.") ? ["models-default", "models-switch", "models-variants", "models-reset"] : [])]) {
+    for (const id of ["exact-prompt-continuation", "crash-after-admission", "crash-during-approval", "crash-after-completion", ...(mode === "managed" ? ["managed-restart"] : ["socket-fixture-restart"]), ...(engine.startsWith("2.") ? ["crash-after-instruction-registration", "definitions-command", "models-default", "models-switch", "models-variants", "models-reset"] : [])]) {
       const row = cell.cases.find((row) => row.id === id);
       row.status = status;
       assert.equal(selectGate(report).exitCode, 1, `${engine} ${mode} ${id} ${status}`);
@@ -249,6 +253,24 @@ test("required deterministic defects, missing cases/cells, diagnostics and empty
     assert.equal(selectGate(report).exitCode, 1);
   }
   assert.equal(compatibilityExit([]), 1);
+});
+
+test("v2-only registration and native command gates preserve excluded v1 failure evidence", () => {
+  const report = gateFixture();
+  for (const cell of report.cells.filter(cell => cell.engine.startsWith("1."))) {
+    cell.cases.find(row => row.id === "crash-after-instruction-registration").status = "BLOCKED";
+    cell.cases.find(row => row.id === "definitions-command").status = "FAIL";
+  }
+  const before = JSON.stringify(report);
+  const selected = selectGate(report);
+  assert.equal(selected.exitCode, 0);
+  for (const id of ["crash-after-instruction-registration", "definitions-command"]) {
+    assert.ok(selected.excluded.some(row => row.engine.startsWith("1.") && row.id === id && /outside applicable generations/u.test(row.reason)));
+    assert.ok(selected.included.some(row => row.engine.startsWith("2.") && row.id === id));
+  }
+  assert.equal(JSON.stringify(report), before, "Scope classification must never rewrite raw outcomes");
+  report.cells[0].cleanup.status = "FAIL";
+  assert.equal(selectGate(report).exitCode, 1, "Excluded feature failures cannot waive ownership cleanup");
 });
 
 test("migration is opt-in collection, never a waiver of required transition evidence or baseline failures", () => {
@@ -292,6 +314,34 @@ test("unexpected provider routes and unregistered prompts are sticky failures", 
     assert.equal((await fetch(`${provider.url}/unknown`)).status, 500);
     assert.equal((await fetch(`${provider.url}/chat/completions`, { method: "POST", body: JSON.stringify({ model: "matrix", messages: [{ role: "user", content: "unexpected" }] }) })).status, 500);
     assert.throws(() => provider.assertClean(), /Unexpected/u);
+  } finally { await runtime.teardown(); }
+});
+
+test("provider preserves UTF-8 characters split across request chunks", async () => {
+  const runtime = await createRuntimeFixture();
+  try {
+    const firstChunk = Promise.withResolvers();
+    const provider = await createProvider({ listen: server => {
+      server.prependListener("request", req => req.once("data", () => firstChunk.resolve()));
+      return runtime.listen(server);
+    } });
+    const prompt = "SPLIT_\u20ac_PROMPT";
+    provider.register({ prompt, text: "DONE", verify: messages => assert.equal(messages[0].content, prompt) });
+    const body = Buffer.from(JSON.stringify({ model: "matrix", messages: [{ role: "user", content: prompt }] }));
+    const split = body.indexOf(Buffer.from("\u20ac")) + 1;
+    const response = Promise.withResolvers();
+    void response.promise.catch(() => undefined);
+    const req = request(`${provider.url}/chat/completions`, { method: "POST" }, res => {
+      res.resume();
+      res.once("end", () => response.resolve(res.statusCode));
+      res.once("error", response.reject);
+    });
+    req.once("error", response.reject);
+    req.write(body.subarray(0, split));
+    await runtime.waitFor(() => firstChunk.promise.then(() => true));
+    req.end(body.subarray(split));
+    assert.equal(await response.promise, 200);
+    provider.assertClean();
   } finally { await runtime.teardown(); }
 });
 
@@ -369,6 +419,24 @@ test("interrupted process registration fails cleanup and retains the owned root"
   assert.match(cell.cleanup.observed, /identity could not be proven/u);
   await access(runtime.root);
   await rm(runtime.root, { recursive: true, force: true });
+});
+
+test("ownership preload preserves the spawn command-options overload", async (t) => {
+  const runtime = await createRuntimeFixture();
+  t.after(() => runtime.teardown());
+  const output = await command(runtime, process.execPath, ["--input-type=module", "-e", `
+    import { spawn } from 'node:child_process';
+    import assert from 'node:assert/strict';
+    const child = spawn(process.execPath, { stdio: ['pipe', 'pipe', 'pipe'] });
+    let output = '';
+    child.stdout.setEncoding('utf8').on('data', chunk => { output += chunk; });
+    child.stdin.end("process.stdout.write('OVERLOAD_OK')");
+    const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
+    assert.equal(code, 0);
+    assert.equal(output, 'OVERLOAD_OK');
+    process.stdout.write(output);
+  `]);
+  assert.equal(output, "OVERLOAD_OK");
 });
 
 test("killed nested worker releases fixture engines and independent detached restart groups before PASS", async () => {

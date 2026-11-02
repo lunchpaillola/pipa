@@ -972,6 +972,26 @@ test("routes a subagent permission through its parent session", async () => {
   assert.equal(seen[0].sessionId, "ses_child");
 });
 
+test("v1 ignores a pending question whose foreign session is absent", async () => {
+  let prompted = false;
+  const fetch = async (url, init = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/event") return new Response(new ReadableStream({ start(stream) {
+      init.signal.addEventListener("abort", () => stream.error(init.signal.reason), { once: true });
+    } }));
+    if (pathname === "/permission") return jsonResponse([]);
+    if (pathname === "/question") return jsonResponse([{ id: "question_foreign", sessionID: "ses_missing", questions: [] }]);
+    if (pathname === "/session/ses_missing") return jsonResponse(null);
+    if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
+    if (pathname === "/session/ses_1/message") return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
+    if (pathname.endsWith("/prompt_async")) { prompted = true; return new Response(null, { status: 204 }); }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 })
+    .runTurn({ prompt: "go", sessionId: "ses_1", workingDirectory: "/work", onInteraction: () => assert.fail("Foreign question must not be routed") });
+  assert.equal(result.text, "done");
+});
+
 test("forwards permission replies from the OpenCode event stream", async () => {
   let prompted = false;
   const events = [
