@@ -41,7 +41,9 @@ test("release catalog keeps four crash boundaries and separate unqualified model
     assert.equal(definition.blocked, undefined);
   }
   const workflow = await readFile(new URL("../.github/workflows/opencode-compatibility.yml", import.meta.url), "utf8");
-  assert.ok(workflow.includes('- "test/opencode-contract.test.mjs"'));
+  assert.match(workflow, /^  workflow_dispatch:/mu);
+  assert.doesNotMatch(workflow, /^  (?:pull_request|push|schedule):/mu);
+  assert.ok(workflow.includes("npm run test:engines -- --migration --gate=deterministic"));
 });
 
 for (const [generation, boundary, replacement] of [["v1", "admission"], ["v1", "approval"], ["v1", "completion"], ["v2", "registration"], ["v1", "completion", true]]) test(`release crash self-check: ${generation} SIGKILL at ${boundary}${replacement ? " with replacement" : ""} through production runner/native HTTP fixture (not engine recovery proof)`, async (t) => {
