@@ -18,38 +18,6 @@ import { MIGRATION_TARGET_PIN, selectMigrationTarget } from "./opencode-migratio
 
 const facade = { checkOpenCodeConnection };
 
-test("Windows PowerShell identity diagnostics compare host and isolated startup/query timings", async (t) => {
-  if (process.platform !== "win32") return;
-  const runtime = await createRuntimeFixture({ timeoutMs: 180_000 });
-  t.after(() => runtime.teardown());
-  const probes = {
-    startup: "[Console]::Out.Write('READY')",
-    pid: `Get-CimInstance Win32_Process -Filter 'ProcessId=${process.pid}' -Property ProcessId,ParentProcessId,CreationDate | ForEach-Object { $_.ProcessId }`,
-    full: "@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate).Count",
-  };
-  for (const [environment, env] of [["host", process.env], ["isolated", runtime.env]]) {
-    const selected = Object.entries(probes);
-    if (environment === "isolated") selected.push(
-      ["explicit-module", `Import-Module (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/Modules/CimCmdlets/CimCmdlets.psd1'); [Console]::Error.WriteLine('PIPA_CIM_IMPORTED'); ${probes.pid}`],
-      ["system-module-path", `$env:PSModulePath=Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/Modules'; ${probes.pid}`],
-      ["wmi", `([wmi]"Win32_Process.Handle='${process.pid}'").ProcessId`],
-    );
-    for (const [probe, script] of selected) {
-      const started = performance.now();
-      const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference='Stop'; [Console]::Error.WriteLine('PIPA_CIM_QUERY_STARTED'); ${script}`], {
-        cwd: runtime.workspace, env, encoding: "utf8", timeout: 15_000, windowsHide: true,
-      });
-      // Measurement only: no process records, error messages, paths or environment values.
-      t.diagnostic(JSON.stringify({ environment, probe, elapsedMs: Math.round(performance.now() - started),
-        stage: result.stderr?.includes("PIPA_CIM_IMPORTED") ? "imported" : result.stderr?.includes("PIPA_CIM_QUERY_STARTED") ? "query" : "startup",
-        status: Number.isInteger(result.status) ? result.status : null,
-        errorCode: result.error ? (["ETIMEDOUT", "ENOENT", "EACCES", "EPERM", "ENOBUFS"].includes(result.error.code) ? result.error.code : "OTHER") : null,
-        stdoutBytes: Buffer.byteLength(result.stdout ?? ""), stderrBytes: Buffer.byteLength(result.stderr ?? ""),
-      }));
-    }
-  }
-});
-
 test("timed-out native workers retain bounded progress diagnostics", async (t) => {
   const runtime = await createRuntimeFixture({ timeoutMs: 5000 });
   t.after(() => runtime.teardown());
@@ -476,8 +444,8 @@ test("ownership preload initialization failure does not expose its capability UR
     });
     assert.equal(missing.status, 1);
     assert.equal(missing.stdout, "");
-    const prefix = "Cannot verify Windows process identities with CIM: ";
-    assert.ok(missing.stderr.startsWith(prefix), "Expected a bounded CIM diagnostic, not a preload stack");
+    const prefix = "Cannot verify Windows process identities with WMI: ";
+    assert.ok(missing.stderr.startsWith(prefix), "Expected a bounded WMI diagnostic, not a preload stack");
     assert.ok(!missing.stderr.includes(runtime.ownership.key) && !missing.stderr.includes(preload.href), "Private ownership capability was exposed");
     const diagnostic = JSON.parse(missing.stderr.slice(prefix.length));
     assert.deepEqual(Object.keys(diagnostic), ["phase", "stage", "elapsedMs", "timeoutMs", "errorCode", "status", "signal", "stdoutBytes", "stderrBytes"]);
