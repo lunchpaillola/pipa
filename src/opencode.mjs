@@ -257,7 +257,8 @@ export function createOpenCodeExecutor(options = {}) {
       if (signal?.aborted) abort();
       else signal?.addEventListener("abort", abort, { once: true });
       active.add(controller);
-      const timer = setTimeout(() => controller.abort(new Error("Model discovery timed out.")), 1_500);
+      // Slack is acknowledged before discovery; allow slow catalogs without waiting forever.
+      const timer = setTimeout(() => controller.abort(new Error("Model discovery timed out.")), 30_000);
       try {
         await abortable(ready(workingDirectory), controller.signal);
         controller.signal.throwIfAborted();

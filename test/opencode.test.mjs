@@ -607,7 +607,24 @@ test("replaces a stale persisted session only after a successful turn", async ()
   assert.deepEqual(body.model, { providerID: "openai", modelID: "model-a" });
 });
 
-test("configured model discovery uses authenticated workspace HTTP without inference", async () => {
+test("model discovery can finish after Slack's acknowledgment deadline", async (t) => {
+  const reading = Promise.withResolvers();
+  const response = Promise.withResolvers();
+  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch: async (_url, { signal }) => {
+    reading.resolve(signal);
+    return response.promise;
+  } });
+  t.after(() => { response.resolve(Response.json({ providers: [] })); executor.stopAll(); });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const discovery = executor.listModels("/workspace");
+  const signal = await reading.promise;
+  t.mock.timers.tick(3_001);
+  assert.equal(signal.aborted, false);
+  response.resolve(Response.json({ providers: [{ id: "openai", models: { a: { id: "a", name: "A" } } }] }));
+  assert.deepEqual(await discovery, [{ providerID: "openai", modelID: "a", name: "A" }]);
+});
+
+test("configured model discovery uses authenticated workspace HTTP without inference", async (t) => {
   const calls = [];
   const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", environment: { OPENCODE_SERVER_USERNAME: "pipa", OPENCODE_SERVER_PASSWORD: "secret" },
     fetch: async (url, init) => {
@@ -619,8 +636,19 @@ test("configured model discovery uses authenticated workspace HTTP without infer
   assert.deepEqual(calls, ["http://localhost:5555/config/providers?directory=%2Fworkspace"]);
   const broken = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch: async () => Response.json({ nope: true }) });
   await assert.rejects(broken.listModels("/work"), /invalid model catalog/u);
-  const stalled = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch: async (_url, { signal }) => new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })) });
-  await assert.rejects(stalled.listModels("/work"), /timed out/u);
+  const reading = Promise.withResolvers();
+  const stalled = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch: async (_url, { signal }) => {
+    reading.resolve(signal);
+    return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+  } });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const discovery = stalled.listModels("/work");
+  const rejected = assert.rejects(discovery, /timed out/u);
+  const signal = await reading.promise;
+  t.mock.timers.tick(29_999);
+  assert.equal(signal.aborted, false);
+  t.mock.timers.tick(1);
+  await rejected;
 });
 
 test("does not complete until both the session is idle and a new assistant message exists", async () => {

@@ -7,7 +7,8 @@ import { pipaPaths, writePrivateJson } from "./state.mjs";
 
 export function createV2Adapter(options) {
   const client = OpenCode.make({ baseUrl: options.baseUrl, headers: options.headers, fetch: async (url, init) => {
-    const signal = AbortSignal.any([...(init.signal ? [init.signal] : []), AbortSignal.timeout(options.connectionRequestTimeoutMs ?? 5_000)]);
+    const modelRead = (init.method ?? "GET").toUpperCase() === "GET" && ["/api/model", "/api/model/default"].includes(new URL(url).pathname);
+    const signal = AbortSignal.any([...(init.signal ? [init.signal] : []), AbortSignal.timeout(options.connectionRequestTimeoutMs ?? (modelRead ? 30_000 : 5_000))]);
     const response = await options.fetch(url, { ...init, signal });
     if (!response.body) return response;
     const reader = response.body.getReader();

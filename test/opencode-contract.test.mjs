@@ -307,16 +307,50 @@ for (const [label, error, providerID, expected] of [
   wire.assertComplete();
 });
 
-for (const generation of ["v1", "v2"]) test(`${generation} models: picker discovery is bounded at 1.5s and aborts native reads`, async (t) => {
+test("v2 models: healthy catalog reads can exceed five seconds without fatal recovery", async (t) => {
+  const failures = [];
+  const { runtime, document, executor } = await fixture(t, "v2", {
+    executorOptions: { onFatal: (error) => failures.push(error) },
+    transport: async (url, init, nativeFetch) => {
+      if (["/api/model", "/api/model/default"].includes(new URL(url).pathname)) {
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(resolve, 5_500);
+          init.signal.addEventListener("abort", () => { clearTimeout(timer); reject(init.signal.reason); }, { once: true });
+        });
+      }
+      return nativeFetch(url, init);
+    },
+  });
+  const location = { directory: runtime.workspace };
+  const model = { providerID: "connected", id: "shared", name: "Shared", enabled: true, variants: [] };
+  document.routes.push(
+    { method: "GET", path: "/api/model", query: { "location[directory]": runtime.workspace }, responses: [{ json: { location, data: [model] } }] },
+    { method: "GET", path: "/api/model/default", query: { "location[directory]": runtime.workspace }, responses: [{ json: { location, data: model } }] },
+  );
+  assert.deepEqual(await bounded(executor.listModels(runtime.workspace), { timeoutMs: 8_000 }), [{ providerID: "connected", modelID: "shared", name: "Shared" }]);
+  assert.deepEqual(failures, []);
+});
+
+for (const generation of ["v1", "v2"]) test(`${generation} models: picker discovery is bounded at 30s and aborts native reads`, async (t) => {
   const signals = [];
+  const reading = Promise.withResolvers();
   const { runtime, executor } = await fixture(t, generation, { transport: async (url, init, nativeFetch) => {
     if (["/config/providers", "/api/model", "/api/model/default"].includes(new URL(url).pathname)) {
       signals.push(init.signal);
+      if (signals.length === (generation === "v1" ? 1 : 2)) reading.resolve();
       return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
     }
     return nativeFetch(url, init);
   } });
-  await assert.rejects(bounded(executor.listModels(runtime.workspace), { timeoutMs: 2500 }), /Model discovery timed out/u);
+  await executor.ready(runtime.workspace);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const rejected = assert.rejects(executor.listModels(runtime.workspace), /Model discovery timed out/u);
+  await reading.promise;
+  t.mock.timers.tick(29_999);
+  assert.ok(signals.every((signal) => !signal.aborted));
+  t.mock.timers.tick(1);
+  await rejected;
+  t.mock.timers.reset();
   assert.equal(signals.length, generation === "v1" ? 1 : 2);
   assert.ok(signals.every((signal) => signal.aborted));
 });
