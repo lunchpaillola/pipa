@@ -8,10 +8,11 @@ Setup, checks, contribution, release process: [`CONTRIBUTING.md`](CONTRIBUTING.m
 
 - Socket profile connects Slack to OpenCode. Managed profile runs OpenCode only.
 - One Slack thread maps to one persisted OpenCode session.
-- Different threads run concurrently. New same-thread message aborts and supersedes old work.
+- Different threads run concurrently. V2 messages use native steering; v1 retains same-thread interrupt-and-replace.
 - Superseded turns must not persist stale state, post stale output, or add success reactions.
-- Shutdown rejects new work, aborts local and server-side turns immediately, then runs bounded cleanup.
+- Shutdown rejects new work and drains local observers/callbacks before disconnecting Slack. V1 aborts its server-side turns; v2 does not interrupt independently continuing native sessions. Owned OpenCode processes still stop; attached servers stay running.
 - Attached OpenCode servers are health-checked, never process-owned.
+- V2 follows native session responses beyond the first reply. Do not add turn-ownership policy or a second execution/recovery journal over OpenCode.
 - Runtime stays plain ESM. Prefer Node APIs and existing dependencies.
 
 ## Security

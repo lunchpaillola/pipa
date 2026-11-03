@@ -46,9 +46,9 @@ For model-selection changes, iterate with `node --test test/state.test.mjs test/
 
 Use a distinct Slack test app and a separate `PIPA_HOME` (the parent of `.pipa`), with its own app/bot tokens, working directory, and channel/user allowlists. Install the slash command derived from its configured `botName` (for example, `Chopper` -> `/chopper`) and grant `commands`. The generated manifest also suggests `/pipa`; omit that alias when another app already owns it, unless intentionally transferring that command. Enable Socket Mode and interactivity, reinstall or reauthorize, and invite the test app to the allowed channel. The generated manifest and runtime must use the same normalized name; a Slack app/bot rename alone does not update command registration or local config. Never run a second Socket listener with production credentials or restart production Pipa for a smoke test.
 
-Isolate OpenCode HOME/XDG, database, configuration, and supported platform-specific storage paths separately; `PIPA_HOME` isolates only Pipa state. Migration rehearsals use stopped, matched Pipa/OpenCode snapshots and disposable copies, never the only copy of a real profile. Preserve recovery journals and verify owned-state reconciliation before new intake; do not delete journals to bypass a blocked recovery.
+Isolate OpenCode HOME/XDG, database, configuration, and supported platform-specific storage paths separately; `PIPA_HOME` isolates only Pipa state. Migration rehearsals use stopped, matched Pipa/OpenCode snapshots and disposable copies, never the only copy of a real profile. Preserve existing profile files; v2 no longer uses the old recovery journal or gates intake on it.
 
-1. Open the installation's model command (for example `/chopper model`), verify the loading window becomes a populated provider-grouped list, choose and save model A, wait for the private saved confirmation, then reopen to verify the selection. Closing the loading window must not reopen it when discovery finishes.
+1. Open the installation's model command (for example `/chopper model`), verify the loading window becomes a searchable picker, search by name/ID/provider and save model A, wait for the private saved confirmation, then reopen to verify the selection. With a large catalog, verify a model beyond the first 100 matches is searchable and remains selected on reopen. Closing the loading window must not reopen it when discovery finishes.
 2. Send an ordinary request and inspect the completed OpenCode assistant message's provider/model metadata. HTTP acceptance or asking the model which model it is does not prove selection.
 3. Save model B and reply in that same Slack thread. Verify completed metadata still names A and the session/history is retained. Start a new thread and verify it uses B. Restart the test profile and verify both threads retain their models.
 4. Cancel another picker and verify no setting changed. Restart only the test profile and reopen to verify persistence.
@@ -69,13 +69,13 @@ Pipa follows Semantic Versioning:
 ### Controlled beta
 
 An opt-in beta is a limited trial, not full stable/platform qualification. For
-`0.6.0-beta.1`, use the [beta notes and publisher checklist](docs/beta-release.md).
+`0.6.0-beta.2`, use the [beta notes and publisher checklist](docs/beta-release.md).
 
 1. Confirm the version is unused on npm and record the current `latest` tag.
 2. Update both package files, beta notes and installation instructions in the PR.
 3. Run `npm test`, `npm run test:pack`, and `node --test scripts/verification/self-check.mjs` on that exact version. Inspect `npm publish --dry-run --tag beta --access public` for package contents and accidental private data. Confirm Linux PR CI passes.
 4. Record the scoped native smoke evidence and its platform/head limits. Retain known failures and gaps; do not label a beta `releaseQualified` or require the abandoned migration-status gate.
-5. Obtain explicit owner approval for merge, release tag and GitHub prerelease. Merge only after required CI passes, then tag the actual merged commit as `v0.6.0-beta.1`.
+5. Obtain explicit owner approval for merge, release tag and GitHub prerelease. Merge only after required CI passes, then tag the actual merged commit as `v0.6.0-beta.2`.
 6. The authorized publisher runs `npm publish --tag beta --access public` from that clean, versioned release checkout. Never omit `--tag beta`, move `latest`, or permanently set `publishConfig.tag` to beta.
 7. Verify npm's `beta` tag points to the new version and `latest` is unchanged. Create the matching GitHub release marked **Pre-release**. Installation into an existing daily profile is a separate owner-approved cutover.
 

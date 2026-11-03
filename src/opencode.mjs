@@ -119,15 +119,35 @@ export function createOpenCodeExecutor(options = {}) {
         signal: AbortSignal.any([readinessController.signal, ...(options.signal ? [options.signal] : [])]),
       });
       headers = connection.headers ?? headers;
-      capabilities = Object.freeze({ modelDiscovery: true, liveModelSwitch: connection.major === 2 });
+      capabilities = Object.freeze({ modelDiscovery: true, liveModelSwitch: connection.major === 2, backgroundResponses: connection.major === 2 });
       adapter = connection.major === 2
         ? createV2Adapter({ ...options, baseUrl, fetch: fetchImpl, headers, environment, pollIntervalMs })
         : createV1Adapter({ request, baseUrl, fetchImpl, headers, pollIntervalMs });
       await adapter.ready?.(workingDirectory);
     })();
     await readiness;
-    // Failed turn cleanup blocks subsequent turns even after initial readiness resolved.
+    // Legacy v1 can reject subsequent work after uncertain admission or cancellation.
     await adapter.ready?.(workingDirectory);
+  }
+
+  async function prepareArtifacts(sessionId, workingDirectory, persistent = false) {
+    if (useDataUrls || !artifactRoot) return;
+    try {
+      await mkdir(artifactRoot, { recursive: true, mode: 0o700 });
+      const directory = await sessionArtifactDirectory(artifactRoot, sessionId, workingDirectory);
+      if (!persistent) await remove(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      const stats = await lstat(directory);
+      if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error("Invalid artifact directory.");
+      await chmod(directory, 0o700);
+      return directory;
+    } catch { return undefined; }
+  }
+
+  async function response(text, sessionId, artifactDirectory, slackTurn) {
+    const parsed = slackTurn ? parseArtifactDeclaration(text) : { text };
+    const files = artifactDirectory && parsed.paths ? await readArtifacts(artifactDirectory, parsed.paths, options.onArtifactOpened) : [];
+    return { text: parsed.text, sessionId, ...(files.length ? { files } : {}) };
   }
 
   async function request(pathname, init, workingDirectory, controller, acceptedStatuses = [200], reportFatal = true) {
@@ -165,10 +185,11 @@ export function createOpenCodeExecutor(options = {}) {
     }
   }
 
-  async function runTurn({ prompt, sessionId, model, defaultModel, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
+  async function runTurn({ prompt, sessionId, model, defaultModel, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled, onResponse, onError }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     if (stopReason) throw stopReason;
-    if (sessionId && activeSessions.has(sessionId)) throw new Error("OpenCode attribution conflict: the session already has an active writer.");
+    const legacySession = options.connection?.major === 1 || capabilities?.backgroundResponses === false;
+    if (legacySession && sessionId && activeSessions.has(sessionId)) throw new Error("OpenCode attribution conflict: the session already has an active writer.");
     let temporaryDirectory;
     const selectedModel = normalizeModel(model);
     const newThreadModel = normalizeModel(defaultModel);
@@ -185,32 +206,27 @@ export function createOpenCodeExecutor(options = {}) {
       try {
         temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
         controller.signal.throwIfAborted();
-        const files = await stageAttachments(attachments, temporaryDirectory, useDataUrls, controller.signal);
+        const files = await stageAttachments(attachments, temporaryDirectory, useDataUrls || !!onResponse, controller.signal);
         if (stopReason) throw stopReason;
         await abortable(ready(workingDirectory), controller.signal);
         const prepared = await adapter.resolveSession(sessionId, workingDirectory, controller);
         const selectedSessionId = prepared.sessionId;
 
-        if (activeSessions.has(selectedSessionId) && activeSessions.get(selectedSessionId).controller !== controller) throw new Error("OpenCode attribution conflict: the session already has an active writer.");
+        if (!capabilities.backgroundResponses && activeSessions.has(selectedSessionId) && activeSessions.get(selectedSessionId).controller !== controller) throw new Error("OpenCode attribution conflict: the session already has an active writer.");
         activeSessions.set(selectedSessionId, { controller, workingDirectory, resolved: true });
         await onSession?.(selectedSessionId);
         if (controller.signal.aborted) throw controller.signal.reason;
 
-        if (slackTurn && !useDataUrls && artifactRoot) {
-          try {
-            await mkdir(artifactRoot, { recursive: true, mode: 0o700 });
-            artifactDirectory = await sessionArtifactDirectory(artifactRoot, selectedSessionId, workingDirectory);
-            await remove(artifactDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
-            await mkdir(artifactDirectory, { mode: 0o700 });
-            await chmod(artifactDirectory, 0o700);
-          } catch {}
-        }
+        if (slackTurn) artifactDirectory = await prepareArtifacts(selectedSessionId, workingDirectory, capabilities.backgroundResponses && !!onResponse);
 
         const text = await adapter.execute({ ...prepared, model: selectedModel, defaultModel: newThreadModel, workingDirectory, controller, prompt, files,
-          instructions: turnInstructions(contextEnvironment, artifactDirectory), onInteraction, onPermissionReplied, onPermissionsReconciled });
-        const parsed = slackTurn ? parseArtifactDeclaration(text) : { text };
-        const artifacts = artifactDirectory && parsed.paths ? await readArtifacts(artifactDirectory, parsed.paths, options.onArtifactOpened) : [];
-        return { text: parsed.text, sessionId: selectedSessionId, ...(artifacts.length ? { files: artifacts } : {}) };
+          instructions: turnInstructions(contextEnvironment, artifactDirectory), onInteraction, onPermissionReplied, onPermissionsReconciled,
+          ...(capabilities.backgroundResponses && onResponse ? {
+            onResponse: async (text, messageId, followSignal) => onResponse(await response(text, selectedSessionId, artifactDirectory, slackTurn), followSignal),
+            onError,
+          } : {}) });
+        if (text?.pending) return { pending: true, sessionId: selectedSessionId };
+        return await response(text, selectedSessionId, artifactDirectory, slackTurn);
       } catch (error) {
         if (controller.signal.aborted) throw controller.signal.reason;
         throw error;
@@ -228,7 +244,7 @@ export function createOpenCodeExecutor(options = {}) {
           process.stderr.write("Pipa could not remove temporary attachment files.\n");
         }
       }
-      if (artifactDirectory) {
+      if (artifactDirectory && !(capabilities?.backgroundResponses && onResponse)) {
         try {
           await remove(artifactDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
         } catch {
@@ -257,7 +273,8 @@ export function createOpenCodeExecutor(options = {}) {
       if (signal?.aborted) abort();
       else signal?.addEventListener("abort", abort, { once: true });
       active.add(controller);
-      const timer = setTimeout(() => controller.abort(new Error("Model discovery timed out.")), 1_500);
+      // Slack is acknowledged before discovery; allow slow catalogs without waiting forever.
+      const timer = setTimeout(() => controller.abort(new Error("Model discovery timed out.")), 30_000);
       try {
         await abortable(ready(workingDirectory), controller.signal);
         controller.signal.throwIfAborted();
@@ -292,7 +309,10 @@ export function createOpenCodeExecutor(options = {}) {
     },
     async abortTurn(sessionId, reason = new Error("OpenCode turn aborted.")) {
       const turn = activeSessions.get(sessionId);
-      if (!turn) return;
+      if (!turn) {
+        if (capabilities?.backgroundResponses) await adapter.abortTurn(sessionId);
+        return;
+      }
       try {
         if (turn.resolved) await adapter.abortTurn(sessionId, turn.workingDirectory);
       } catch {
@@ -305,7 +325,9 @@ export function createOpenCodeExecutor(options = {}) {
       stopReason ??= reason;
       readinessController.abort(stopReason);
       for (const controller of active) controller.abort(stopReason);
+      adapter?.stopAll?.(stopReason);
     },
+    async drain() { await adapter?.drain?.(); },
   };
 }
 
@@ -434,10 +456,6 @@ async function stageAttachments(attachments, temporaryDirectory, useDataUrls, si
 function turnInstructions(contextEnvironment, artifactDirectory) {
   const context = Object.entries(contextEnvironment).filter(([, value]) => value !== undefined && value !== null && String(value));
   const instructions = ["For scheduling requests, consult `pipa routine --help`, convert timezone wording to an IANA timezone, preview first, show the normalized details, and create only after user confirmation."];
-  const restartCommand = contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack" && contextEnvironment.PIPA_CURRENT_SLACK_CHANNEL_ID
-    ? `pipa restart --channel ${contextEnvironment.PIPA_CURRENT_SLACK_CHANNEL_ID}${contextEnvironment.PIPA_CURRENT_SLACK_THREAD_TS ? ` --thread ${contextEnvironment.PIPA_CURRENT_SLACK_THREAD_TS}` : ""}`
-    : "pipa restart";
-  instructions.push(`When asked to restart Pipa, run \`${restartCommand}\`; existing messaging authorization is sufficient. It requests a detached restart and may end this turn. Use \`pipa restart --status\` to inspect the durable outcome; do not claim completion from the request alone. Both commands must run on the Pipa host, not a remote attached OpenCode host. If you lack command access to the Pipa host, explain that limitation instead of running them remotely. The Pipa profile home on that host is ${JSON.stringify(path.resolve(process.env.PIPA_HOME || os.homedir()))}; ensure PIPA_HOME has this value in the command environment. Do not use sequential stop/start or OpenCode /instance/dispose: that disposes an instance, not restarts the server.`);
   if (context.length) instructions.push(`Slack context for this turn (provided here, not as shell environment variables):\n${context.map(([key, value]) => `${key}=${value}`).join("\n")}`);
   if (contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack") {
     instructions.push("Keep naturally short answers inline. For deeper work or larger deliverables, keep the Slack response concise and use the most suitable artifact format.");

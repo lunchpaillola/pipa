@@ -31,7 +31,7 @@
 | What it does | What that means |
 | --- | --- |
 | **One server** | In local mode, Pipa starts one private OpenCode server on `127.0.0.1` and reuses it for every Slack turn. Attached servers follow their own network controls. |
-| **Thread sessions** | A mention starts a session; replies in that thread continue it. Different threads run independently, and a newer message interrupts only its own thread. |
+| **Thread sessions** | A mention starts a session; replies continue it. On OpenCode v2, messages steer native work and later background responses return to the same Slack thread. |
 | **Routines** | Schedule timezone-aware work that runs through the same agent and delivers to an exact channel or thread. |
 | **Generated files** | In local mode, long work returns as a concise summary with generated files from a private per-turn directory. Attached non-loopback servers return inline text. |
 | **Access control** | Restrict by Slack channel, human user, and bot. Allowlists are rechecked on every turn, interaction, and delivery. |
@@ -53,11 +53,11 @@ pipa start
 
 ### Opt-in 0.6 beta
 
-`0.6.0-beta.1` is being prepared for controlled testing, not stable release.
+`0.6.0-beta.2` is being prepared for controlled testing, not stable release.
 Once published, opt in with:
 
 ```sh
-npm install --global @usepipa/pipa@0.6.0-beta.1
+npm install --global @usepipa/pipa@0.6.0-beta.2
 ```
 
 Normal installs keep using npm's `latest` tag; subsequent betas use `@beta`.
@@ -113,23 +113,25 @@ pipa init
 pipa start
 ```
 
-Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. In owned local mode, Pipa starts one OpenCode server bound to `127.0.0.1` on an operating-system-assigned port and reuses it for every Slack turn. Port `0` asks the operating system for an available port; no port configuration is required. Pipa replies in a thread, and follow-up messages in that thread reuse the same OpenCode session without another mention. A newer follow-up interrupts an active turn in the same thread, while other threads continue independently. While a turn is active, Pipa shows a typing status in its Slack thread.
+Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. In owned local mode, Pipa starts one OpenCode server bound to `127.0.0.1` on an operating-system-assigned port and reuses it for every Slack thread. Port `0` asks the operating system for an available port; no port configuration is required. Follow-up messages reuse the same OpenCode session without another mention. On v2, they enter OpenCode's native steering queue without Pipa cancelling the current execution. V1 retains its interrupt-and-replace behavior. Different threads remain independent.
+
+For v2, Pipa keeps following live native session events after the first reply. The agent can say a render is running, resume when it finishes, and send the result into the same Slack thread without another message from you. Replies missed during a disconnect or restart are not recovered. Restarting preserves the conversation mapping, but background forwarding starts again only when you send another message in that thread. Pipa does not scan response history or maintain a second execution or delivery journal. Failed Slack deliveries are reported when possible, not replayed; later live replies can still arrive.
 
 Ordinary startup detects OpenCode v1/v2 and waits for listening, workspace readiness and Slack initialization without a default overall timeout or migration-status gate. OpenCode owns schema/data upgrades; Pipa never converts that data. Ctrl+C cancels startup and stops owned children, never attached servers. See the [startup contract](docs/opencode-compatibility.md#startup-contract) for retry, failure and explicit-deadline behavior.
 
 **Managed external-client upgrade notice:** Before upgrading a Managed profile used by external OpenCode clients, set a shared explicit `OPENCODE_SERVER_PASSWORD` in the Pipa server/restart launch environment and configure that password in every external client. For v2, `OPENCODE_PASSWORD` takes precedence; match it to the shared password or remove conflicting values from the server/restart and client environments. If no explicit password is set, Pipa generates a private per-launch password unavailable to external clients, and unauthenticated clients no longer connect. Keep generated passwords private; use an explicit shared password for external access. See [OpenCode compatibility](docs/opencode-compatibility.md).
 
-Pipa keeps naturally short answers inline. For deeper work, OpenCode can return a concise summary with suitable generated files, such as documents, spreadsheets, PDFs, or images. Files are read only from a private session directory under `.pipa/artifacts` in the configured working directory. The directory is cleared before each turn, files are validated and limited to 10 files and 100 MB total, and the directory is deleted locally after delivery. If file delivery fails, Pipa retries the declaration-free summary without the files. Attached OpenCode servers on non-loopback hosts use inline text fallback instead of local artifact delivery.
+Pipa keeps naturally short answers inline. For deeper work, OpenCode can return a concise summary with generated files. Files are read only from a private session directory under `.pipa/artifacts` in the configured working directory and validated against the existing path, type, identity, count, and size limits. V2 keeps that directory available for later background responses; v1 clears it around each turn. If file delivery fails, Pipa retries the declaration-free summary without the files. Attached OpenCode servers on non-loopback hosts use inline text fallback instead of local artifact delivery.
 
 Incoming messages can include up to Slack's 10-file limit, with a maximum size of 10 MiB (10,485,760 bytes) per file. Pipa checks both declared size and downloaded bytes before sending the prompt. Attachments require a text prompt and are copied to a temporary directory only for the duration of the turn. Outgoing artifact limits remain 10 files and 100 MB per file or response.
 
 For owned OpenCode v2 servers, Pipa defaults `BUN_JSC_maxRegExpStackSize` to `536870912` (a 512 MiB on-demand regular-expression stack ceiling), preserving any explicit override. This works around native 2.0.29 rejecting valid large base64 attachments. An independently launched attached v2 server needs the same setting in **its server process**, for example `BUN_JSC_maxRegExpStackSize=536870912 opencode serve`; setting it only on the attaching Pipa client cannot configure that server. The model's context/media capabilities still determine which admitted files it can process.
 
-### Recovering a blocked OpenCode turn
+### Native v2 session context
 
-If v2 reports that cleanup failed and new intake is blocked, restore the selected server's connectivity and let any independently submitted work finish, then restart Pipa with `pipa restart`. Use `pipa restart --status` to confirm the outcome. If Pipa already exited, run `pipa start` with the same profile and working directory instead.
+Slack routing and attachment guidance live in a stable native session instruction entry. They remain available when background work resumes; Pipa no longer installs and removes temporary instructions around each response. Restart instructions are not repeated in every turn—an agent can use `pipa restart` and its CLI help like any other command.
 
-Startup reconciles the profile's private `~/.pipa/opencode-recovery.json` before accepting Slack or routine work. It removes only owned instructions/admissions and waits for owned execution to settle; it does not replay the failed prompt. Keep the recovery file and session mappings intact. If startup still blocks, resolve the reported server/workspace or foreign-writer conflict before trying again; deleting the recovery file would discard the evidence needed for safe cleanup. Review any partial side effects before manually retrying the original request.
+Pipa no longer reads or writes `~/.pipa/opencode-recovery.json`, rejects native activity as a competing writer, or blocks unrelated threads after one session fails. Old journal files are left untouched. Existing Slack-to-session mappings are preserved.
 
 ### Access control
 
@@ -202,7 +204,7 @@ pipa start
 
 ### Choosing a model
 
-Type your installation's command followed by `model` in an allowed Slack channel: `/chopper model` for `Chopper`, `/pipwick model` for `Pipwick`, or the `/pipa model` compatibility alias when registered to that app. Both forms use the same private native modal, authorization checks, and setting. A loading window opens before catalog discovery, then fills with models grouped by provider. Browse or type to filter, choose a model, and Save. Save closes the window promptly; a private channel message confirms success only after fresh validation and persistence, or explains a failure. Wait for that confirmation before testing the new selection. Cancel leaves the setting unchanged. Existing channel and human-user allowlists are rechecked after discovery, on Save, during persistence, and before delivering the private result.
+Type your installation's command followed by `model` in an allowed Slack channel: `/chopper model` for `Chopper`, `/pipwick model` for `Pipwick`, or the `/pipa model` compatibility alias when registered to that app. Both forms use the same private native modal, authorization checks, and setting. A loading window opens before catalog discovery, then becomes a searchable picker. Search by model name, ID or provider, choose a model, and Save. Save closes the window promptly; a private channel message confirms success only after fresh validation and persistence, or explains a failure. Wait for that confirmation before testing the new selection. Cancel leaves the setting unchanged. Existing channel and human-user allowlists are rechecked after discovery, on each search, on Save, during persistence, and before delivering the private result.
 
 The command is computed from your configured `botName`, not a hardcoded list of bot names. Pipa decomposes accented Latin characters, removes combining marks, lowercases the name, replaces runs of spaces/punctuation/other non-ASCII characters with `-`, trims edge hyphens, and limits the part after `/` to 31 characters (trimming any resulting trailing hyphen). For example, `Workshop "Bot"` becomes `/workshop-bot` and `Café 🧪` becomes `/cafe`. A valid display name with no usable ASCII slug, such as `🤖` or `東京`, falls back to `/pipa` so this optional feature cannot prevent an old profile from starting. Existing display-name validation still applies. Generated commands use a conservative lowercase-letter/digit/hyphen subset within Slack's 32-character limit including `/`.
 
@@ -212,7 +214,7 @@ The default for new threads is stored as optional `defaultModel: { "providerID":
 
 New routines snapshot the selection when created; preview JSON shows that snapshot. Existing routines and their saved model are unchanged by later saves or routine edits. A routine with no saved model uses OpenCode's default, never the current installation setting. Human replies to routine results retain the model recorded in that conversation. If a thread's provider stops working, reconnect it or choose a different default and start a new thread.
 
-The picker preloads the configured OpenCode model catalog into a native Slack dropdown, grouped by provider. Open the dropdown to browse immediately, or type to filter models; no search callback is needed. Groups contain up to 100 models each, with at most 100 groups. Empty catalogs or catalogs exceeding Slack's limits get a private explanation instead of an empty or truncated list. A listed model may still lack credentials or quota; saving never runs inference to check it. The provider shown beneath each result identifies the connection: `opencode` and `openai` use separate credentials, even for similarly named models. Turn failures identify the provider and HTTP status when available; authentication failures give reconnection guidance, and an explicitly expired API key is reported as expired. Raw upstream errors and credentials are not posted, and Pipa never silently switches models. Abandoned pickers expire after 30 minutes; reopen your installation's model command to continue.
+The picker loads the configured OpenCode model catalog once per window, with up to 30 seconds for discovery. Searches use that cached catalog without contacting OpenCode again. Slack displays up to 100 matches at a time; type more specific terms to find models anywhere in a large catalog. Search is case-insensitive and matches all entered terms across model names, IDs and providers. The saved model remains selected even when it is outside the first 100 results. Empty catalogs get a private explanation. Save checks the current OpenCode catalog again before persisting. A listed model may still lack credentials or quota; saving never runs inference to check it. The provider shown beneath each result identifies the connection: `opencode` and `openai` use separate credentials, even for similarly named models. Turn failures identify the provider and HTTP status when available; authentication failures give reconnection guidance, and an explicitly expired API key is reported as expired. Raw upstream errors and credentials are not posted, and Pipa never silently switches models. Abandoned pickers expire after 30 minutes; reopen your installation's model command to continue.
 
 If the model window cannot open, its private error distinguishes saved-settings problems, model-catalog loading, configured access restrictions, and Slack window failures. It confirms that the saved model is unchanged; it does not expose raw upstream errors or credentials.
 

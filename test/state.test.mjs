@@ -87,8 +87,7 @@ test("routine and OpenCode recovery paths are separate and the atomic JSON write
   const paths = pipaPaths(home);
   assert.equal(paths.routines, path.join(paths.directory, "routines.json"));
   assert.equal(paths.routinesLock, path.join(paths.directory, "routines.lock"));
-  assert.equal(paths.openCodeRecovery, path.join(paths.directory, "opencode-recovery.json"));
-  assert.equal(new Set([paths.config, paths.sessions, paths.routines, paths.openCodeRecovery]).size, 4);
+  assert.equal(new Set([paths.config, paths.sessions, paths.routines]).size, 3);
   await writePrivateJson(paths.routines, { version: 1, routines: [] });
   assert.deepEqual(JSON.parse(await readFile(paths.routines, "utf8")), { version: 1, routines: [] });
   if (process.platform !== "win32") assert.equal((await stat(paths.routines)).mode & 0o777, 0o600);

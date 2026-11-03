@@ -518,10 +518,7 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
   assert.match(promptBody.system, /PIPA_MESSAGE_CHANNEL=slack/u);
   assert.match(promptBody.system, /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
   assert.match(promptBody.system, /consult `pipa routine --help`/u);
-  assert.match(promptBody.system, /run `pipa restart --channel C1 --thread 123\.456`/u);
-  assert.match(promptBody.system, /existing messaging authorization is sufficient/u);
-  assert.match(promptBody.system, /pipa restart --status/u);
-  assert.match(promptBody.system, /ensure PIPA_HOME/u);
+  assert.doesNotMatch(promptBody.system, /When asked to restart|instance\/dispose/u);
   assert.match(promptBody.system, /IANA timezone/u);
   assert.match(promptBody.system, /preview first/u);
   assert.match(promptBody.system, /create only after user confirmation/u);
@@ -607,7 +604,24 @@ test("replaces a stale persisted session only after a successful turn", async ()
   assert.deepEqual(body.model, { providerID: "openai", modelID: "model-a" });
 });
 
-test("configured model discovery uses authenticated workspace HTTP without inference", async () => {
+test("model discovery can finish after Slack's acknowledgment deadline", async (t) => {
+  const reading = Promise.withResolvers();
+  const response = Promise.withResolvers();
+  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch: async (_url, { signal }) => {
+    reading.resolve(signal);
+    return response.promise;
+  } });
+  t.after(() => { response.resolve(Response.json({ providers: [] })); executor.stopAll(); });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const discovery = executor.listModels("/workspace");
+  const signal = await reading.promise;
+  t.mock.timers.tick(3_001);
+  assert.equal(signal.aborted, false);
+  response.resolve(Response.json({ providers: [{ id: "openai", models: { a: { id: "a", name: "A" } } }] }));
+  assert.deepEqual(await discovery, [{ providerID: "openai", modelID: "a", name: "A" }]);
+});
+
+test("configured model discovery uses authenticated workspace HTTP without inference", async (t) => {
   const calls = [];
   const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", environment: { OPENCODE_SERVER_USERNAME: "pipa", OPENCODE_SERVER_PASSWORD: "secret" },
     fetch: async (url, init) => {
@@ -619,8 +633,19 @@ test("configured model discovery uses authenticated workspace HTTP without infer
   assert.deepEqual(calls, ["http://localhost:5555/config/providers?directory=%2Fworkspace"]);
   const broken = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch: async () => Response.json({ nope: true }) });
   await assert.rejects(broken.listModels("/work"), /invalid model catalog/u);
-  const stalled = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch: async (_url, { signal }) => new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })) });
-  await assert.rejects(stalled.listModels("/work"), /timed out/u);
+  const reading = Promise.withResolvers();
+  const stalled = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch: async (_url, { signal }) => {
+    reading.resolve(signal);
+    return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+  } });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const discovery = stalled.listModels("/work");
+  const rejected = assert.rejects(discovery, /timed out/u);
+  const signal = await reading.promise;
+  t.mock.timers.tick(29_999);
+  assert.equal(signal.aborted, false);
+  t.mock.timers.tick(1);
+  await rejected;
 });
 
 test("does not complete until both the session is idle and a new assistant message exists", async () => {
@@ -1417,8 +1442,7 @@ test("short Slack answers stay inline and remote attached servers get no local a
     response: async (body) => { remoteSystem = body.system; return 'Summary.\nPIPA_ARTIFACTS: ["private.pdf"]'; },
   });
   assert.match(remoteSystem, /For deeper work or larger deliverables/u);
-  assert.match(remoteSystem, /Both commands must run on the Pipa host, not a remote attached OpenCode host/u);
-  assert.match(remoteSystem, /If you lack command access to the Pipa host, explain that limitation/u);
+  assert.doesNotMatch(remoteSystem, /When asked to restart|instance\/dispose/u);
   assert.doesNotMatch(remoteSystem, /PIPA_ARTIFACTS|artifact director|pipa-artifacts-/u);
   assert.deepEqual(remote, { text: "Summary.", sessionId: "ses_1" });
 
