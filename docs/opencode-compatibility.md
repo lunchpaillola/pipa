@@ -70,9 +70,40 @@ create/preview snapshots the default and dispatch uses that saved model. Native
 v2 live switching/reset is a separate executor capability, not the Slack picker's
 Save behavior. Preserving the picker does not establish native qualification.
 
-Generic numeric, conditional or external forms require an OpenCode client.
-Pipa displays a notice and reconciles external settlement rather than inventing
-answers. Rejected native submissions leave supported controls editable.
+V2 forms use the existing Slack question controls when every field is a visible,
+unconditional `string` or `multiselect`. Classification uses the field shape,
+not `metadata.kind` or a `q0`/`q1` naming convention. Replies preserve native
+field keys and encode displayed option labels back to their native values.
+This includes both web-search setup and the follow-on provider picker; choosing
+Allow, Choose another provider, or Disable remains an explicit user decision.
+Native validation still applies, and rejected submissions leave controls editable.
+
+Numeric (`number`/`integer`), boolean, hidden, conditional, and external fields
+require an OpenCode client. A mixed form is not partially rendered. Pipa displays
+a notice and reconciles external settlement rather than inventing answers.
+Existing Slack control size limits are unchanged. Forms must still belong to the
+observed session or a linked child in the configured workspace.
+
+#### Form coverage and upstream changes
+
+The source audit at OpenCode **v2.2.5**
+([`9bbb8ce`](https://github.com/anomalyco/opencode/tree/9bbb8ce18c80f099e0e448775f59d965ead40a21))
+found these built-in producers:
+
+| Metadata kind | Producer | Pipa handling |
+| --- | --- | --- |
+| `question` | `packages/core/src/tool/plugin/question.ts` | Supported text and multiple-choice fields |
+| `websearch.provider` | `packages/core/src/tool/plugin/websearch.ts` | Setup and provider choices through the same controls |
+| `mcp-elicitation` | `packages/core/src/mcp/index.ts` | Currently has the non-session owner `global`, so it is not forwarded to a Slack thread |
+
+This is not a closed kind registry: `Form.Metadata` is an arbitrary record, and
+plugins and API clients can create forms with other kinds or no kind. On an
+OpenCode upgrade, inspect `packages/schema/src/form.ts` for field/answer changes
+and the `Form.Service` producers for new shapes and ownership. Exercise those
+shapes through the native adapter and Slack submission tests in
+`test/opencode-v2.test.mjs`; adding a kind name alone is not a compatibility fix.
+The tests cover unknown/absent metadata and preserve the richer-form boundary,
+not every possible plugin or future form type.
 
 Owned servers preflight the selected `opencode` executable and check the serving
 identity agrees. Attached servers are identified from HTTP, independently of
