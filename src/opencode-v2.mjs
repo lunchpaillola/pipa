@@ -140,6 +140,15 @@ export function createV2Adapter(options) {
     return readWithRecovery((readSignal) => readProjection(record, readSignal), signal);
   }
 
+  function ownedShellCompletion(record, message, timeline) {
+    const metadata = message.payload?.metadata ?? message.metadata;
+    if (message.type !== "synthetic" || metadata?.source !== "shell" || typeof metadata.shellID !== "string") return false;
+    const index = timeline.findIndex((item) => item.id === record.id && item.type === "user");
+    // Native background notifications belong to the shell tool that launched them.
+    return index >= 0 && timeline.slice(index + 1).some((item) => item.type === "assistant" && item.content.some((part) =>
+      part.type === "tool" && part.name === "shell" && part.state?.metadata?.shellID === metadata.shellID));
+  }
+
   async function readProjection(record, signal) {
     // Native promotion atomically removes pending input and projects its message.
     // Read inbox first so a lost cancel reply cannot hide that handoff between reads.
@@ -150,8 +159,8 @@ export function createV2Adapter(options) {
     if (!Array.isArray(inbox) || inbox.some((item) => typeof item?.id !== "string" || item.sessionID !== record.sessionId || typeof item.type !== "string")) throw new Error("OpenCode returned an invalid inbox projection.");
     const baseline = new Set(record.baseline);
     const fresh = timeline.filter((message) => !baseline.has(message.id));
-    const foreign = fresh.some((message) => ["user", "synthetic", "shell"].includes(message.type) && message.id !== record.id)
-      || inbox.some((item) => item.id !== record.id);
+    const foreign = fresh.some((message) => ["user", "synthetic", "shell"].includes(message.type) && message.id !== record.id && !ownedShellCompletion(record, message, timeline))
+      || inbox.some((item) => item.id !== record.id && !ownedShellCompletion(record, item, timeline));
     const index = fresh.findIndex((message) => message.id === record.id && message.type === "user");
     const own = index >= 0 ? fresh[index] : null;
     const idle = index >= 0 ? fresh.slice(index + 1).find((message) => message.type === "idle") : null;
@@ -569,7 +578,15 @@ export function createV2Adapter(options) {
             try {
               for await (const event of events.event.subscribe({ signal: streamSignal })) {
                 if (typeof event?.type !== "string" || !event.data || typeof event.id !== "string") throw new Error("OpenCode returned an invalid event.");
-                if (event.type === "session.inbox.enqueued" && event.data.sessionID === sessionId && event.data.inboxID !== record.id) record.foreign = true;
+                if (event.type === "session.inbox.enqueued" && event.data.sessionID === sessionId && event.data.inboxID !== record.id) {
+                  let owned = false;
+                  try {
+                    // Stream shutdown must not cancel an in-flight ownership check.
+                    if (event.data.item?.type === "synthetic") owned = ownedShellCompletion(record, event.data.item, await messages(sessionId, AbortSignal.timeout(options.cleanupTimeoutMs ?? 5_000)));
+                  } finally {
+                    if (!owned) record.foreign = true;
+                  }
+                }
                 if ((onInteraction || onPermissionReplied || onPermissionsReconciled) && (!event.location || path.resolve(event.location.directory ?? "") === path.resolve(workingDirectory))) {
                   if (event.type === "form.created") await dispatch("form", event.data.form);
                   if (event.type === "permission.asked") await dispatch("permission", event.data);

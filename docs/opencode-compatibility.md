@@ -234,6 +234,8 @@ or establish private operator/plugin compatibility.
 - Native event reconciliation is not durable replay. Foreign prompt writers in
   an active Pipa session cause an attribution conflict. Restore connectivity and
   resolve ownership conflicts rather than replaying prompts automatically.
+  Background-shell completion notifications are part of the Pipa turn when their
+  shell ID matches a shell tool launched in that turn, not a competing writer.
 - V2 request deadlines include response-body consumption, including compressed
   large-attachment admission replies. A timed-out reply triggers authoritative
   admission reconciliation, not prompt replay; healthy long-running turns still

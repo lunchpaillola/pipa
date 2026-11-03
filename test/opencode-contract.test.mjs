@@ -2273,6 +2273,49 @@ test("v2 review: same-session reservation precedes callbacks/downloads and does 
   wire.assertComplete();
 });
 
+for (const stage of ["pending", "delivered", "active", "event", "event during shutdown", "unrelated job"]) test(`v2 U2: background shell completion preserves turn ownership (${stage})`, async (t) => {
+  let admitted = false;
+  let polls = 0;
+  let stream;
+  let closed = false;
+  let notified = false;
+  const streamClosed = Promise.withResolvers();
+  const notification = { id: "msg_shell_done", sessionID: "ses_contract", type: "synthetic", payload: { text: "export finished", metadata: { source: "shell", shellID: stage === "unrelated job" ? "sh_other" : "sh_export" } } };
+  const { executor, input, document, runtime, wire } = await fixture(t, "v2", { transport: async (url, init, next) => {
+    const pathname = new URL(url).pathname;
+    const json = (value) => new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } });
+    if (pathname === "/api/event") return new Response(new ReadableStream({ start(controller) {
+      stream = controller;
+      init.signal.addEventListener("abort", () => { closed = true; controller.close(); streamClosed.resolve(); }, { once: true });
+    }, cancel() { closed = true; } }), { headers: { "content-type": "text/event-stream" } });
+    if (pathname.endsWith("/prompt")) { admitted = true; return next(url, init); }
+    if (pathname.endsWith("/inbox") && admitted) return json({ data: stage === "pending" ? [notification] : [] });
+    if (pathname.endsWith("/message") && admitted) {
+      if (stage === "event during shutdown" && notified) {
+        await streamClosed.promise;
+        init.signal.throwIfAborted();
+      }
+      const page = structuredClone(document.routes.find((route) => route.path.endsWith("/message")).responses[2].json);
+      page.data.find((message) => message.type === "assistant").content.push({ type: "tool", id: "call_export", name: "shell", state: { status: "completed", input: { command: "export", background: true }, content: [], metadata: { shellID: "sh_export" } }, time: { created: 2, completed: 3 } });
+      if (["delivered", "active", "unrelated job"].includes(stage)) page.data.splice(-1, 0, { id: notification.id, type: "synthetic", time: { created: 3 }, ...notification.payload });
+      if (stage === "active" && ++polls === 1) page.data.pop();
+      return json(page);
+    }
+    if (pathname.includes("/instructions/entries/") && init.method === "DELETE" && stage.startsWith("event") && !notified) {
+      notified = true;
+      stream.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ id: "evt_shell", type: "session.inbox.enqueued", data: { sessionID: input.sessionId, inboxID: notification.id, item: notification } })}\n\n`));
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    return next(url, init);
+  } });
+  if (stage === "unrelated job") await assert.rejects(executor.runTurn(input), /attribution conflict/u);
+  else await runTurnContract({ executor, input, expected: document.expected });
+  assert.equal(closed, true);
+  assert.deepEqual(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records, []);
+  await executor.ready(runtime.workspace);
+  wire.assertComplete();
+});
+
 test("v2 U2: foreign input fails attribution and is never interrupted", async (t) => {
   let admitted = false;
   let deleted = false;
