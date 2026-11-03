@@ -63,27 +63,15 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
         failure = "No configured models are available. Connect a provider in OpenCode, then reopen the model picker.";
         throw new Error("empty catalog");
       }
-      const groups = [];
-      for (const model of models) {
-        const label = model.providerID.slice(0, 75);
-        if (groups.at(-1)?.label.text !== label || groups.at(-1).options.length === 100) {
-          if (groups.length === 100) {
-            failure = "The model catalog exceeds Slack's list limit. Reduce the configured models in OpenCode, then reopen the picker.";
-            throw new Error("oversized catalog");
-          }
-          groups.push({ label: { type: "plain_text", text: label }, options: [] });
-        }
-        groups.at(-1).options.push(modelOption(model));
-      }
+      entry.options = models.map((model) => ({ option: modelOption(model), search: `${model.providerID} ${model.modelID} ${model.name ?? ""}`.toLowerCase() }));
       const initialModel = currentConfig.defaultModel && models.find((model) => model.providerID === currentConfig.defaultModel.providerID && model.modelID === currentConfig.defaultModel.modelID);
-      // The pinned Chat SDK cannot express grouped selects. Native Slack groups
-      // preload more than 100 models and filter locally without options callbacks.
       failure = `Slack couldn't display the model list. Try ${command} model again in a moment.`;
       await event.adapter.webClient.views.update({ view_id: entry.viewId, view: {
         ...view, submit: { type: "plain_text", text: "Save" },
         blocks: [{ type: "input", block_id: `pipa_model_${token}`, label: { type: "plain_text", text: `Default for new ${botName} threads` },
-          element: { type: "static_select", action_id: `pipa_model_${token}`, option_groups: groups,
-            placeholder: { type: "plain_text", text: "Browse models or type to filter" }, ...(initialModel ? { initial_option: modelOption(initialModel) } : {}) } }],
+          hint: { type: "plain_text", text: "Up to 100 matches shown. Type a model name, ID or provider to narrow the results." },
+          element: { type: "external_select", action_id: `pipa_model_${token}`, min_query_length: 0,
+            placeholder: { type: "plain_text", text: "Search models or providers" }, ...(initialModel ? { initial_option: modelOption(initialModel) } : {}) } }],
       } });
     } catch (error) {
       const entry = pending.get(token);
@@ -104,6 +92,24 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
       }
       await reply(message);
     }
+  });
+
+  chat.onOptionsLoad?.(async (event) => {
+    if (!event.actionId?.startsWith("pipa_model_")) return;
+    const entry = pending.get(event.actionId.slice("pipa_model_".length));
+    try {
+      authorize(entry, event, {});
+      authorize(entry, event, await loadConfig());
+      if (pending.get(event.actionId.slice("pipa_model_".length)) !== entry || entry.saving) return [];
+      const terms = String(event.query ?? "").toLowerCase().trim().split(/\s+/u);
+      const matches = [];
+      for (const { option, search } of entry.options ?? []) {
+        if (!terms.every((term) => search.includes(term))) continue;
+        matches.push({ label: option.text.text, description: option.description.text, value: option.value });
+        if (matches.length === 100) break;
+      }
+      return matches;
+    } catch { return []; }
   });
 
   chat.onModalSubmit?.("pipa_model", (event) => {
