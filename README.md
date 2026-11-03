@@ -53,11 +53,11 @@ pipa start
 
 ### Opt-in 0.6 beta
 
-`0.6.0-beta.1` is being prepared for controlled testing, not stable release.
+`0.6.0-beta.2` is being prepared for controlled testing, not stable release.
 Once published, opt in with:
 
 ```sh
-npm install --global @usepipa/pipa@0.6.0-beta.1
+npm install --global @usepipa/pipa@0.6.0-beta.2
 ```
 
 Normal installs keep using npm's `latest` tag; subsequent betas use `@beta`.
