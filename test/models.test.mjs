@@ -10,6 +10,35 @@ import { createPipaSlackAdapter, startPipa } from "../src/app.mjs";
 import { createModelPicker } from "../src/models.mjs";
 import { createModelSetting, createSessionStore, loadConfig, pipaPaths, writePrivateJson } from "../src/state.mjs";
 
+test("model search acknowledgments fit Slack's 20 KiB Socket Mode frame limit", async (t) => {
+  const adapter = createPipaSlackAdapter({ signingSecret: "test", botToken: "xoxb-test", botUserId: "UPIPA", userName: "Piper" });
+  const chat = new Chat({ adapters: { slack: adapter }, state: createMemoryState(), userName: "Piper", logger: "silent" });
+  let view;
+  adapter.webClient.views.open = async () => ({ view: { id: "V1" } });
+  adapter.webClient.views.update = async (input) => { view = input.view; };
+  const models = Array.from({ length: 150 }, (_, id) => ({ providerID: "provider-" + "漢".repeat(60), modelID: `model-${id}`, name: '漢"\\'.repeat(25) }));
+  const picker = createModelPicker({ chat, botName: "Piper", commands: ["/piper"], loadConfig: async () => ({}),
+    listModels: async () => models, setting: {} });
+  await chat.initialize();
+  t.after(async () => { picker.close(); await chat.shutdown(); });
+  const waiting = [];
+  await adapter.handleSlashCommand(new URLSearchParams({ command: "/piper", text: "model", user_id: "U1", channel_id: "C1", trigger_id: "trigger" }), { waitUntil: (p) => waiting.push(p) });
+  await Promise.all(waiting);
+  const responses = [];
+  const sizes = [];
+  const actionId = view.blocks[0].element.action_id;
+  for (const query of ["", "model-149"]) {
+    await adapter.routeSocketEvent({ type: "block_suggestion", action_id: actionId, value: query, user: { id: "U1" }, view: { id: "V1" } }, "interactive", async (payload) => {
+      const frame = JSON.stringify({ envelope_id: "00000000-0000-0000-0000-000000000000", payload });
+      sizes.push(Buffer.byteLength(frame));
+      responses.push(payload.options);
+    });
+  }
+  assert.ok(sizes.every((bytes) => bytes <= 20 * 1024), `oversized search replies disconnect Slack and break Save: ${sizes}`);
+  assert.ok(responses[0].length > 0 && responses[0].length < 100);
+  assert.equal(responses[1].length, 1, "models omitted by the byte limit remain searchable");
+});
+
 for (const revoked of [false, true]) test(`native Save acknowledges before config I/O; ${revoked ? "revoked access prevents discovery and writes" : "authorized save persists afterward"}`, async (t) => {
   const adapter = createPipaSlackAdapter({ signingSecret: "test", botToken: "xoxb-test", botUserId: "UPIPA", userName: "Chopper" });
   const chat = new Chat({ adapters: { slack: adapter }, state: createMemoryState(), userName: "Chopper", logger: "silent" });

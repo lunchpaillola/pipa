@@ -359,11 +359,15 @@ export function createPipaSlackAdapter(options, drainTimeoutMs = 3_000) {
   adapter.startSocketMode = (...args) => disconnecting ? Promise.resolve() : startSocketMode(...args);
   // The pinned adapter's async EventEmitter listener neither observes route
   // rejections nor drains acknowledgments before closing its Socket Mode client.
-  adapter.routeSocketEvent = (...args) => {
+  adapter.routeSocketEvent = (body, eventType, ack, options, retryNum) => {
     if (disconnecting) return Promise.resolve();
     const task = (async () => {
       try {
-        await route(...args);
+        await route(body, eventType, async (response) => {
+          // Slack closes sockets above 20 KiB; leave 1 KiB for the envelope.
+          while (response?.options?.length && Buffer.byteLength(JSON.stringify(response)) > 19 * 1024) response.options.pop();
+          await ack(response);
+        }, options, retryNum);
       } catch {
         // SDK errors can contain payloads/tokens; keep diagnostics credential-free.
         adapter.logger.error("Pipa Slack Socket Mode event failed.");
