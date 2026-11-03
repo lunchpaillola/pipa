@@ -349,6 +349,23 @@ for (const selection of ["empty-native-choice", "model-switch-history"]) test(`v
   wire.assertComplete();
 });
 
+for (const generation of ["v1", "v2"]) test(`${generation} invalid selected defaults retain the new session for later messages`, async (t) => {
+  const { document, executor, input, wire } = await fixture(t, generation);
+  const messages = document.routes.find((route) => route.path.endsWith("/message"));
+  messages.responses = [{ json: generation === "v2" ? { data: [], cursor: { previous: null, next: null } } : [] }];
+  messages.repeatLast = true;
+  if (generation === "v2") document.routes.find((route) => route.path === "/api/session/ses_contract").responses[0].json.data.model = null;
+  let saved;
+  const run = () => executor.runTurn({ ...input, sessionId: saved, defaultModel: false, onSession: (id) => { saved = id; } });
+  await assert.rejects(run(), /Invalid model/u);
+  assert.equal(saved, input.sessionId);
+  await assert.rejects(run(), /Invalid model/u);
+  assert.equal(saved, input.sessionId);
+  assert.equal(wire.calls.filter((call) => call.method === "POST" && ["/session", "/api/session"].includes(call.path)).length, 1);
+  assert.equal(wire.calls.some((call) => /\/(?:prompt|prompt_async)$/u.test(call.path)), false);
+  wire.assertComplete();
+});
+
 for (const [label, error, providerID, expected] of [
   ["HTTP 401", { type: "provider.auth", status: 401, message: "invalid key private-message-secret" }, "connected", /selected provider authentication failed \(HTTP 401\)\. Reconnect that provider/u],
   ["expired key", { type: "provider.auth", status: 401, message: "This API key has expired. private-message-secret" }, "connected", /selected provider API key has expired\. Replace that provider's API key/u],

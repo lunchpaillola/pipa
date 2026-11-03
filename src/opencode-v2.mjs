@@ -116,7 +116,6 @@ export function createV2Adapter(options) {
   }
 
   async function belongs(observer, candidate) {
-    const original = candidate;
     const visited = new Set();
     while (candidate && !visited.has(candidate)) {
       visited.add(candidate);
@@ -124,7 +123,7 @@ export function createV2Adapter(options) {
       try { session = await client.session.get({ sessionID: candidate }, { signal: observer.controller.signal }); }
       catch (error) { if (error._tag === "SessionNotFoundError") return false; throw error; }
       if (session?.id !== candidate) return false;
-      if (candidate === observer.sessionId) { observer.interactionSessions.add(original); return true; }
+      if (candidate === observer.sessionId) return true;
       candidate = session.parentID;
     }
     return false;
@@ -229,7 +228,17 @@ export function createV2Adapter(options) {
   }
 
   function reconcile(observer) {
-    observer.reconciliation = (observer.reconciliation ?? Promise.resolve()).catch(() => undefined).then(() => reconcilePending(observer));
+    observer.reconcileRequested = true;
+    if (observer.reconciliation) return observer.reconciliation;
+    observer.reconciliation = Promise.resolve().then(async () => {
+      try {
+        while (observer.reconcileRequested && !observer.controller.signal.aborted) {
+          observer.reconcileRequested = false;
+          try { await reconcilePending(observer); }
+          catch (error) { if (!observer.reconcileRequested) throw error; }
+        }
+      } finally { observer.reconciliation = undefined; }
+    });
     return observer.reconciliation;
   }
 
@@ -239,40 +248,46 @@ export function createV2Adapter(options) {
     const revision = observer.interactionRevision;
     const sessionIds = new Set([observer.sessionId]);
     for (const sessionId of sessionIds) {
+      signal.throwIfAborted();
+      const input = { sessionID: sessionId };
+      const results = await Promise.allSettled(["form", "permission"].map(async (kind) => {
+        let snapshot;
+        try {
+          snapshot = await readWithRecovery((signal) => kind === "form"
+            ? client.session.form.list(input, { signal }) : client.permission.list(input, { signal }), signal);
+          if (!Array.isArray(snapshot) || snapshot.some((request) => request.sessionID !== sessionId)) throw new Error("OpenCode returned an invalid interaction projection.");
+        } catch {
+          if (!signal.aborted) process.stderr.write(`OpenCode ${kind} reconciliation read failed.\n`);
+          return;
+        }
+        if (signal.aborted || revision !== observer.interactionRevision) return;
+        for (const request of snapshot) await dispatch(observer, kind, request);
+        if (signal.aborted || revision !== observer.interactionRevision) return;
+        for (const [key, entry] of observer.interactions) {
+          if (entry.kind === kind && entry.request.sessionID === sessionId && !entry.submitting && !snapshot.some((request) => request.id === entry.request.id)) {
+            settle(entry);
+            observer.interactions.delete(key);
+          }
+        }
+        if (kind === "permission" && observer.onPermissionsReconciled && await belongs(observer, sessionId)
+          && !signal.aborted && revision === observer.interactionRevision) {
+          await observer.onPermissionsReconciled({ sessionId, requestIds: new Set(snapshot.map((request) => request.id)) });
+        }
+      }));
+      for (const result of results) if (result.status === "rejected") throw result.reason;
+      if (signal.aborted || revision !== observer.interactionRevision) return;
       let cursor;
       do {
-        const page = await readWithRecovery((signal) => client.session.list({ parentID: sessionId, ...(cursor ? { cursor } : {}) }, { signal }), signal);
-        if (!Array.isArray(page.data)) throw new Error("OpenCode returned an invalid session projection.");
-        for (const child of page.data) if (typeof child.id === "string" && child.parentID === sessionId) sessionIds.add(child.id);
-        cursor = page.cursor.next;
-      } while (cursor);
-    }
-    const snapshots = [[], []];
-    for (const sessionId of sessionIds) {
-      const input = { sessionID: sessionId };
-      const scoped = await readWithRecovery((signal) => Promise.all([client.session.form.list(input, { signal }), client.permission.list(input, { signal })]), signal);
-      for (const [index, requests] of scoped.entries()) {
-        if (!Array.isArray(requests)) throw new Error("OpenCode returned an invalid interaction projection.");
-        snapshots[index].push(...requests);
-      }
-    }
-    if (revision !== observer.interactionRevision) return;
-    for (const [index, snapshot] of snapshots.entries()) {
-      if (revision !== observer.interactionRevision) return;
-      const kind = index === 0 ? "form" : "permission";
-      for (const request of snapshot) await dispatch(observer, kind, request);
-      if (revision !== observer.interactionRevision) return;
-      for (const [key, entry] of observer.interactions) {
-        if (entry.kind === kind && !entry.submitting && !snapshot.some((request) => request.id === entry.request.id && request.sessionID === entry.request.sessionID)) {
-          settle(entry);
-          observer.interactions.delete(key);
+        try {
+          const page = await readWithRecovery((signal) => client.session.list({ parentID: sessionId, ...(cursor ? { cursor } : {}) }, { signal }), signal);
+          if (!Array.isArray(page.data)) throw new Error("OpenCode returned an invalid session projection.");
+          for (const child of page.data) if (typeof child.id === "string" && child.parentID === sessionId) sessionIds.add(child.id);
+          cursor = page.cursor.next;
+        } catch {
+          if (!signal.aborted) process.stderr.write("OpenCode descendant discovery failed.\n");
+          break;
         }
-      }
-      if (kind === "permission" && observer.onPermissionsReconciled) {
-        const scoped = [];
-        for (const request of snapshot) if (await belongs(observer, request.sessionID)) scoped.push(request);
-        for (const sessionId of observer.interactionSessions) await observer.onPermissionsReconciled({ sessionId, requestIds: new Set(scoped.filter((request) => request.sessionID === sessionId).map((request) => request.id)) });
-      }
+      } while (cursor);
     }
   }
 
@@ -311,7 +326,7 @@ export function createV2Adapter(options) {
               observer.interactionTask = (observer.interactionTask ?? Promise.resolve()).then(async () => {
                 if (observer.controller.signal.aborted) return;
                 if (["session.created", "session.forked", "session.moved"].includes(event.type)
-                  && await belongs(observer, event.data.parentID ?? event.data.sessionID)) await reconcile(observer);
+                  && await belongs(observer, event.data.parentID ?? event.data.sessionID)) void reconcile(observer).catch(() => undefined);
                 if (event.type === "form.created") await dispatch(observer, "form", event.data.form);
                 if (event.type === "permission.asked") await dispatch(observer, "permission", event.data);
                 if (event.type === "permission.replied" && await belongs(observer, event.data.sessionID)) {
@@ -327,7 +342,7 @@ export function createV2Adapter(options) {
                   const id = kind === "form" ? event.data?.id : event.data?.requestID;
                   const entry = observer.interactions.get(`${kind}:${event.data?.sessionID}:${id}`);
                   if (entry && !entry.submitting) settle(entry);
-                  await reconcile(observer);
+                  void reconcile(observer).catch(() => undefined);
                 }
               }).catch(() => { if (!observer.controller.signal.aborted) process.stderr.write("OpenCode interaction event failed.\n"); });
             }
@@ -378,7 +393,7 @@ export function createV2Adapter(options) {
     let observer = observers.get(input.sessionId);
     const created = !observer;
     if (!observer) {
-      observer = { sessionId: input.sessionId, controller: new AbortController(), initialized: Promise.withResolvers(), delivered: new Set(), replied: new Set(), waiters: new Set(), handlers: new Set(), interactions: new Map(), interactionSessions: new Set([input.sessionId]), interactionRevision: 0, persistent };
+      observer = { sessionId: input.sessionId, controller: new AbortController(), initialized: Promise.withResolvers(), delivered: new Set(), replied: new Set(), waiters: new Set(), handlers: new Set(), interactions: new Map(), interactionRevision: 0, persistent };
       observers.set(input.sessionId, observer);
       // Observe rejection immediately, including shutdown during initial attachment.
       void observer.initialized.promise.catch(() => undefined);

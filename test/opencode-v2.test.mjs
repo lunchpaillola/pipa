@@ -557,35 +557,145 @@ test("native child creation and location changes refresh pending controls withou
   assert.deepEqual(interactions.map((item) => item.request.id), ["per_created", "frm_moved"]);
 });
 
-test("failed descendant snapshots do not falsely settle existing pending controls", async (t) => {
+test("reconciliation coalesces event bursts into one running scan and one follow-up", async (t) => {
+  const release = Promise.withResolvers();
+  let blocked = false;
+  let scans = 0;
+  const f = await fixture(t, { onRequest: async ({ url }) => {
+    if (url.pathname === "/api/session" && url.searchParams.get("parentID") === "ses_one") {
+      scans++;
+      if (blocked) await release.promise;
+    }
+  } });
+  t.after(() => release.resolve());
+  const interactions = [];
+  await f.adapter.followSession(f.input("ses_one", { onInteraction: async (item) => { interactions.push(item); return { type: "cancelled" }; } }));
+  const baseline = scans;
+  blocked = true;
+  f.emit("ses_one", "session.tool.called", {});
+  await until(() => scans === baseline + 1);
+  for (let index = 0; index < 20; index++) {
+    f.emit("ses_one", "session.tool.called", {});
+    f.globalEvent("session.moved", { sessionID: "ses_one", location: { directory: process.cwd() }, projectID: "proj_native" });
+  }
+  // Drain the event queue while the descendant fetch is held, not by timing scan completion.
+  f.globalEvent("permission.asked", { id: "per_barrier", sessionID: "ses_one", action: "bash", resources: ["pwd"] });
+  await until(() => interactions.length === 1);
+  assert.equal(scans, baseline + 1);
+  release.resolve();
+  await until(() => scans >= baseline + 2);
+  await delay(100);
+  assert.equal(scans, baseline + 2);
+});
+
+test("root approvals survive failing descendant reads and discovery", async (t) => {
+  for (const failure of ["read", "discovery"]) {
+    const f = await fixture(t, { onRequest: ({ url, json }) => {
+      if (failure === "read" && url.pathname === "/api/session/ses_child/permission"
+        || failure === "discovery" && url.pathname === "/api/session") { json({ secret: "never-log-this" }, 500); return true; }
+    } });
+    f.sessions.set("ses_child", { parentID: "ses_one" });
+    f.permissions.push({ id: "per_root", sessionID: "ses_one", action: "bash", resources: ["pwd"] });
+    const interactions = [];
+    await f.adapter.followSession(f.input("ses_one", { onInteraction: async (item) => { interactions.push(item); return { type: "cancelled" }; } }));
+    assert.deepEqual(interactions.map((item) => item.request.id), ["per_root"]);
+  }
+});
+
+test("a failed scan still runs an already-requested reconciliation follow-up", async (t) => {
+  const started = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let block = false;
+  const f = await fixture(t);
+  t.after(() => release.resolve());
+  const seen = [];
+  await f.adapter.followSession(f.input("ses_one", {
+    onInteraction: async (item) => { seen.push(item.request.id); return { type: "cancelled" }; },
+    onPermissionsReconciled: async () => {
+      if (!block) return;
+      block = false;
+      started.resolve();
+      await release.promise;
+      throw new Error("callback failed");
+    },
+  }));
+  block = true;
+  f.emit("ses_one", "session.tool.called", {});
+  await started.promise;
+  f.permissions.push({ id: "per_pending", sessionID: "ses_one", action: "bash", resources: ["pwd"] });
+  f.emit("ses_one", "session.tool.called", {});
+  f.globalEvent("permission.asked", { id: "per_barrier", sessionID: "ses_one", action: "bash", resources: ["pwd"] });
+  await until(() => seen.includes("per_barrier"));
+  release.resolve();
+  await until(() => seen.includes("per_pending"));
+});
+
+test("a successful permission snapshot dispatches before a stalled same-session form read", async (t) => {
+  const release = Promise.withResolvers();
+  const f = await fixture(t, { onRequest: async ({ url }) => {
+    if (url.pathname === "/api/session/ses_one/form") await release.promise;
+  } });
+  const interactions = [];
+  f.permissions.push({ id: "per_root", sessionID: "ses_one", action: "bash", resources: ["pwd"] });
+  const following = f.adapter.followSession(f.input("ses_one", { onInteraction: async (item) => { interactions.push(item); return { type: "cancelled" }; } }));
+  try {
+    await until(() => interactions.length === 1);
+    assert.equal(interactions[0].request.id, "per_root");
+  } finally { release.resolve(); await following; }
+});
+
+test("failed descendant kinds stay editable while successful root and sibling kinds settle", async (t) => {
   let fail = false;
   const f = await fixture(t, { onRequest: ({ url, json }) => {
-    if (fail && url.pathname === "/api/session/ses_child/form") { json({}, 500); return true; }
+    if (fail && url.pathname === "/api/session/ses_child/permission"
+      || fail && url.pathname === "/api/session/ses_one/form") { json({}, 500); return true; }
   } });
   f.sessions.set("ses_child", { parentID: "ses_one", location: { directory: "/outside/child" } });
-  f.permissions.push({ id: "per_pending", sessionID: "ses_one", action: "bash", resources: ["pwd"] });
+  f.permissions.push(...["ses_one", "ses_child"].map((sessionID) => ({ id: `per_${sessionID}`, sessionID, action: "bash", resources: ["pwd"] })));
+  f.forms.push(...["ses_one", "ses_child"].map((sessionID) => ({ id: `frm_${sessionID}`, sessionID, title: "Continue?", fields: [{ key: "answer", type: "string" }] })));
   const interactions = [];
   const snapshots = [];
   await f.adapter.followSession(f.input("ses_one", {
     onInteraction: async (item) => { interactions.push(item); return { type: "cancelled" }; },
     onPermissionsReconciled: async (item) => snapshots.push(item),
   }));
-  await until(() => interactions.length === 1);
-  let settled = false;
-  void interactions[0].settled.then(() => { settled = true; });
+  await until(() => interactions.length === 4);
+  const settled = new Set();
+  for (const item of interactions) void item.settled.then(() => settled.add(item.request.id));
   snapshots.length = 0;
-  f.permissions.length = 0;
+  f.permissions.splice(0, 1);
+  f.forms.splice(1, 1);
   fail = true;
-  const reads = f.requests.filter((r) => r.path === "/api/session/ses_child/form").length;
-  f.globalEvent("session.moved", { sessionID: "ses_child", location: { directory: "/outside/child" }, projectID: "proj_native" }, { directory: "/outside/child" });
-  await until(() => f.requests.filter((r) => r.path === "/api/session/ses_child/form").length > reads);
-  await delay(10);
-  assert.equal(settled, false);
-  assert.deepEqual(snapshots, []);
+  await f.adapter.followSession(f.input("ses_one"));
+  assert.deepEqual(settled, new Set(["per_ses_one", "frm_ses_child"]));
+  assert.ok(snapshots.some((item) => item.sessionId === "ses_one" && item.requestIds.size === 0));
+  assert.equal(snapshots.some((item) => item.sessionId === "ses_child"), false);
   fail = false;
-  f.globalEvent("session.moved", { sessionID: "ses_child", location: { directory: "/outside/child" }, projectID: "proj_native" }, { directory: "/outside/child" });
-  await until(() => settled);
-  await assert.rejects(interactions[0].submit({ type: "reply", reply: "once" }), /already settled/u);
+  await interactions.find((item) => item.request.id === "per_ses_child").submit({ type: "reply", reply: "once" });
+  await interactions.find((item) => item.request.id === "frm_ses_one").submit({ type: "answer", answers: [["yes"]] });
+  await assert.rejects(interactions.find((item) => item.request.id === "per_ses_one").submit({ type: "reply", reply: "once" }), /already settled/u);
+});
+
+test("drain waits for a coalesced reconciliation callback", async (t) => {
+  const started = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let block = false;
+  const f = await fixture(t);
+  await f.adapter.followSession(f.input("ses_one", { onPermissionsReconciled: async () => {
+    if (block) { started.resolve(); await release.promise; }
+  } }));
+  block = true;
+  f.emit("ses_one", "session.tool.called", {});
+  await started.promise;
+  f.emit("ses_one", "session.tool.called", {});
+  f.adapter.stopAll();
+  let drained = false;
+  const drain = f.adapter.drain().then(() => { drained = true; });
+  try {
+    await delay(10);
+    assert.equal(drained, false);
+  } finally { release.resolve(); await drain; }
+  assert.equal(drained, true);
 });
 
 test("existing session lookup and native ancestry retain session ID validation", async (t) => {

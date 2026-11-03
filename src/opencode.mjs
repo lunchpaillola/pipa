@@ -210,12 +210,12 @@ export function createOpenCodeExecutor(options = {}) {
         await abortable(ready(workingDirectory), controller.signal);
         const prepared = await adapter.resolveSession(sessionId, workingDirectory, controller);
         const selectedSessionId = prepared.sessionId;
-        const newThreadModel = !selectedModel && (prepared.defaultEligible ?? !prepared.threadModel) ? normalizeModel(defaultModel) : null;
 
         if (!capabilities.backgroundResponses && activeSessions.has(selectedSessionId) && activeSessions.get(selectedSessionId).controller !== controller) throw new Error("OpenCode attribution conflict: the session already has an active writer.");
         activeSessions.set(selectedSessionId, { controller, workingDirectory, resolved: true });
         await onSession?.(selectedSessionId);
         if (controller.signal.aborted) throw controller.signal.reason;
+        const newThreadModel = !selectedModel && (prepared.defaultEligible ?? !prepared.threadModel) ? normalizeModel(defaultModel) : null;
 
         if (slackTurn) artifactDirectory = await prepareArtifacts(selectedSessionId, workingDirectory, capabilities.backgroundResponses && !!onResponse);
 
