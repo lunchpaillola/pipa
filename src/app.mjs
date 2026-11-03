@@ -190,9 +190,7 @@ export async function startPipa(options = {}) {
     const allowed = async (signal) => {
       if (!accepting || signal?.aborted) return false;
       const current = await loadCurrentConfig();
-      const channelId = thread.id.split(":")[1];
-      if (current.allowedSlackChannelIds?.length && !current.allowedSlackChannelIds.includes(channelId)) return false;
-      return !message || isAuthorized(thread, message, current);
+      return isAuthorized(thread, message, current);
     };
     return {
       onResponse: async (result, signal) => {
@@ -284,16 +282,6 @@ export async function startPipa(options = {}) {
     }
     await withTimeout(chat.initialize(), options.startupTimeoutMs, "Slack Socket Mode startup timed out.", options.signal);
     options.signal?.throwIfAborted();
-    if (executor.capabilities?.backgroundResponses) {
-      for (const conversationKey of sessionStore.keys()) {
-        const thread = chat.thread(conversationKey);
-        const [, channelId, threadTs] = conversationKey.split(":");
-        if (config.allowedSlackChannelIds?.length && !config.allowedSlackChannelIds.includes(channelId)) continue;
-        await executor.followSession({ sessionId: sessionStore.get(conversationKey), workingDirectory: config.workingDirectory,
-          contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack", PIPA_CURRENT_SLACK_CHANNEL_ID: channelId, PIPA_CURRENT_SLACK_THREAD_TS: threadTs },
-          ...followCallbacks(thread) }).catch(() => process.stderr.write("Pipa could not follow a restored OpenCode session.\n"));
-      }
-    }
     await routineScheduler?.start();
     options.signal?.throwIfAborted();
   } catch (error) {
@@ -819,7 +807,7 @@ export function createConversationRunner({ sessionStore, runTurn, abortTurn = as
       const aborts = [];
       for (const turn of latest.values()) {
         turn.controller.abort(closeReason);
-        if (turn.sessionId) aborts.push(Promise.resolve(abortTurn(turn.sessionId, closeReason)).catch(() => undefined));
+        if (turn.sessionId && interruptPrevious()) aborts.push(Promise.resolve(abortTurn(turn.sessionId, closeReason)).catch(() => undefined));
       }
       closing = Promise.allSettled(aborts);
     },

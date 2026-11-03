@@ -98,6 +98,10 @@ test("v2 forwards background replies after admission without another Slack messa
   await submitted.onResponse({ sessionId: "ses_background", text: "Rendering; I will verify it." }, new AbortController().signal);
   await submitted.onResponse({ sessionId: "ses_background", text: "Render verified." }, new AbortController().signal);
   assert.deepEqual(posts, [{ markdown: "Rendering; I will verify it." }, { markdown: "Render verified." }]);
+  config.allowedSlackUserIds = ["U2"];
+  await submitted.onResponse({ sessionId: "ses_background", text: "Requester no longer allowed." }, new AbortController().signal);
+  assert.equal(posts.length, 2);
+  config.allowedSlackUserIds = [];
   config.allowedSlackChannelIds = ["C2"];
   await submitted.onResponse({ sessionId: "ses_background", text: "No longer allowed." }, new AbortController().signal);
   assert.equal(posts.length, 2);
@@ -106,7 +110,7 @@ test("v2 forwards background replies after admission without another Slack messa
   assert.equal(posts.length, 2);
 });
 
-test("v2 resumes session following for restored Slack threads", async (t) => {
+test("v2 restores thread subscriptions without attaching old background work", async (t) => {
   const watched = [];
   const posts = [];
   const thread = { id: "slack:C1:1.0", subscribe: async () => undefined, post: async (payload) => posts.push(payload) };
@@ -115,10 +119,48 @@ test("v2 resumes session following for restored Slack threads", async (t) => {
     executor: { capabilities: { backgroundResponses: true }, followSession: async (input) => watched.push(input), stopAll() {} },
     chat: { thread: () => thread, onNewMention() {}, onSubscribedMessage() {}, initialize: async () => undefined, shutdown: async () => undefined } });
   t.after(() => app.shutdown());
-  assert.equal(watched.length, 1);
-  assert.equal(watched[0].sessionId, "ses_restored");
-  await watched[0].onResponse({ sessionId: "ses_restored", text: "Background work finished." }, new AbortController().signal);
-  assert.deepEqual(posts, [{ markdown: "Background work finished." }]);
+  assert.deepEqual(watched, []);
+  assert.deepEqual(posts, []);
+});
+
+test("v2 background replies clear pending eyes and acknowledge only the latest message", async (t) => {
+  let mention;
+  const turns = [];
+  const reactions = [];
+  const app = await startPipa({
+    config: { botName: "Pipa", workingDirectory: "/work", slackBotToken: "xoxb-test", slackAppToken: "xapp-test" },
+    checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => [], get: () => "ses_native", set: async () => undefined },
+    executor: { capabilities: { backgroundResponses: true }, runTurn: async (input) => { turns.push(input); return { pending: true, sessionId: "ses_native" }; }, stopAll() {} },
+    chat: { onNewMention: (fn) => { mention = fn; }, onSubscribedMessage() {}, initialize: async () => undefined, shutdown: async () => undefined },
+  });
+  t.after(() => app.shutdown());
+  const thread = { id: "slack:C1:1.0", channel: { isDM: false }, subscribe: async () => undefined, post: async () => undefined,
+    adapter: { addReaction: async (_thread, id, emoji) => reactions.push(["add", id, emoji]), removeReaction: async (_thread, id, emoji) => reactions.push(["remove", id, emoji]) } };
+  mention(thread, { id: "1.0", text: "render", author: { userId: "U1" }, raw: {} });
+  await waitFor(() => turns.length === 1);
+  mention(thread, { id: "2.0", text: "use blue", author: { userId: "U1" }, raw: {} });
+  await waitFor(() => turns.length === 2);
+  assert.deepEqual(reactions, [["add", "1.0", "eyes"], ["add", "2.0", "eyes"]]);
+  await turns[1].onResponse({ text: "Done", sessionId: "ses_native" }, new AbortController().signal);
+  assert.deepEqual(reactions.slice(2), [["remove", "1.0", "eyes"], ["remove", "2.0", "eyes"], ["add", "2.0", "white_check_mark"]]);
+});
+
+test("closing a native-steering runner does not interrupt attached OpenCode work", async () => {
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const interrupted = [];
+  const runner = createConversationRunner({ interruptPrevious: () => false,
+    sessionStore: { get: () => "ses_native", set: async () => undefined },
+    abortTurn: async (id) => interrupted.push(id),
+    runTurn: async () => { entered.resolve(); await release.promise; return { pending: true, sessionId: "ses_native" }; } });
+  const turn = runner.enqueue("slack:C1:1.0", {}).catch(() => undefined);
+  await entered.promise;
+  runner.close();
+  release.resolve();
+  await turn;
+  await runner.drain();
+  assert.deepEqual(interrupted, []);
 });
 
 test("native steering serializes admission without cancelling OpenCode execution", async () => {

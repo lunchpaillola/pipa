@@ -264,14 +264,6 @@ export function createOpenCodeExecutor(options = {}) {
     get capabilities() { return capabilities; },
     ready,
     runTurn,
-    async followSession({ sessionId, workingDirectory, contextEnvironment = {}, onResponse, ...callbacks }) {
-      await ready(workingDirectory);
-      if (!capabilities.backgroundResponses) return;
-      const slackTurn = contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack";
-      const artifactDirectory = slackTurn ? await prepareArtifacts(sessionId, workingDirectory, true) : undefined;
-      await adapter.followSession({ sessionId, workingDirectory, instructions: turnInstructions(contextEnvironment, artifactDirectory), ...callbacks,
-        onResponse: async (text, messageId, signal) => onResponse(await response(text, sessionId, artifactDirectory, slackTurn), signal) });
-    },
     async listModels(input = {}) {
       const flat = typeof input === "string";
       const { workingDirectory, signal } = flat ? { workingDirectory: input } : input;

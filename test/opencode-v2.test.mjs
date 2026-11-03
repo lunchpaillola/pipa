@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { createV2Adapter } from "../src/opencode-v2.mjs";
+import { postResult } from "../src/app.mjs";
 
 async function fixture(t, options = {}) {
   const messages = new Map();
@@ -114,7 +115,7 @@ test("unavailable response observation fails before admitting unobservable work"
   assert.equal(f.requests.some((request) => request.path.endsWith("/prompt")), false);
 });
 
-test("attachment skips history and reconnect recovers missed replies without duplicates", async (t) => {
+test("attachment and reconnect forward live replies without reading or replaying history", async (t) => {
   const f = await fixture(t);
   f.reply("ses_one", "msg_old", "Do not replay");
   const responses = [];
@@ -123,34 +124,47 @@ test("attachment skips history and reconnect recovers missed replies without dup
   await until(() => responses.length === 1);
   for (const stream of f.globalStreams) stream.end();
   f.reply("ses_one", "msg_gap", "Missed while disconnected");
-  await until(() => responses.length === 2);
+  await until(() => f.requests.filter((r) => r.path === "/api/event").length === 2);
   await f.adapter.followSession(f.input("ses_one", { onResponse: async (text) => responses.push(`updated ${text}`) }));
   f.reply("ses_one", "msg_two", "Two");
-  await until(() => responses.length === 3);
-  assert.deepEqual(responses, ["One", "Missed while disconnected", "updated Two"]);
+  await until(() => responses.length === 2);
+  assert.deepEqual(responses, ["One", "updated Two"]);
+  assert.equal(f.requests.some((r) => r.path.endsWith("/message")), false);
   assert.equal(f.requests.filter((r) => r.method === "PUT").length, 1);
 });
 
-test("reconnect paginates missed responses in order without combining cursor and order", async (t) => {
-  let recover = false;
-  const f = await fixture(t, { onRequest: ({ url, json }) => {
-    if (!recover || !url.pathname.endsWith("/message")) return;
-    if (url.searchParams.has("cursor")) {
-      assert.equal(url.searchParams.has("order"), false);
-      json({ data: [f.messages.get("msg_two"), f.messages.get("msg_one")], cursor: { next: null } });
-    } else json({ data: [f.messages.get("msg_three")], cursor: { next: "older-page" } });
-    return true;
-  } });
+test("two admissions before either completion forward each live message once", async (t) => {
+  const f = await fixture(t);
   const responses = [];
-  await f.adapter.followSession(f.input("ses_one", { onResponse: async (text) => responses.push(text) }));
-  f.reply("ses_one", "msg_one", "One");
-  await until(() => responses.length === 1);
-  for (const stream of f.globalStreams) stream.end();
-  f.reply("ses_one", "msg_two", "Two");
-  f.reply("ses_one", "msg_three", "Three");
-  recover = true;
-  await until(() => responses.length === 3);
-  assert.deepEqual(responses, ["One", "Two", "Three"]);
+  const onResponse = async (text, id) => responses.push([text, id]);
+  await f.adapter.execute(f.input("ses_one", { onResponse }));
+  await f.adapter.execute(f.input("ses_one", { onResponse }));
+  f.reply("ses_one", "msg_second", "Second");
+  f.reply("ses_one", "msg_first", "First");
+  f.reply("ses_one", "msg_first", "First");
+  await until(() => responses.length === 2);
+  await delay(10);
+  assert.deepEqual(responses, [["Second", "msg_second"], ["First", "msg_first"]]);
+  assert.equal(f.requests.filter((r) => r.path.endsWith("/prompt")).length, 2);
+});
+
+test("slow interaction lookup does not block another session's live response", async (t) => {
+  const reading = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const f = await fixture(t, { onRequest: async ({ url }) => {
+    if (url.pathname === "/api/session/ses_child") { reading.resolve(); await release.promise; }
+  } });
+  f.sessions.set("ses_child", { parentID: "ses_one" });
+  const responses = [];
+  await f.adapter.followSession(f.input("ses_one", { onInteraction: async () => ({ type: "cancelled" }) }));
+  await f.adapter.followSession(f.input("ses_two", { onResponse: async (text) => responses.push(text) }));
+  f.globalEvent("permission.asked", { id: "per_slow", sessionID: "ses_child", action: "bash", resources: ["pwd"] });
+  await reading.promise;
+  f.reply("ses_two", "msg_independent", "Independent reply");
+  try {
+    await until(() => responses.length === 1);
+    assert.deepEqual(responses, ["Independent reply"]);
+  } finally { release.resolve(); }
 });
 
 test("native active session lookup is allowed and failures stay session-local and sanitized", async (t) => {
@@ -167,7 +181,7 @@ test("native active session lookup is allowed and failures stay session-local an
   assert.doesNotMatch(errors[0].message, /secret-token/u);
 });
 
-test("reconnect does not resync a session moved outside the configured workspace", async (t) => {
+test("reconnect detaches a session moved outside the configured workspace", async (t) => {
   const f = await fixture(t);
   const responses = [], errors = [];
   await f.adapter.followSession(f.input("ses_one", { onResponse: async (text) => responses.push(text), onError: async (error) => errors.push(error) }));
@@ -176,24 +190,47 @@ test("reconnect does not resync a session moved outside the configured workspace
   f.reply("ses_one", "msg_outside", "Must not be forwarded");
   await until(() => errors.length === 1);
   assert.deepEqual(responses, []);
-  assert.match(errors[0].message, /session is unavailable/u);
+  assert.match(errors[0].message, /session responses are unavailable/u);
 });
 
-test("failed consumer delivery retries without duplicating delivered responses", async (t) => {
+test("failed consumer delivery is not replayed and later responses still deliver", async (t) => {
   const f = await fixture(t);
-  let attempts = 0;
   const delivered = [];
-  await f.adapter.followSession(f.input("ses_one", { onResponse: async (text) => {
-    if (++attempts === 1) throw new Error("Slack unavailable");
-    delivered.push(text);
-  } }));
-  f.reply("ses_one", "msg_retry", "Retry me");
-  await until(() => delivered.length === 1);
-  assert.equal(attempts, 2);
+  const errors = [];
+  const firstChunk = "a".repeat(3500);
+  const thread = { post: async ({ markdown }) => {
+    if (markdown === "last chunk") throw new Error("Slack unavailable");
+    delivered.push(markdown);
+  } };
+  await f.adapter.followSession(f.input("ses_one", {
+    onResponse: (text, _id, signal) => postResult(thread, { text }, signal),
+    onError: async (error) => errors.push(error),
+  }));
+  f.reply("ses_one", "msg_retry", `${firstChunk}\nlast chunk`);
+  await until(() => errors.length === 1);
+  f.reply("ses_one", "msg_retry", `${firstChunk}\nlast chunk`);
+  f.reply("ses_one", "msg_next", "Next response");
+  await until(() => delivered.length === 2);
   for (const stream of f.globalStreams) stream.end();
   await until(() => f.requests.filter((r) => r.path === "/api/event").length === 2);
   await delay(10);
-  assert.deepEqual(delivered, ["Retry me"]);
+  assert.deepEqual(delivered, [firstChunk, "Next response"]);
+  assert.equal(errors.length, 1);
+});
+
+test("a failed instruction update does not detach an existing background observer", async (t) => {
+  let fail = false;
+  const f = await fixture(t, { onRequest: ({ req, url, json }) => {
+    if (fail && req.method === "PUT" && url.pathname.includes("/instructions/entries/")) { json({}, 500); return true; }
+  } });
+  const responses = [];
+  const onResponse = async (text) => responses.push(text);
+  await f.adapter.followSession(f.input("ses_one", { onResponse }));
+  fail = true;
+  await assert.rejects(f.adapter.execute(f.input("ses_one", { instructions: "Changed context", onResponse })));
+  f.reply("ses_one", "msg_still_watched", "Still followed");
+  await until(() => responses.length === 1);
+  assert.deepEqual(responses, ["Still followed"]);
 });
 
 test("headless execution returns native text and detaches; explicit stop settles without idle", async (t) => {

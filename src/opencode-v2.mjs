@@ -262,7 +262,7 @@ export function createV2Adapter(options) {
     }
   }
 
-  // Native 2.2.5's experimental session log emits boundaries but no events; use live events and reconnect snapshots.
+  // Native 2.2.5's experimental session log emits no responses; forward live events only.
   function watchEvents() {
     if (events && !events.signal.aborted) return;
     events = new AbortController();
@@ -275,40 +275,47 @@ export function createV2Adapter(options) {
             if (event.type === "server.connected") {
               connected = true;
               for (const observer of observers.values()) {
-                queueResponse(observer, () => resyncResponses(observer));
+                queueResponse(observer, async () => {
+                  if (!await lookup(observer.sessionId, observer.workingDirectory, observer.controller.signal)) throw new Error("OpenCode session is unavailable.");
+                  observer.initialized.resolve();
+                }, true);
                 void reconcile(observer).catch(() => undefined);
               }
               continue;
             }
-            await Promise.allSettled([...observers.values()].map(async (observer) => {
-              if (event.location && path.resolve(event.location.directory ?? "") !== path.resolve(observer.workingDirectory)) return;
+            for (const observer of observers.values()) {
+              if (event.location && path.resolve(event.location.directory ?? "") !== path.resolve(observer.workingDirectory)) continue;
               if (event.data?.sessionID === observer.sessionId) {
                 if (event.type === "session.step.ended" && event.data.finish === "stop") queueResponse(observer, async () => {
-                  const message = await client.session.message.get({ sessionID: observer.sessionId, messageID: event.data.assistantMessageID }, { signal: observer.controller.signal });
+                  const message = await readWithRecovery((signal) => client.session.message.get({ sessionID: observer.sessionId, messageID: event.data.assistantMessageID }, { signal }), observer.controller.signal);
                   await deliverResponse(observer, message);
                 });
                 if (event.type === "session.execution.failed") queueResponse(observer, () => report(observer, executionError(event.data.error)));
                 if (event.type === "session.execution.interrupted") settleWaiters(observer, "");
                 if (event.type === "session.tool.called") void reconcile(observer).catch(() => undefined);
               }
-              if (event.type === "form.created") await dispatch(observer, "form", event.data.form);
-              if (event.type === "permission.asked") await dispatch(observer, "permission", event.data);
-              if (event.type === "permission.replied" && await belongs(observer, event.data.sessionID)) {
-                const key = `${event.data.sessionID}:${event.data.requestID}`;
-                if (!observer.replied.has(key)) {
-                  await observer.onPermissionReplied?.({ sessionId: event.data.sessionID, requestId: event.data.requestID, reply: event.data.reply });
-                  observer.replied.add(key);
+              if (!["form.created", "permission.asked", "form.replied", "form.cancelled", "permission.replied", "location.shutdown"].includes(event.type)) continue;
+              observer.interactionTask = (observer.interactionTask ?? Promise.resolve()).then(async () => {
+                if (observer.controller.signal.aborted) return;
+                if (event.type === "form.created") await dispatch(observer, "form", event.data.form);
+                if (event.type === "permission.asked") await dispatch(observer, "permission", event.data);
+                if (event.type === "permission.replied" && await belongs(observer, event.data.sessionID)) {
+                  const key = `${event.data.sessionID}:${event.data.requestID}`;
+                  if (!observer.replied.has(key)) {
+                    await observer.onPermissionReplied?.({ sessionId: event.data.sessionID, requestId: event.data.requestID, reply: event.data.reply });
+                    observer.replied.add(key);
+                  }
                 }
-              }
-              if (["form.replied", "form.cancelled", "permission.replied", "location.shutdown"].includes(event.type)) {
-                observer.interactionRevision++;
-                const kind = event.type.startsWith("form.") ? "form" : "permission";
-                const id = kind === "form" ? event.data.id : event.data.requestID;
-                const entry = observer.interactions.get(`${kind}:${event.data.sessionID}:${id}`);
-                if (entry && !entry.submitting) settle(entry);
-                await reconcile(observer);
-              }
-            }));
+                if (["form.replied", "form.cancelled", "permission.replied", "location.shutdown"].includes(event.type)) {
+                  observer.interactionRevision++;
+                  const kind = event.type.startsWith("form.") ? "form" : "permission";
+                  const id = kind === "form" ? event.data?.id : event.data?.requestID;
+                  const entry = observer.interactions.get(`${kind}:${event.data?.sessionID}:${id}`);
+                  if (entry && !entry.submitting) settle(entry);
+                  await reconcile(observer);
+                }
+              }).catch(() => { if (!observer.controller.signal.aborted) process.stderr.write("OpenCode interaction event failed.\n"); });
+            }
           }
         } catch { if (signal.aborted) return; }
         connected = false;
@@ -317,21 +324,22 @@ export function createV2Adapter(options) {
     })();
   }
 
-  function queueResponse(observer, operation) {
+  function queueResponse(observer, operation, fatal = false) {
     observer.task = (observer.task ?? Promise.resolve()).then(async () => {
       const signal = observer.controller.signal;
-      while (!signal.aborted) {
-        try { await operation(); return; }
-        catch (error) {
-          if ((error._tag || error.reason) && !retryable(error)) {
-            const safe = new Error("OpenCode session responses are unavailable.");
-            observer.initialized.reject(safe);
-            await report(observer, safe).catch(() => undefined);
-            detach(observer, safe);
-            return;
-          }
-          await delay(options.pollIntervalMs ?? 100, undefined, { signal }).catch(() => undefined);
+      if (signal.aborted) return;
+      try { await operation(); }
+      catch {
+        if (signal.aborted) return;
+        if (fatal) {
+          const safe = new Error("OpenCode session responses are unavailable.");
+          observer.initialized.reject(safe);
+          await report(observer, safe).catch(() => undefined);
+          detach(observer, safe);
+          return;
         }
+        const safe = new Error("OpenCode response could not be delivered; it will not be replayed.");
+        await report(observer, safe).catch(() => process.stderr.write("Pipa could not deliver an OpenCode response.\n"));
       }
     });
   }
@@ -341,49 +349,19 @@ export function createV2Adapter(options) {
     if (message.type !== "assistant" || message.finish !== "stop" || typeof message.time?.completed !== "number") return;
     if (!Array.isArray(message.content)) throw new Error("OpenCode returned an invalid assistant message.");
     const text = message.content.filter((part) => part.type === "text" && typeof part.text === "string").map((part) => part.text).join("\n").trim();
+    // A failed Slack post may have sent earlier chunks; never replay the whole response.
+    observer.delivered.add(message.id);
     if (text) {
       await observer.onResponse?.(text, message.id, observer.controller.signal);
     }
     settleWaiters(observer, text);
-    observer.delivered.add(message.id);
-  }
-
-  async function resyncResponses(observer) {
-    let session;
-    try { session = await lookup(observer.sessionId, observer.workingDirectory, observer.controller.signal); }
-    catch (error) { if (retryable(error)) throw error; }
-    if (!session) {
-      const error = new Error("OpenCode session is unavailable.");
-      observer.initialized.reject(error);
-      await report(observer, error);
-      detach(observer, error);
-      return;
-    }
-    const messages = [];
-    let cursor;
-    do {
-      const page = await client.message.list({ sessionID: observer.sessionId, limit: 100, ...(cursor ? { cursor } : { order: "desc" }) }, { signal: observer.controller.signal });
-      if (!Array.isArray(page.data)) throw new Error("OpenCode returned an invalid message projection.");
-      let found = false;
-      for (const message of page.data) {
-        if (observer.delivered.has(message.id)) { found = true; break; }
-        if (message.type === "assistant" && message.time?.completed !== undefined) messages.push(message);
-      }
-      cursor = found ? null : page.cursor?.next;
-    } while (cursor);
-    if (observer.synced) {
-      for (const message of messages.reverse()) await deliverResponse(observer, message);
-    } else {
-      for (const message of messages) observer.delivered.add(message.id);
-      observer.synced = true;
-      observer.initialized.resolve();
-    }
   }
 
   async function follow(input, persistent, waiter) {
     if (stopped) throw stopped;
     if (typeof input.sessionId !== "string" || !input.sessionId || typeof input.workingDirectory !== "string" || !input.workingDirectory) throw new Error("Invalid OpenCode session context.");
     let observer = observers.get(input.sessionId);
+    const created = !observer;
     if (!observer) {
       observer = { sessionId: input.sessionId, workingDirectory: input.workingDirectory, controller: new AbortController(), initialized: Promise.withResolvers(), delivered: new Set(), replied: new Set(), waiters: new Set(), handlers: new Set(), interactions: new Map(), interactionSessions: new Set([input.sessionId]), interactionRevision: 0, persistent };
       observers.set(input.sessionId, observer);
@@ -398,7 +376,7 @@ export function createV2Adapter(options) {
           await Promise.all(entries.filter((entry) => /^pipa-[a-f0-9]{16}-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u.test(entry.key)).map((entry) => client.session.instructions.entry.remove({ sessionID: input.sessionId, key: entry.key }, { signal })));
         } catch { signal.throwIfAborted(); /* Old context migration is best effort and session-local. */ }
         watchEvents();
-        if (connected) queueResponse(observer, () => resyncResponses(observer));
+        if (connected) observer.initialized.resolve();
         const timer = setTimeout(() => observer.initialized.reject(new Error("OpenCode event attachment timed out.")), options.connectionRecoveryTimeoutMs ?? 10_000);
         try { await observer.initialized.promise; } finally { clearTimeout(timer); }
       })();
@@ -421,7 +399,7 @@ export function createV2Adapter(options) {
         await reconcile(observer).catch(() => undefined);
       }
       return observer;
-    } catch (error) { detach(observer, error); throw error; }
+    } catch (error) { if (created) detach(observer, error); throw error; }
   }
 
   return {
@@ -498,7 +476,7 @@ export function createV2Adapter(options) {
     stopAll(reason = new Error("OpenCode bridge stopped.")) {
       stopped = reason;
       const current = [...observers.values()];
-      stopping = [...stopping, eventTask, ...current.flatMap((observer) => [observer.task, observer.registration, observer.contextUpdate, observer.reconciliation, ...observer.handlers])];
+      stopping = [...stopping, eventTask, ...current.flatMap((observer) => [observer.task, observer.interactionTask, observer.registration, observer.contextUpdate, observer.reconciliation, ...observer.handlers])];
       for (const controller of controllers) controller.abort(reason);
       for (const observer of current) detach(observer, reason);
       events?.abort(reason);

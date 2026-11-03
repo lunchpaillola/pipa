@@ -34,6 +34,12 @@ test("release catalog keeps native crash boundaries and separate unqualified mod
   }
   assert.ok(releaseCases.find((row) => row.id === "slack-editable-retry-controls")?.blocked);
   assert.match(releaseCases.find(row => row.id === "plugin-reload-contract").expected, /v1 full native-process restart/u);
+  for (const id of ["supersession-concurrency", "supersession-reaction-contract"]) {
+    const definition = releaseCases.find((row) => row.id === id);
+    assert.equal(definition.native, true, "Generation gating must be enforced by runCell");
+    assert.deepEqual(definition.generations, ["1"]);
+    assert.deepEqual(definition.modes, ["socket-owned", "attached"]);
+  }
   for (const id of ["models-switch", "models-variants", "models-default", "models-reset"]) {
     const definition = releaseCases.find((row) => row.id === id);
     assert.deepEqual(definition.generations, ["2"]);

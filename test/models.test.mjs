@@ -439,6 +439,7 @@ test("large interleaved catalogs are searched locally with bounded results and a
     assert.equal(results.length, 1);
     assert.equal(results[0].label, "Model 10000");
     assert.match(results[0].description, /provider-a/u);
+    assert.deepEqual((await handlers.options({ ...event, query: "model-10000" })).map((result) => result.label), ["Model 10000"]);
     assert.deepEqual(await handlers.options({ ...event, query: "not-a-model" }), []);
     for (const bad of [{ user: { userId: "U2" } }, { raw: { view: { id: "other" } } }, { actionId: "pipa_model_forged" }]) {
       assert.deepEqual(await handlers.options({ ...event, ...bad }), []);

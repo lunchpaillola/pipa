@@ -54,7 +54,7 @@ the actual connection's required contracts; other majors fail before intake.
 | --- | --- | --- |
 | Identity | Authenticated `/global/health` | Authenticated `/api/info` |
 | Workspace readiness | Configured directory and session status | Matching configured location and native readiness |
-| Prompts and sessions | Native prompt/system instructions | Stable input ID, scoped instruction journal, correlated terminal projections |
+| Prompts and sessions | Native prompt/system instructions | Stable input ID, stable `pipa.slack` session instruction entry, correlated terminal projections |
 | Questions and permissions | Existing native controls | Native question fields/permission decisions normalized into the same Slack controls |
 | Model discovery | Available through executor capability API | Connected providers, variants and native defaults |
 | Live model switching | Explicitly unsupported | Existing-session native switch; affects subsequent provider work |
@@ -231,10 +231,12 @@ or establish private operator/plugin compatibility.
   process for the measured 2.0.29 large-base64 boundary. Model context/media limits
   remain separate. Outgoing files retain 10-file/100 MB per-file/response limits;
   non-loopback attachments use text fallback for local artifacts.
-- V2 follows native session events beyond the first reply. On reconnect, it
-  reads missed responses from native history, stopping at a known message. A fresh Pipa process
-  attaches without reposting historical replies; it does not promise delivery
-  of messages completed while Pipa was offline.
+- V2 forwards live native session events beyond the first reply. Replies missed
+  during disconnects or restarts are not recovered, and no response history is
+  scanned. A fresh Pipa process restores conversation mappings and Slack
+  subscriptions, not background observers; a new message reattaches that thread.
+  Failed Slack response delivery is not replayed. Native message reads retain
+  bounded transport retries; later live responses are not blocked by a failed post.
 - Native 2.2.5's experimental session-log endpoint returned only `log.synced`
   during both live observation and replay in the isolated probe. Pipa therefore
   uses the working native event stream, not that endpoint.
