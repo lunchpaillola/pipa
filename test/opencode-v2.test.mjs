@@ -393,6 +393,33 @@ test("simple forms use field shapes rather than a closed list of metadata kinds 
   }
 });
 
+test("native form validation rejection allows correcting the same pending form", async (t) => {
+  let attempts = 0;
+  const f = await fixture(t, { onRequest: ({ req, url, json }) => {
+    if (req.method === "POST" && url.pathname.endsWith("/frm_validated/reply") && ++attempts === 1) {
+      json({ _tag: "FormInvalidAnswerError", id: "frm_validated", message: "Enter a valid email." }, 400);
+      return true;
+    }
+  } });
+  const interactions = [];
+  f.forms.push({ id: "frm_validated", sessionID: "ses_one", title: "Contact", fields: [
+    { key: "email", type: "string", format: "email", required: true },
+  ] });
+  await f.adapter.followSession(f.input("ses_one", { onInteraction: async (interaction) => { interactions.push(interaction); return { type: "cancelled" }; } }));
+  await until(() => interactions.length === 1);
+  const interaction = interactions[0];
+  assert.equal(interaction.type, "question");
+  await assert.rejects(interaction.submit({ type: "answer", answers: [["not an email"]] }), { _tag: "FormInvalidAnswerError" });
+  assert.equal(f.forms.length, 1, "native rejection must leave the form pending");
+  await interaction.submit({ type: "answer", answers: [["person@example.com"]] });
+  assert.equal(attempts, 2);
+  assert.deepEqual(f.requests.filter((request) => request.path.endsWith("/frm_validated/reply")).map((request) => request.body), [
+    { answer: { email: "not an email" } }, { answer: { email: "person@example.com" } },
+  ]);
+  assert.equal(f.forms.length, 0);
+  assert.equal(interactions.length, 1, "correction must reuse the existing interaction");
+});
+
 test("richer or partially supported forms still require a native client", async (t) => {
   for (const field of [
     { type: "number" }, { type: "integer" }, { type: "boolean" }, { type: "external", url: "https://example.com/connect" },

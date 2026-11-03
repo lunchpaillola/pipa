@@ -10,7 +10,7 @@ import { createPipaSlackAdapter, startPipa } from "../src/app.mjs";
 import { createModelPicker } from "../src/models.mjs";
 import { createModelSetting, createSessionStore, loadConfig, pipaPaths, writePrivateJson } from "../src/state.mjs";
 
-test("model search acknowledgments fit Slack's 20 KiB Socket Mode frame limit", async (t) => {
+test("model search acknowledgments stay within the live-tested 12 KiB payload budget", async (t) => {
   const adapter = createPipaSlackAdapter({ signingSecret: "test", botToken: "xoxb-test", botUserId: "UPIPA", userName: "Piper" });
   const chat = new Chat({ adapters: { slack: adapter }, state: createMemoryState(), userName: "Piper", logger: "silent" });
   let view;
@@ -26,15 +26,18 @@ test("model search acknowledgments fit Slack's 20 KiB Socket Mode frame limit", 
   await Promise.all(waiting);
   const responses = [];
   const sizes = [];
+  const payloadSizes = [];
   const actionId = view.blocks[0].element.action_id;
   for (const query of ["", "model-149"]) {
     await adapter.routeSocketEvent({ type: "block_suggestion", action_id: actionId, value: query, user: { id: "U1" }, view: { id: "V1" } }, "interactive", async (payload) => {
       const frame = JSON.stringify({ envelope_id: "00000000-0000-0000-0000-000000000000", payload });
       sizes.push(Buffer.byteLength(frame));
+      payloadSizes.push(Buffer.byteLength(JSON.stringify(payload)));
       responses.push(payload.options);
     });
   }
-  assert.ok(sizes.every((bytes) => bytes <= 20 * 1024), `oversized search replies disconnect Slack and break Save: ${sizes}`);
+  assert.ok(payloadSizes.every((bytes) => bytes <= 12 * 1024), `larger search replies stall Slack delivery and break Save: ${payloadSizes}`);
+  assert.ok(sizes.every((bytes) => bytes <= 13 * 1024), `search envelopes exceed the reserved 1 KiB: ${sizes}`);
   assert.ok(responses[0].length > 0 && responses[0].length < 100);
   assert.equal(responses[1].length, 1, "models omitted by the byte limit remain searchable");
 });

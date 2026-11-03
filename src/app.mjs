@@ -364,8 +364,8 @@ export function createPipaSlackAdapter(options, drainTimeoutMs = 3_000) {
     const task = (async () => {
       try {
         await route(body, eventType, async (response) => {
-          // Slack closes sockets above 20 KiB; leave 1 KiB for the envelope.
-          while (response?.options?.length && Buffer.byteLength(JSON.stringify(response)) > 19 * 1024) response.options.pop();
+          // shortcut: 19 KiB stalls live Slack; keep 12 KiB until larger replies pass live trials.
+          while (response?.options?.length && Buffer.byteLength(JSON.stringify(response)) > 12 * 1024) response.options.pop();
           await ack(response);
         }, options, retryNum);
       } catch {
