@@ -59,8 +59,17 @@ and all 26 `scripts/verification/self-check.mjs` tests. The beta publish dry-run
 contained only the expected 12 files: the CLI, runtime sources, README, license
 and package metadata. No profile data or credentials were included.
 
-The historical native/live results above have not been rerun for 0.6.3 and do
-not qualify its new form handling. No production installation was changed.
+On candidate `1f22e92`, [unit/package CI passed on Linux, macOS and Windows](https://github.com/lunchpaillola/pipa/actions/runs/41729270963).
+The [native beta smoke](https://github.com/lunchpaillola/pipa/actions/runs/41729271447)
+passed on Linux and macOS. Windows failed the OpenCode 1.19.0 Socket-owned restart
+case because fixture cleanup was not confirmed; its private root was retained.
+The other 23 Windows journey observations passed, including all 2.2.5 cases.
+This failure is unresolved, not waived by the passing unit/package CI.
+
+These native checks do not exercise the new Slack form UI. Historical live
+Slack results above have not been rerun for 0.6.3. CodeRabbit's automated review
+of the preparation PR was rate-limited, not approved. No production installation
+was changed; full release qualification remains false.
 
 Once published, install this exact beta with:
 
