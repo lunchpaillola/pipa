@@ -80,6 +80,72 @@ test("a delayed model read cannot let an older message supersede a newer one", a
   assert.deepEqual(posts.at(-1), { markdown: "newer" });
 });
 
+test("v2 forwards background replies after admission without another Slack message", async (t) => {
+  const handlers = {};
+  const posts = [];
+  let submitted;
+  const config = { botName: "Pipa", workingDirectory: "/work", slackBotToken: "xoxb-test", slackAppToken: "xapp-test", allowedSlackChannelIds: ["C1"] };
+  const app = await startPipa({ config, checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    executor: { capabilities: { backgroundResponses: true }, runTurn: async (input) => { submitted = input; await input.onSession("ses_background"); return { sessionId: "ses_background", pending: true }; }, stopAll() {} },
+    chat: { onNewMention: (fn) => { handlers.mention = fn; }, onSubscribedMessage() {}, initialize: async () => undefined, shutdown: async () => undefined } });
+  t.after(() => app.shutdown());
+  const thread = { id: "slack:C1:1.0", channel: { isDM: false }, subscribe: async () => undefined,
+    adapter: { addReaction: async () => undefined, removeReaction: async () => undefined }, post: async (payload) => posts.push(payload) };
+  await handlers.mention(thread, { id: "1.0", text: "render", author: { userId: "U1" }, raw: {} });
+  await waitFor(() => submitted);
+  assert.equal(typeof submitted.onResponse, "function");
+  await submitted.onResponse({ sessionId: "ses_background", text: "Rendering; I will verify it." }, new AbortController().signal);
+  await submitted.onResponse({ sessionId: "ses_background", text: "Render verified." }, new AbortController().signal);
+  assert.deepEqual(posts, [{ markdown: "Rendering; I will verify it." }, { markdown: "Render verified." }]);
+  config.allowedSlackChannelIds = ["C2"];
+  await submitted.onResponse({ sessionId: "ses_background", text: "No longer allowed." }, new AbortController().signal);
+  assert.equal(posts.length, 2);
+  app.stop();
+  await submitted.onResponse({ sessionId: "ses_background", text: "Stopped." }, new AbortController().signal);
+  assert.equal(posts.length, 2);
+});
+
+test("v2 resumes session following for restored Slack threads", async (t) => {
+  const watched = [];
+  const posts = [];
+  const thread = { id: "slack:C1:1.0", subscribe: async () => undefined, post: async (payload) => posts.push(payload) };
+  const app = await startPipa({ config: { botName: "Pipa", workingDirectory: "/work", slackBotToken: "xoxb-test", slackAppToken: "xapp-test" }, checkSlackToken: async () => ({ ok: true }),
+    sessionStore: { keys: () => [thread.id], get: () => "ses_restored" },
+    executor: { capabilities: { backgroundResponses: true }, followSession: async (input) => watched.push(input), stopAll() {} },
+    chat: { thread: () => thread, onNewMention() {}, onSubscribedMessage() {}, initialize: async () => undefined, shutdown: async () => undefined } });
+  t.after(() => app.shutdown());
+  assert.equal(watched.length, 1);
+  assert.equal(watched[0].sessionId, "ses_restored");
+  await watched[0].onResponse({ sessionId: "ses_restored", text: "Background work finished." }, new AbortController().signal);
+  assert.deepEqual(posts, [{ markdown: "Background work finished." }]);
+});
+
+test("native steering serializes admission without cancelling OpenCode execution", async () => {
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const calls = [];
+  let firstSignal;
+  const runner = createConversationRunner({ interruptPrevious: () => false,
+    sessionStore: { get: () => null, set: async () => undefined },
+    abortTurn: async () => assert.fail("Steering must not interrupt native work"),
+    runTurn: async ({ prompt, signal, onSession, sessionId }) => {
+      calls.push({ prompt, sessionId });
+      if (prompt === "render") { firstSignal = signal; entered.resolve(); await release.promise; await onSession("ses_native"); }
+      return { pending: true, sessionId: "ses_native" };
+    } });
+  const first = runner.enqueue("slack:C1:1.0", { prompt: "render" });
+  await entered.promise;
+  const second = runner.enqueue("slack:C1:1.0", { prompt: "use the other thumbnail" });
+  const third = runner.enqueue("slack:C1:1.0", { prompt: "and keep the captions" });
+  assert.equal(firstSignal.aborted, false);
+  release.resolve();
+  await Promise.all([first, second, third]);
+  assert.deepEqual(calls, [{ prompt: "render", sessionId: null }, { prompt: "use the other thumbnail", sessionId: "ses_native" }, { prompt: "and keep the captions", sessionId: "ses_native" }]);
+  runner.close();
+  await runner.drain();
+});
+
 test("init validates dependencies before replacing config", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-init-"));
   const paths = pipaPaths(home);

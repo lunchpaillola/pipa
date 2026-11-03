@@ -231,20 +231,26 @@ or establish private operator/plugin compatibility.
   process for the measured 2.0.29 large-base64 boundary. Model context/media limits
   remain separate. Outgoing files retain 10-file/100 MB per-file/response limits;
   non-loopback attachments use text fallback for local artifacts.
-- Native event reconciliation is not durable replay. Foreign prompt writers in
-  an active Pipa session cause an attribution conflict. Restore connectivity and
-  resolve ownership conflicts rather than replaying prompts automatically.
-  Background-shell completion notifications are part of the Pipa turn when their
-  shell ID matches a shell tool launched in that turn, not a competing writer.
-- V2 request deadlines include response-body consumption, including compressed
-  large-attachment admission replies. A timed-out reply triggers authoritative
-  admission reconciliation, not prompt replay; healthy long-running turns still
-  have no overall execution deadline.
-- A v2 root tool permission rejection may terminate without a native idle message.
-  Pipa settles it only after the rejection acknowledgement is durably confirmed,
-  the exact owned assistant/tool are aborted, pending permissions are absent and
-  native execution is inactive. Lost acknowledgements or failed journal writes
-  fail closed and retain uncertain recovery state; inactivity alone is not success.
+- V2 follows native session events beyond the first reply. On reconnect, it
+  reads missed responses from native history, stopping at a known message. A fresh Pipa process
+  attaches without reposting historical replies; it does not promise delivery
+  of messages completed while Pipa was offline.
+- Native 2.2.5's experimental session-log endpoint returned only `log.synced`
+  during both live observation and replay in the isolated probe. Pipa therefore
+  uses the working native event stream, not that endpoint.
+- Background shell notices, restart notices and other native input do not cause
+  Pipa attribution conflicts. New Slack messages use native steering rather than
+  interrupting and replacing the OpenCode execution.
+- Slack context is a stable native session instruction entry. The v2 adapter no
+  longer creates per-turn temporary instruction entries or uses a recovery journal.
+  Old journal files are left untouched and do not gate startup or other threads.
+- Stopping Pipa detaches v2 observers and drains callbacks. An attached OpenCode
+  server can continue its native work; stopping an owned server still stops that process.
+- Ordinary HTTP requests remain bounded, but native event streams have no
+  response-body execution deadline. Pipa sends each prompt through native admission;
+  it does not independently reconstruct whether OpenCode executed it.
+- Native permission rejection and question cancellation use their native replies;
+  they do not require a journaled proof or a subsequent idle projection.
 - Routine restart skips missed schedules; saved explicit run requests survive.
   A crash after side effects/delivery but before saving completion can repeat
   work. There is no new exactly-once promise.

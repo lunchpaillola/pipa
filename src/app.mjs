@@ -73,7 +73,6 @@ export async function startPipa(options = {}) {
       artifactRoot: path.join(config.workingDirectory, ".pipa", "artifacts"),
       baseUrl: server.baseUrl,
       connection: server.connection,
-      recoveryFile: paths.openCodeRecovery,
       onFatal: server.fail,
     });
     await executor.ready?.(config.workingDirectory);
@@ -83,7 +82,8 @@ export async function startPipa(options = {}) {
     await withTimeout(server?.wait(), options.shutdownTimeoutMs ?? 15_000, "OpenCode shutdown timed out.").catch(() => undefined);
     throw error;
   }
-  const runner = createConversationRunner({ sessionStore, abortTurn: executor.abortTurn, runTurn: async (input) => {
+  const runner = createConversationRunner({ sessionStore, abortTurn: executor.abortTurn,
+    interruptPrevious: () => !executor.capabilities?.backgroundResponses, runTurn: async (input) => {
     const currentConfig = await loadCurrentConfig();
     return executor.runTurn({ ...input, ...(currentConfig.defaultModel ? { defaultModel: currentConfig.defaultModel } : {}) });
   } });
@@ -186,6 +186,33 @@ export async function startPipa(options = {}) {
     for (const entry of pending) await finishReaction(entry.thread, entry.message, entry.message === currentMessage ? emoji : null);
   };
 
+  function followCallbacks(thread, message) {
+    const allowed = async (signal) => {
+      if (!accepting || signal?.aborted) return false;
+      const current = await loadCurrentConfig();
+      const channelId = thread.id.split(":")[1];
+      if (current.allowedSlackChannelIds?.length && !current.allowedSlackChannelIds.includes(channelId)) return false;
+      return !message || isAuthorized(thread, message, current);
+    };
+    return {
+      onResponse: async (result, signal) => {
+        if (!await allowed(signal)) return;
+        await postResult(thread, result, signal);
+        if (message) await finishPendingReactions(thread.id, message, "white_check_mark");
+      },
+      onError: async (error, signal) => {
+        if (!await allowed(signal)) return;
+        await thread.post(`${config.botName} failed: ${safeError(error)}`);
+        if (message) await finishPendingReactions(thread.id, message, "warning");
+      },
+      onInteraction: (interaction) => interactions.onInteraction({ thread, authorize: async () => {
+        if (!await allowed(interaction.signal)) throw new Error("Slack destination is no longer allowed.");
+      }, loadAllowedUserIds: async () => (await loadCurrentConfig()).allowedSlackUserIds ?? [] }, interaction),
+      onPermissionReplied: interactions.onPermissionReplied,
+      onPermissionsReconciled: interactions.onPermissionsReconciled,
+    };
+  }
+
   const handle = async (thread, message, subscribe) => {
     if (!accepting || !isAuthorized(thread, message, config) || shouldIgnore(thread, message, config)) return;
     if (config.mentionOnly && !subscribe && !message.isMention) return;
@@ -217,6 +244,7 @@ export async function startPipa(options = {}) {
         onInteraction: (interaction) => interactions.onInteraction(interactionContext, interaction),
         onPermissionReplied: interactions.onPermissionReplied,
         onPermissionsReconciled: interactions.onPermissionsReconciled,
+        ...(executor.capabilities?.backgroundResponses ? followCallbacks(thread, message) : {}),
         startTyping: () => thread.startTyping("Working on it..."),
         deliver: (result, signal) => postResult(thread, result, signal),
         deliverFailure: (error) => thread.post(error instanceof PipaRestartingError
@@ -226,6 +254,7 @@ export async function startPipa(options = {}) {
           : `${config.botName} failed: ${safeError(error)}`),
       });
       if (result.superseded) return;
+      if (result.pending) return;
       await finishPendingReactions(thread.id, message, result.error instanceof PipaStoppedError ? null : result.error ? "warning" : "white_check_mark");
     } catch (error) {
       await finishPendingReactions(thread.id, message, "warning");
@@ -255,6 +284,16 @@ export async function startPipa(options = {}) {
     }
     await withTimeout(chat.initialize(), options.startupTimeoutMs, "Slack Socket Mode startup timed out.", options.signal);
     options.signal?.throwIfAborted();
+    if (executor.capabilities?.backgroundResponses) {
+      for (const conversationKey of sessionStore.keys()) {
+        const thread = chat.thread(conversationKey);
+        const [, channelId, threadTs] = conversationKey.split(":");
+        if (config.allowedSlackChannelIds?.length && !config.allowedSlackChannelIds.includes(channelId)) continue;
+        await executor.followSession({ sessionId: sessionStore.get(conversationKey), workingDirectory: config.workingDirectory,
+          contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack", PIPA_CURRENT_SLACK_CHANNEL_ID: channelId, PIPA_CURRENT_SLACK_THREAD_TS: threadTs },
+          ...followCallbacks(thread) }).catch(() => process.stderr.write("Pipa could not follow a restored OpenCode session.\n"));
+      }
+    }
     await routineScheduler?.start();
     options.signal?.throwIfAborted();
   } catch (error) {
@@ -294,6 +333,7 @@ export async function startPipa(options = {}) {
           await modelPicker.drain();
           await routineScheduler?.drain();
           await runner.drain();
+          await executor.drain?.();
           await chat.shutdown();
           server?.stop();
           await server?.wait();
@@ -693,7 +733,7 @@ function displayName(value) {
   return name ? name[0].toUpperCase() + name.slice(1) : "";
 }
 
-export function createConversationRunner({ sessionStore, runTurn, abortTurn = async () => undefined }) {
+export function createConversationRunner({ sessionStore, runTurn, abortTurn = async () => undefined, interruptPrevious = () => true }) {
   const latest = new Map();
   let closed = false;
   let closeReason;
@@ -704,7 +744,7 @@ export function createConversationRunner({ sessionStore, runTurn, abortTurn = as
     if (closed) return Promise.reject(closeReason);
     const previous = latest.get(conversationKey);
     const reason = new Error("Pipa replaced this turn with a newer message.");
-    previous?.controller.abort(reason);
+    if (interruptPrevious()) previous?.controller.abort(reason);
     const turn = {
       controller: new AbortController(),
       generation: (previous?.generation ?? 0) + 1,
@@ -721,7 +761,7 @@ export function createConversationRunner({ sessionStore, runTurn, abortTurn = as
 
   async function execute(conversationKey, current, previous, input, abortReason) {
     const { deliver, deliverFailure, startTyping, onSession, ...turn } = input;
-    const isLatest = () => latest.get(conversationKey)?.generation === current.generation;
+    const isLatest = () => !interruptPrevious() || latest.get(conversationKey)?.generation === current.generation;
     const stopped = async () => {
       const error = closeReason ?? current.controller.signal.reason;
       if (!deliverFailure) throw error;
@@ -731,7 +771,7 @@ export function createConversationRunner({ sessionStore, runTurn, abortTurn = as
     let result;
     try {
       if (previous) {
-        if (previous.sessionId) await Promise.resolve(abortTurn(previous.sessionId, abortReason)).catch(() => undefined);
+        if (previous.sessionId && interruptPrevious()) await Promise.resolve(abortTurn(previous.sessionId, abortReason)).catch(() => undefined);
         await previous.done.catch(() => undefined);
         current.sessionId = previous.sessionId ?? current.sessionId;
       }
@@ -765,7 +805,7 @@ export function createConversationRunner({ sessionStore, runTurn, abortTurn = as
     }
     if (!isLatest()) return { superseded: true };
     if (current.controller.signal.aborted) return stopped();
-    if (deliver) await deliver(result, current.controller.signal);
+    if (deliver && !result.pending) await deliver(result, current.controller.signal);
     if (!isLatest()) return { superseded: true };
     if (current.controller.signal.aborted) return stopped();
     return result;

@@ -518,10 +518,7 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
   assert.match(promptBody.system, /PIPA_MESSAGE_CHANNEL=slack/u);
   assert.match(promptBody.system, /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
   assert.match(promptBody.system, /consult `pipa routine --help`/u);
-  assert.match(promptBody.system, /run `pipa restart --channel C1 --thread 123\.456`/u);
-  assert.match(promptBody.system, /existing messaging authorization is sufficient/u);
-  assert.match(promptBody.system, /pipa restart --status/u);
-  assert.match(promptBody.system, /ensure PIPA_HOME/u);
+  assert.doesNotMatch(promptBody.system, /When asked to restart|instance\/dispose/u);
   assert.match(promptBody.system, /IANA timezone/u);
   assert.match(promptBody.system, /preview first/u);
   assert.match(promptBody.system, /create only after user confirmation/u);
@@ -1445,8 +1442,7 @@ test("short Slack answers stay inline and remote attached servers get no local a
     response: async (body) => { remoteSystem = body.system; return 'Summary.\nPIPA_ARTIFACTS: ["private.pdf"]'; },
   });
   assert.match(remoteSystem, /For deeper work or larger deliverables/u);
-  assert.match(remoteSystem, /Both commands must run on the Pipa host, not a remote attached OpenCode host/u);
-  assert.match(remoteSystem, /If you lack command access to the Pipa host, explain that limitation/u);
+  assert.doesNotMatch(remoteSystem, /When asked to restart|instance\/dispose/u);
   assert.doesNotMatch(remoteSystem, /PIPA_ARTIFACTS|artifact director|pipa-artifacts-/u);
   assert.deepEqual(remote, { text: "Summary.", sessionId: "ses_1" });
 

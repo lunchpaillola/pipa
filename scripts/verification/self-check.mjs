@@ -289,7 +289,7 @@ test("required deterministic defects, missing cases/cells, diagnostics and empty
   for (const engine of PINS) for (const mode of MODES) for (const status of ["FAIL", "BLOCKED", "NOT_APPLICABLE"]) {
     const report = gateFixture();
     const cell = report.cells.find((cell) => cell.engine === engine && cell.mode === mode);
-    for (const id of ["exact-prompt-continuation", "crash-after-admission", "crash-during-approval", "crash-after-completion", ...(mode === "managed" ? ["managed-restart"] : ["socket-fixture-restart"]), ...(engine.startsWith("2.") ? ["crash-after-instruction-registration", "definitions-command", "models-default", "models-switch", "models-variants", "models-reset"] : [])]) {
+    for (const id of ["exact-prompt-continuation", "crash-after-admission", "crash-during-approval", "crash-after-completion", ...(mode === "managed" ? ["managed-restart"] : ["socket-fixture-restart"]), ...(engine.startsWith("2.") ? ["definitions-command", "models-default", "models-switch", "models-variants", "models-reset"] : [])]) {
       const row = cell.cases.find((row) => row.id === id);
       row.status = status;
       assert.equal(selectGate(report).exitCode, 1, `${engine} ${mode} ${id} ${status}`);
@@ -310,16 +310,15 @@ test("required deterministic defects, missing cases/cells, diagnostics and empty
   assert.equal(compatibilityExit([]), 1);
 });
 
-test("v2-only registration and native command gates preserve excluded v1 failure evidence", () => {
+test("v2-only native command gates preserve excluded v1 failure evidence", () => {
   const report = gateFixture();
   for (const cell of report.cells.filter(cell => cell.engine.startsWith("1."))) {
-    cell.cases.find(row => row.id === "crash-after-instruction-registration").status = "BLOCKED";
     cell.cases.find(row => row.id === "definitions-command").status = "FAIL";
   }
   const before = JSON.stringify(report);
   const selected = selectGate(report);
   assert.equal(selected.exitCode, 0);
-  for (const id of ["crash-after-instruction-registration", "definitions-command"]) {
+  for (const id of ["definitions-command"]) {
     assert.ok(selected.excluded.some(row => row.engine.startsWith("1.") && row.id === id && /outside applicable generations/u.test(row.reason)));
     assert.ok(selected.included.some(row => row.engine.startsWith("2.") && row.id === id));
   }
