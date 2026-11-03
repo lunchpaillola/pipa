@@ -152,8 +152,8 @@ export function createV2Adapter(options) {
     if (!observer.onInteraction || observer.interactions.has(key) || !await belongs(observer, request.sessionID)) return;
     if (observer.interactions.has(key) || signal.aborted || revision !== observer.interactionRevision) return;
     const fields = request.fields;
-    const question = kind === "form" && request.metadata?.kind === "question" && Array.isArray(fields) && fields.length
-      && fields.every((field, index) => field.key === `q${index}` && ["string", "multiselect"].includes(field.type) && !field.hidden && !field.when?.length);
+    const question = kind === "form" && Array.isArray(fields) && fields.length
+      && fields.every((field) => ["string", "multiselect"].includes(field.type) && !field.hidden && !field.when?.length);
     const type = kind === "permission" ? "permission" : question ? "question" : "form";
     let tool;
     if (kind === "permission" && request.source?.type === "tool") {

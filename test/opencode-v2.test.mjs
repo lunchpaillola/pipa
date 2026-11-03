@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { createV2Adapter } from "../src/opencode-v2.mjs";
-import { postResult } from "../src/app.mjs";
+import { createPendingInteractions, postResult } from "../src/app.mjs";
 
 async function fixture(t, options = {}) {
   const messages = new Map();
@@ -317,6 +317,125 @@ test("questions preserve options, multiselect and custom answers after admission
   assert.equal(interactions[0].request.questions[1].custom, true);
   await interactions[0].submit({ type: "answer", answers: [["Blue"], ["Red", "custom text"]] });
   assert.deepEqual(f.requests.find((r) => r.path.endsWith("/frm_choices/reply")).body, { answer: { q0: "blue_value", q1: ["red_value", "custom text"] } });
+});
+
+test("web-search setup and provider selection round-trip through Slack controls", async (t) => {
+  for (const choice of ["allow", "choose", "disable"]) {
+    const interactions = createPendingInteractions(["U1"]);
+    t.after(() => interactions.close());
+    const f = await fixture(t);
+    const posted = [];
+    const updated = [];
+    const deleted = [];
+    const thread = { id: "slack:C1:1.0", adapter: { webClient: { chat: {
+      postMessage: async (message) => { posted.push(message); return { ts: `${posted.length}.0` }; },
+      update: async (message) => updated.push(message),
+      delete: async (message) => deleted.push(message),
+    } } } };
+    await f.adapter.followSession(f.input("ses_one", { onInteraction: (interaction) => interactions.onInteraction({ thread }, interaction) }));
+    const form = { id: "frm_websearch", sessionID: "ses_one", title: "Web Search", metadata: { kind: "websearch.provider" }, fields: [{
+      key: "choice", description: "Allow OpenCode to search the web for up-to-date information?", type: "string", required: true, custom: false,
+      options: [
+        { value: "allow", label: "Allow search via Exa, Firecrawl, Parallel, Tavily, TinyFish" },
+        { value: "choose", label: "Choose another provider" },
+        { value: "disable", label: "Disable web search" },
+      ],
+    }] };
+    f.forms.push(form);
+    f.globalEvent("form.created", { form });
+    await until(() => posted.length === 1);
+    const answer = async (card, label) => {
+      assert.equal(card.channel, "C1");
+      assert.equal(card.thread_ts, "1.0");
+      assert.match(JSON.stringify(card), /Choose a provider|Allow OpenCode to search/u);
+      assert.doesNotMatch(JSON.stringify(card), /requires an OpenCode client|Custom answer/u);
+      const block = card.blocks.find((item) => item.elements?.[0]?.type === "radio_buttons");
+      const select = block.elements[0];
+      const submit = card.blocks.flatMap((item) => item.elements ?? []).find((item) => item.action_id?.startsWith("pipa_submit_"));
+      await interactions.onAction({ actionId: submit.action_id, value: submit.value, threadId: thread.id, user: { userId: "U1" },
+        raw: { state: { values: { [block.block_id]: { [select.action_id]: { type: "radio_buttons", selected_option: select.options.find((item) => item.text.text === label) } } } } },
+      });
+    };
+    assert.equal(f.requests.some((request) => request.path.endsWith("/frm_websearch/reply")), false);
+    await answer(posted[0], form.fields[0].options.find((option) => option.value === choice).label);
+    assert.deepEqual(f.requests.find((request) => request.path.endsWith("/frm_websearch/reply")).body, { answer: { choice } });
+    await until(() => updated.length === 1);
+    if (choice === "choose") {
+      const provider = { id: "frm_provider", sessionID: "ses_one", title: "Choose a web search provider", metadata: { kind: "websearch.provider" }, fields: [{
+        key: "provider", description: "Choose a provider for web search.", type: "string", required: true, custom: false,
+        options: [{ value: "exa", label: "Exa" }, { value: "tavily", label: "Tavily" }],
+      }] };
+      f.forms.push(provider);
+      f.globalEvent("form.created", { form: provider });
+      await until(() => posted.length === 2);
+      await answer(posted[1], "Tavily");
+      assert.deepEqual(f.requests.find((request) => request.path.endsWith("/frm_provider/reply")).body, { answer: { provider: "tavily" } });
+      await until(() => updated.length === 2);
+    }
+    assert.deepEqual(deleted, []);
+    assert.equal(f.requests.some((request) => request.path.endsWith("/interrupt") || request.method === "DELETE" && request.path.includes("/form/")), false);
+  }
+});
+
+test("simple forms use field shapes rather than a closed list of metadata kinds or keys", async (t) => {
+  for (const metadata of [undefined, { kind: "plugin.choice" }]) {
+    const f = await fixture(t);
+    const interactions = [];
+    f.forms.push({ id: "frm_plugin", sessionID: "ses_one", title: "Project", metadata, fields: [
+      { key: "project", type: "string", title: "Name", custom: true },
+      { key: "colors", type: "multiselect", title: "Colors", options: [{ label: "Blue", value: "blue" }] },
+    ] });
+    await f.adapter.followSession(f.input("ses_one", { onInteraction: async (interaction) => { interactions.push(interaction); return { type: "cancelled" }; } }));
+    await until(() => interactions.length === 1);
+    assert.equal(interactions[0].type, "question");
+    await interactions[0].submit({ type: "answer", answers: [["Pipa"], ["Blue"]] });
+    assert.deepEqual(f.requests.find((request) => request.path.endsWith("/frm_plugin/reply")).body, { answer: { project: "Pipa", colors: ["blue"] } });
+  }
+});
+
+test("native form validation rejection allows correcting the same pending form", async (t) => {
+  let attempts = 0;
+  const f = await fixture(t, { onRequest: ({ req, url, json }) => {
+    if (req.method === "POST" && url.pathname.endsWith("/frm_validated/reply") && ++attempts === 1) {
+      json({ _tag: "FormInvalidAnswerError", id: "frm_validated", message: "Enter a valid email." }, 400);
+      return true;
+    }
+  } });
+  const interactions = [];
+  f.forms.push({ id: "frm_validated", sessionID: "ses_one", title: "Contact", fields: [
+    { key: "email", type: "string", format: "email", required: true },
+  ] });
+  await f.adapter.followSession(f.input("ses_one", { onInteraction: async (interaction) => { interactions.push(interaction); return { type: "cancelled" }; } }));
+  await until(() => interactions.length === 1);
+  const interaction = interactions[0];
+  assert.equal(interaction.type, "question");
+  await assert.rejects(interaction.submit({ type: "answer", answers: [["not an email"]] }), { _tag: "FormInvalidAnswerError" });
+  assert.equal(f.forms.length, 1, "native rejection must leave the form pending");
+  await interaction.submit({ type: "answer", answers: [["person@example.com"]] });
+  assert.equal(attempts, 2);
+  assert.deepEqual(f.requests.filter((request) => request.path.endsWith("/frm_validated/reply")).map((request) => request.body), [
+    { answer: { email: "not an email" } }, { answer: { email: "person@example.com" } },
+  ]);
+  assert.equal(f.forms.length, 0);
+  assert.equal(interactions.length, 1, "correction must reuse the existing interaction");
+});
+
+test("richer or partially supported forms still require a native client", async (t) => {
+  for (const field of [
+    { type: "number" }, { type: "integer" }, { type: "boolean" }, { type: "external", url: "https://example.com/connect" },
+    { type: "string", hidden: true }, { type: "string", when: [{ key: "q0", op: "eq", value: "allow" }] },
+  ]) {
+    const f = await fixture(t);
+    const interactions = [];
+    f.forms.push({ id: "frm_rich", sessionID: "ses_one", title: "Setup", metadata: { kind: "question" }, fields: [
+      { key: "q0", type: "string", title: "Continue?" }, { key: "q1", ...field },
+    ] });
+    await f.adapter.followSession(f.input("ses_one", { onInteraction: async (interaction) => { interactions.push(interaction); return { type: "cancelled" }; } }));
+    await until(() => interactions.length === 1);
+    assert.equal(interactions[0].type, "form");
+    await assert.rejects(interactions[0].submit({ type: "answer", answers: [["allow"], ["anything"]] }), /requires an OpenCode client/u);
+    assert.equal(f.requests.some((request) => request.path.endsWith("/frm_rich/reply")), false);
+  }
 });
 
 test("child permissions, native settlement and reconnect reconciliation share one live source", async (t) => {
