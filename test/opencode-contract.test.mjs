@@ -160,6 +160,17 @@ async function fixture(t, generation = "v1", options = {}) {
       const responses = document.routes.find((route) => route.path.endsWith("/message")).responses;
       return Response.json({ data: (admitted ? responses.at(-1) : responses[0]).json.data.toReversed(), cursor: { next: null, previous: null } });
     }
+    if (generation === "v2" && parsed.pathname === "/api/session" && (init.method ?? "GET") === "GET"
+      && !document.routes.some((route) => route.path === parsed.pathname && route.method === "GET" && route.query?.parentID === parsed.searchParams.get("parentID"))) {
+      const children = document.routes.filter((route) => /^\/api\/session\/[^/]+$/u.test(route.path))
+        .map((route) => route.responses[0].json?.data).filter((session) => session?.parentID === parsed.searchParams.get("parentID"));
+      document.routes.push({ method: "GET", path: parsed.pathname, query: { parentID: parsed.searchParams.get("parentID") }, repeatLast: true,
+        responses: [{ json: { data: children, cursor: { next: null } } }] });
+    }
+    if (generation === "v2" && /^\/api\/session\/[^/]+\/(?:form|permission)$/u.test(parsed.pathname)
+      && !document.routes.some((route) => route.path === parsed.pathname)) {
+      document.routes.push({ method: "GET", path: parsed.pathname, repeatLast: true, responses: [{ json: { data: [] } }] });
+    }
     const result = await wire.fetch(url, init);
     if (generation === "v2" && parsed.pathname.endsWith("/prompt") && result.ok) {
       admitted = true;
@@ -332,7 +343,7 @@ for (const selection of ["empty-native-choice", "model-switch-history"]) test(`v
     const selected = { id: "msg_selected", type: "model-switched", model, time: { created: 1 } };
     for (const response of document.routes.find((route) => route.path.endsWith("/message")).responses) response.json.data.unshift(selected);
   }
-  await executor.runTurn({ ...input, defaultModel: { providerID: "installation", modelID: "default" } });
+  await executor.runTurn({ ...input, defaultModel: { providerID: "", modelID: "invalid-unused-default" } });
   assert.equal(wire.calls.filter((call) => call.path.endsWith("/model")).length, 0);
   assert.equal(wire.calls.filter((call) => call.path.endsWith("/prompt")).length, 1);
   wire.assertComplete();
@@ -344,7 +355,9 @@ for (const [label, error, providerID, expected] of [
   ["native auth", { type: "provider.auth", message: "private-message-secret" }, "connected", /selected provider authentication failed\. Reconnect that provider/u],
   ["HTTP 429", { type: "provider.rate-limit", status: 429, message: "private-message-secret" }, "connected", /selected provider failed \(HTTP 429\)/u],
   ["unsafe provider", { type: "provider.auth", status: 401, message: "private-message-secret" }, "connected\nprivate-provider-secret", /selected provider authentication failed \(HTTP 401\)/u],
-  ["unsafe type and misleading message", { type: "private-type-secret", status: 429, message: "HTTP 401 API key has expired private-message-secret" }, "connected", /selected provider failed \(HTTP 429\)/u],
+  ["unsafe type and misleading message", { type: "private-type-secret", status: 429, message: "HTTP 401 API key has expired private-message-secret" }, "connected", /OpenCode execution failed \(HTTP 429\)/u],
+  ["tool failure", { type: "tool.failure", message: "private-message-secret" }, "connected", /OpenCode execution failed\./u],
+  ["non-provider HTTP 401", { type: "tool.failure", status: 401, message: "private-message-secret" }, "connected", /OpenCode execution failed \(HTTP 401\)/u],
 ]) test(`v2 provider diagnostics: ${label} uses only safe native structured fields`, async (t) => {
   const { document, executor, input, wire, runtime } = await fixture(t, "v2");
   const timeline = document.routes.find((route) => route.path.endsWith("/message")).responses.at(-1).json.data;
@@ -355,7 +368,8 @@ for (const [label, error, providerID, expected] of [
   await assert.rejects(executor.runTurn(input), (failure) => {
     assert.match(failure.message, expected);
     assert.doesNotMatch(failure.message, /private-(?:message|response|provider|type)-secret/u);
-    if (error.status === 401 || error.type === "provider.auth") assert.match(failure.message, /choose another provider with your installation's model command, then start a new thread/u);
+    if (error.type === "provider.auth") assert.match(failure.message, /change this session's model in OpenCode, then retry in this thread/u);
+    if (!error.type.startsWith("provider.")) assert.doesNotMatch(failure.message, /provider|authentication/u);
     if (label !== "expired key") assert.doesNotMatch(failure.message, /expired/u);
     return true;
   });
@@ -428,7 +442,7 @@ for (const [error, expected] of [
   });
 });
 
-test("v2 models: provider-qualified discovery, native default reset and validation before mutation", async (t) => {
+test("v2 models: provider-qualified discovery, native explicit selection and moved-session default reset", async (t) => {
   const { runtime, document, wire, executor, input } = await fixture(t, "v2");
   const location = { directory: runtime.workspace };
   const model = { providerID: "connected", id: "shared", name: "Shared", enabled: true, variants: [{ id: "measured" }] };
@@ -443,7 +457,7 @@ test("v2 models: provider-qualified discovery, native default reset and validati
   assert.deepEqual(catalog, { models: ["connected", "other"].map((providerID) => ({ providerID, id: "shared", name: "Shared", variants: ["default", "measured"] })), defaultModel: { providerID: "connected", id: "shared", variant: "default" } });
   assert.deepEqual(await executor.listModels(runtime.workspace), ["connected", "other"].map((providerID) => ({ providerID, modelID: "shared", name: "Shared" })));
   const select = (model) => executor.switchModel({ sessionId: input.sessionId, model, workingDirectory: runtime.workspace });
-  for (const invalid of [{ providerID: "missing", id: "shared" }, { providerID: "connected", id: "disabled" }, { ...model, variant: "absent" }, { ...model, variant: "" }, undefined]) await assert.rejects(select(invalid), /unavailable|Invalid/u);
+  for (const invalid of [{ ...model, variant: "" }, undefined]) await assert.rejects(select(invalid), /Invalid/u);
   assert.equal(wire.calls.filter((call) => call.method === "POST" && call.path.endsWith("/model")).length, 0);
   await select({ providerID: "other", id: "shared", variant: "measured" });
   await select({ providerID: "connected", id: "shared" });
@@ -455,10 +469,27 @@ test("v2 models: provider-qualified discovery, native default reset and validati
   ]);
   const lookup = document.routes.find((route) => route.path === "/api/session/ses_contract");
   lookup.responses = [{ json: { data: { id: input.sessionId, location: { directory: path.dirname(runtime.workspace) } } } }];
-  await assert.rejects(select(null), /workspace/u);
-  assert.equal(wire.calls.filter((call) => call.method === "POST" && call.path.endsWith("/model")).length, 3);
+  await select({ providerID: "native-other-location", id: "not-in-starting-catalog" });
+  for (const pathname of ["/api/model", "/api/model/default"]) document.routes.push({ method: "GET", path: pathname,
+    query: { "location[directory]": path.dirname(runtime.workspace) }, repeatLast: true,
+    responses: [{ json: { location: { directory: path.dirname(runtime.workspace) }, data: pathname.endsWith("/default") ? model : [model] } }] });
+  await select(null);
+  assert.equal(wire.calls.filter((call) => call.method === "POST" && call.path.endsWith("/model")).length, 5);
   executor.stopAll();
   await assert.rejects(select(null), /shutting down/u);
+});
+
+test("v2 explicit selection preserves native rejection without a catalog preflight or retry", async (t) => {
+  let switches = 0;
+  const { executor, input, wire } = await fixture(t, "v2", { transport: async (url, init, nativeFetch) => {
+    if (new URL(url).pathname.endsWith("/model") && init.method === "POST") { switches++; return new Response(null, { status: 503 }); }
+    return nativeFetch(url, init);
+  } });
+  await assert.rejects(executor.switchModel({ ...input, model: { providerID: "native", id: "unavailable" } }),
+    (error) => error.reason === "UnexpectedStatus" && error.cause.status === 503);
+  assert.equal(wire.calls.some((call) => call.path === "/api/model"), false);
+  assert.equal(wire.calls.some((call) => call.path.endsWith("/prompt")), false);
+  assert.equal(switches, 1);
 });
 
 for (const cancellation of ["stop", "caller"]) test(`v2 models: discovery rejects after ${cancellation} cancellation at a fetch barrier`, async (t) => {
@@ -584,12 +615,11 @@ test("v2 native questions and child permissions expose acceptance without duplic
   const form = { id: "frm_contract", sessionID: "ses_contract", title: "Color", metadata: { kind: "question" }, fields: [{ key: "q0", type: "string", title: "Pick one", required: true, options: [{ value: "Blue", label: "Blue" }] }] };
   const permission = { id: "per_contract", sessionID: "ses_child", action: "bash", resources: ["pwd"] };
   for (const [route, json] of [
-    ["/api/form", { location: { directory: runtime.workspace }, data: [form] }],
-    ["/api/permission/request", { location: { directory: runtime.workspace }, data: [permission] }],
+    ["/api/session/ses_contract/form", { data: [form] }],
     ["/api/session/ses_child/permission", { data: [permission] }],
     ["/api/session/ses_contract/form/frm_contract", { data: { ...form, state: { status: "pending" } } }],
     ["/api/session/ses_child", { data: { id: "ses_child", parentID: "ses_contract", location: { directory: runtime.workspace } } }],
-  ]) document.routes.push({ method: "GET", path: route, ...(["/api/form", "/api/permission/request"].includes(route) ? { query: { "location[directory]": runtime.workspace } } : {}), repeatLast: true, responses: [{ json }] });
+  ]) document.routes.push({ method: "GET", path: route, repeatLast: true, responses: [{ json }] });
   const seen = [];
   await runTurnContract({ executor, input: { ...input, onInteraction: async (interaction) => {
     seen.push([interaction.type, interaction.sessionId]);
@@ -621,19 +651,22 @@ async function nativeInteractions(t, { forms = [], permissions = [], onReply, on
   // Keep the original completion event; discovery comes from native pending reads.
   document.routes.find((route) => route.path === "/api/event").responses[0].sse = document.routes.find((route) => route.path === "/api/event").responses[0].sse.split("\n\n").filter((frame) => frame.includes("evt_done")).join("\n\n") + "\n\n";
   for (const [route, json, query] of [
-    ["/api/form", { location: { directory: runtime.workspace }, data: pendingForms }, { "location[directory]": runtime.workspace }],
-    ["/api/permission/request", { location: { directory: runtime.workspace }, data: pendingPermissions }, { "location[directory]": runtime.workspace }],
     ["/api/session/ses_child", { data: { id: "ses_child", parentID: "ses_contract", location: { directory: runtime.workspace } } }],
     ["/api/session/ses_unrelated", { data: { id: "ses_unrelated", location: { directory: runtime.workspace } } }],
     ["/api/session/ses_child/message/msg_tool", { data: { id: "msg_tool", type: "assistant", time: { created: 2 }, content: [{ type: "tool", id: "call_native", name: "bash", time: { created: 2 }, state: { status: "running", input: { command: "pwd" }, metadata: {} } }] } }],
-    ["/api/session/ses_wrong_location", { data: { id: "ses_wrong_location", parentID: "ses_contract", location: { directory: path.dirname(runtime.workspace) } } }],
+    ["/api/session/ses_other_tree", { data: { id: "ses_other_tree", parentID: "ses_unrelated", location: { directory: path.dirname(runtime.workspace) } } }],
   ]) document.routes.push({ method: "GET", path: route, ...(query ? { query } : {}), repeatLast: true, responses: [{ json }] });
+  for (const sessionId of ["ses_contract", "ses_child", "ses_unrelated", "ses_other_tree"]) {
+    for (const [kind, pending] of [["form", pendingForms], ["permission", pendingPermissions]]) document.routes.push({
+      method: "GET", path: `/api/session/${sessionId}/${kind}`, repeatLast: true,
+      responses: [{ json: { get data() { return pending.filter((item) => item.sessionID === sessionId); } } }],
+    });
+  }
   for (const form of forms) {
     document.routes.push({ method: "GET", path: `/api/session/${form.sessionID}/form/${form.id}`, repeatLast: true, responses: [{ json: { data: { ...form, state: { status: "pending" } } } }] });
     document.routes.push({ method: "POST", path: `/api/session/${form.sessionID}/form/${form.id}/reply`, repeatLast: true, responses: [{ status: 204 }] });
     document.routes.push({ method: "DELETE", path: `/api/session/${form.sessionID}/form/${form.id}`, repeatLast: true, responses: [{ status: 204 }] });
   }
-  for (const id of new Set(permissions.map((item) => item.sessionID))) document.routes.push({ method: "GET", path: `/api/session/${id}/permission`, repeatLast: true, responses: [{ json: { data: pendingPermissions } }] });
   for (const permission of permissions) document.routes.push({ method: "POST", path: `/api/session/${permission.sessionID}/permission/${permission.id}/reply`, repeatLast: true, responses: [{ status: 204 }] });
   return { ...current, pendingForms, pendingPermissions, calls };
 }
@@ -1118,7 +1151,7 @@ for (const lost of ["accepted", "pending"]) test(`U3 v2 lost reply reconciles ${
 });
 
 test("U3 v2 richer forms stay native-only; external settlement releases notices, foreign children stay invisible", async (t) => {
-  const forms = [...nativeExamples.rich, ...["ses_unrelated", "ses_wrong_location"].map((sessionID, index) => ({ ...nativeExamples.question, sessionID, id: `frm_foreign_${index}` }))];
+  const forms = [...nativeExamples.rich, ...["ses_unrelated", "ses_other_tree"].map((sessionID, index) => ({ ...nativeExamples.question, sessionID, id: `frm_foreign_${index}` }))];
   const current = await nativeInteractions(t, { forms });
   const messages = current.document.routes.find((route) => route.path.endsWith("/message"));
   const completed = messages.responses.at(-1);

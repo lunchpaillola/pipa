@@ -558,9 +558,12 @@ test("new threads use the default while existing threads retain their model acro
   history.set(first.sessionId, [{ info: { id: "user", role: "user", model: a }, parts: [] }]);
   await run({ sessionId: first.sessionId, defaultModel: b });
   await run({ sessionId: first.sessionId });
+  await run({ sessionId: first.sessionId, defaultModel: { providerID: "", modelID: "invalid-unused" } });
+  await assert.rejects(run({ defaultModel: { providerID: "", modelID: "invalid-selected" } }), /Invalid model/u);
+  await assert.rejects(run({ defaultModel: false }), /Invalid model/u);
   await run({ sessionId: "ses_missing", defaultModel: b });
   await run({});
-  assert.deepEqual(prompts, [a, a, b, a, a, b, undefined]);
+  assert.deepEqual(prompts, [a, a, b, a, a, a, b, undefined]);
 });
 
 test("rejects an all-whitespace prompt before creating a session", async () => {

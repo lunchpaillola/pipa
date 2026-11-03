@@ -19,7 +19,7 @@ Setup, checks, contribution, release process: [`CONTRIBUTING.md`](CONTRIBUTING.m
 
 - Never expose Slack tokens through child environments, errors, logs, fixtures, or commits.
 - Never commit local Pipa state.
-- Configured working directory is trust boundary. Access-control changes require security review and regression tests.
+- For v2, the configured directory is a starting location, not session confinement. Follow native session identity and ancestry across moves; keep Slack authorization and artifact containment as integration boundaries. Access-control changes require security review and regression tests.
 - Preserve attachment cleanup and filename sanitization. Incoming files are limited to 10 MiB each; outgoing artifacts retain the 10-file/100 MB per-file and response limits.
 - Preserve artifact containment, symlink, identity, type, count, and aggregate-size checks.
 - Never expose local artifact paths to Slack.

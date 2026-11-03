@@ -47,6 +47,21 @@ test("model saves serialize, reload unrelated fields, and recover after failed p
   if (process.platform !== "win32") assert.equal((await stat(paths.config)).mode & 0o777, 0o600);
 });
 
+test("an invalid optional default does not block config authorization or repairing the selection", async (t) => {
+  const runtime = await createRuntimeFixture();
+  t.after(() => runtime.teardown());
+  const file = pipaPaths(runtime.home).config;
+  const config = { botName: "Pipa", workingDirectory: runtime.workspace, slackAppToken: "xapp-test", slackBotToken: "xoxb-test", allowedSlackUserIds: ["U1"], defaultModel: { providerID: "", modelID: "bad" } };
+  await writePrivateJson(file, config);
+  assert.deepEqual((await loadConfig(file)).allowedSlackUserIds, ["U1"]);
+  const setting = createModelSetting(file);
+  await assert.rejects(setting.save(config.defaultModel), /Invalid model/u);
+  await setting.save({ providerID: "native", modelID: "repaired" });
+  assert.deepEqual((await loadConfig(file)).defaultModel, { providerID: "native", modelID: "repaired" });
+  await writePrivateJson(file, { ...config, allowedSlackUserIds: "U1" });
+  await assert.rejects(loadConfig(file), /allowedSlackUserIds/u);
+});
+
 test("manifest preserves approved capabilities and substitutes the bot name", () => {
   const manifest = createManifest('Workshop "Bot"');
   assert.equal(manifest.display_information.name, 'Workshop "Bot"');

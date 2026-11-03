@@ -19,7 +19,7 @@ async function fixture(t, options = {}) {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks)) : undefined;
-    requests.push({ path: url.pathname, method: req.method, body, after: url.searchParams.get("after") });
+    requests.push({ path: url.pathname, method: req.method, body, after: url.searchParams.get("after"), parentID: url.searchParams.get("parentID"), cursor: url.searchParams.get("cursor") });
     const json = (data, status = 200) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(data)); };
     const sessionId = url.pathname.split("/")[3];
     if (await options.onRequest?.({ req, res, url, body, json })) return;
@@ -45,8 +45,15 @@ async function fixture(t, options = {}) {
     if (url.pathname.endsWith("/message")) return json({ data: [...messages.values()].filter((message) => message.sessionID === sessionId).reverse(), cursor: { next: null, previous: null } });
     if (url.pathname.endsWith("/prompt")) return json({ data: { id: body.id, sessionID: sessionId, time: { created: 1 }, type: "user", payload: { text: body.text }, delivery: "steer" } });
     if (url.pathname.endsWith("/interrupt")) return json({});
-    if (url.pathname === "/api/form") return json({ location: { directory: process.cwd() }, data: forms });
-    if (url.pathname === "/api/permission/request") return json({ location: { directory: process.cwd() }, data: permissions });
+    if (url.pathname === "/api/form") return json({ location: { directory: process.cwd() }, data: forms.filter((item) => !sessions.get(item.sessionID)?.location || sessions.get(item.sessionID).location.directory === process.cwd()) });
+    if (url.pathname === "/api/permission/request") return json({ location: { directory: process.cwd() }, data: permissions.filter((item) => !sessions.get(item.sessionID)?.location || sessions.get(item.sessionID).location.directory === process.cwd()) });
+    if (url.pathname === "/api/session") {
+      const children = [...sessions].filter(([, session]) => session.parentID === url.searchParams.get("parentID"));
+      const offset = Number(url.searchParams.get("cursor") ?? 0);
+      const pageSize = options.childPageSize ?? 100;
+      return json({ data: children.slice(offset, offset + pageSize).map(([id, session]) => ({ id, ...session })), cursor: { next: offset + pageSize < children.length ? String(offset + pageSize) : undefined } });
+    }
+    if (url.pathname.endsWith("/form")) return json({ data: forms.filter((item) => item.sessionID === sessionId) });
     if (url.pathname.endsWith("/permission")) return json({ data: permissions.filter((item) => item.sessionID === sessionId) });
     if (/\/permission\/[^/]+\/reply$/u.test(url.pathname)) {
       const id = url.pathname.split("/").at(-2);
@@ -115,6 +122,22 @@ test("unavailable response observation fails before admitting unobservable work"
   assert.equal(f.requests.some((request) => request.path.endsWith("/prompt")), false);
 });
 
+test("successful native admission is not vetoed by a changed prompt echo", async (t) => {
+  const f = await fixture(t, { onRequest: ({ url, body, json }) => {
+    if (!url.pathname.endsWith("/prompt")) return;
+    json({ data: { id: body.id, sessionID: "ses_one", time: { created: 1 }, type: "user", payload: { text: "native representation" }, delivery: "steer" } });
+    return true;
+  } });
+  const responses = [];
+  assert.deepEqual(await f.adapter.execute(f.input("ses_one", { onResponse: async (text) => responses.push(text) })), { pending: true });
+  f.reply("ses_one", "msg_admitted", "Native work completed");
+  await until(() => responses.length === 1);
+  assert.deepEqual(responses, ["Native work completed"]);
+  const admissions = f.requests.filter((request) => request.path.endsWith("/prompt"));
+  assert.equal(admissions.length, 1);
+  assert.equal(admissions[0].body.text, "exact prompt");
+});
+
 test("attachment and reconnect forward live replies without reading or replaying history", async (t) => {
   const f = await fixture(t);
   f.reply("ses_one", "msg_old", "Do not replay");
@@ -181,16 +204,36 @@ test("native active session lookup is allowed and failures stay session-local an
   assert.doesNotMatch(errors[0].message, /secret-token/u);
 });
 
-test("reconnect detaches a session moved outside the configured workspace", async (t) => {
+test("live moves, follow-ups and reconnect retain the original session and response deduplication", async (t) => {
   const f = await fixture(t);
   const responses = [], errors = [];
   await f.adapter.followSession(f.input("ses_one", { onResponse: async (text) => responses.push(text), onError: async (error) => errors.push(error) }));
-  f.sessions.set("ses_one", { location: { directory: "/outside" } });
+  f.sessions.set("ses_one", { location: { directory: "/outside/worktree" } });
+  f.messages.set("msg_moved", { id: "msg_moved", sessionID: "ses_one", type: "assistant", time: { completed: 2 }, content: [{ type: "text", text: "Moved reply" }], finish: "stop" });
+  f.globalEvent("session.step.ended", { sessionID: "ses_one", assistantMessageID: "msg_moved", finish: "stop" }, { directory: "/outside/worktree" });
+  await until(() => responses.length === 1);
+  await f.adapter.execute(f.input("ses_one", { workingDirectory: "/outside/worktree", onResponse: async (text) => responses.push(text) }));
   for (const stream of f.globalStreams) stream.end();
-  f.reply("ses_one", "msg_outside", "Must not be forwarded");
-  await until(() => errors.length === 1);
-  assert.deepEqual(responses, []);
-  assert.match(errors[0].message, /session responses are unavailable/u);
+  await until(() => f.requests.filter((r) => r.path === "/api/event").length === 2 && f.globalStreams.size === 1);
+  f.globalEvent("session.step.ended", { sessionID: "ses_one", assistantMessageID: "msg_moved", finish: "stop" }, { directory: "/outside/worktree" });
+  f.reply("ses_other", "msg_unrelated", "Unrelated reply");
+  f.reply("ses_one", "msg_outside", "Reconnected reply");
+  await until(() => responses.length === 2);
+  assert.deepEqual(responses, ["Moved reply", "Reconnected reply"]);
+  assert.deepEqual(errors, []);
+  assert.equal(f.requests.filter((r) => r.path.endsWith("/prompt")).every((r) => r.path === "/api/session/ses_one/prompt"), true);
+});
+
+test("sessions moved before attachment resolve and continue without replacement", async (t) => {
+  const f = await fixture(t);
+  f.sessions.set("ses_one", { location: { directory: "/outside/worktree" } });
+  assert.deepEqual(await f.adapter.resolveSession("ses_one", process.cwd(), new AbortController()), { sessionId: "ses_one", defaultEligible: false });
+  const responses = [];
+  await f.adapter.execute(f.input("ses_one", { onResponse: async (text) => responses.push(text) }));
+  f.reply("ses_one", "msg_attached", "Same session");
+  await until(() => responses.length === 1);
+  assert.deepEqual(responses, ["Same session"]);
+  assert.equal(f.requests.some((r) => r.method === "POST" && r.path === "/api/session"), false);
 });
 
 test("failed consumer delivery is not replayed and later responses still deliver", async (t) => {
@@ -452,25 +495,113 @@ test("child permissions, native settlement and reconnect reconciliation share on
   }));
   await f.adapter.followSession(f.input("ses_two", { onInteraction: async () => ({ type: "cancelled" }) }));
   const permission = { id: "per_child", sessionID: "ses_child", action: "bash", resources: ["pwd"] };
-  f.permissions.push(permission, { ...permission, id: "per_outside", sessionID: "ses_outside" });
-  f.globalEvent("permission.asked", f.permissions[1]);
+  f.permissions.push(permission, { ...permission, id: "per_outside", sessionID: "ses_outside" }, { ...permission, id: "per_unrelated", sessionID: "ses_two" });
+  f.globalEvent("permission.asked", f.permissions[1], { directory: "/outside" });
   f.globalEvent("permission.asked", permission);
-  await until(() => interactions.length === 1);
-  assert.equal(interactions[0].sessionId, "ses_child");
-  await interactions[0].submit({ type: "reply", reply: "always" });
+  f.globalEvent("permission.asked", f.permissions[2]);
+  await until(() => interactions.length === 2);
+  assert.deepEqual(new Set(interactions.map((item) => item.sessionId)), new Set(["ses_child", "ses_outside"]));
+  await interactions.find((item) => item.sessionId === "ses_child").submit({ type: "reply", reply: "always" });
   await until(() => replies.length === 1);
   assert.deepEqual(replies[0], { sessionId: "ses_child", requestId: "per_child", reply: "always" });
   assert.equal(f.requests.filter((r) => r.path === "/api/event").length, 1);
   const pending = { ...permission, id: "per_reconnect" };
   f.permissions.push(pending);
   for (const stream of f.globalStreams) stream.end();
-  await until(() => interactions.length === 2);
-  const external = interactions[1];
+  await until(() => interactions.length === 3);
+  const external = interactions.find((item) => item.request.id === pending.id);
   f.permissions.splice(f.permissions.findIndex((item) => item.id === pending.id), 1);
   f.globalEvent("permission.replied", { sessionID: "ses_child", requestID: pending.id, reply: "once" });
   await external.settled;
   await assert.rejects(external.submit({ type: "reply", reply: "once" }), /already settled/u);
   await until(() => snapshots.some((snapshot) => snapshot.sessionId === "ses_child" && snapshot.requestIds.size === 0));
+});
+
+test("attachment and reconnect discover pending requests in paginated independently moved descendants", async (t) => {
+  const f = await fixture(t, { childPageSize: 1 });
+  f.sessions.set("ses_one", { location: { directory: "/outside/root" } });
+  f.sessions.set("ses_child", { parentID: "ses_one", location: { directory: "/outside/child" } });
+  f.sessions.set("ses_second", { parentID: "ses_one", location: { directory: "/outside/second" } });
+  f.sessions.set("ses_grandchild", { parentID: "ses_second", location: { directory: "/outside/grandchild" } });
+  f.sessions.set("ses_unrelated", { location: { directory: "/outside/grandchild" } });
+  const form = (sessionID) => ({ id: `frm_${sessionID}`, sessionID, title: "Continue?", fields: [{ key: "answer", type: "string" }] });
+  const permission = (sessionID) => ({ id: `per_${sessionID}`, sessionID, action: "bash", resources: ["pwd"] });
+  f.forms.push(form("ses_one"), form("ses_grandchild"), form("ses_unrelated"));
+  f.permissions.push(permission("ses_child"), permission("ses_second"), permission("ses_unrelated"));
+  const interactions = [];
+  await f.adapter.followSession(f.input("ses_one", { onInteraction: async (item) => { interactions.push(item); return { type: "cancelled" }; } }));
+  await until(() => interactions.length === 4);
+  assert.deepEqual(new Set(interactions.map((item) => item.request.id)), new Set(["frm_ses_one", "frm_ses_grandchild", "per_ses_child", "per_ses_second"]));
+  assert.ok(f.requests.some((r) => r.path === "/api/session" && r.parentID === "ses_one" && r.cursor === "1"));
+  f.sessions.set("ses_new", { parentID: "ses_grandchild", location: { directory: "/outside/new" } });
+  f.forms.push(form("ses_new"));
+  for (const stream of f.globalStreams) stream.end();
+  await until(() => interactions.length === 5);
+  assert.equal(interactions[4].sessionId, "ses_new");
+  assert.equal(f.requests.some((r) => r.path === "/api/session/ses_unrelated/form" || r.path === "/api/session/ses_unrelated/permission"), false);
+  assert.equal(f.requests.some((r) => r.path === "/api/form" || r.path === "/api/permission/request"), false);
+});
+
+test("native child creation and location changes refresh pending controls without reconnect", async (t) => {
+  const f = await fixture(t);
+  const interactions = [];
+  await f.adapter.followSession(f.input("ses_one", { onInteraction: async (item) => { interactions.push(item); return { type: "cancelled" }; } }));
+  f.sessions.set("ses_child", { parentID: "ses_one", location: { directory: "/outside/child" } });
+  f.permissions.push({ id: "per_created", sessionID: "ses_child", action: "bash", resources: ["pwd"] });
+  f.globalEvent("session.created", { sessionID: "ses_child", parentID: "ses_one", location: { directory: "/outside/child" } }, { directory: "/outside/child" });
+  await until(() => interactions.length === 1);
+  f.forms.push({ id: "frm_moved", sessionID: "ses_child", title: "Continue?", fields: [{ key: "answer", type: "string" }] });
+  f.sessions.set("ses_child", { parentID: "ses_one", location: { directory: "/outside/moved" } });
+  f.globalEvent("session.moved", { sessionID: "ses_child", location: { directory: "/outside/moved" }, projectID: "proj_native" }, { directory: "/outside/moved" });
+  await until(() => interactions.length === 2);
+  assert.deepEqual(interactions.map((item) => item.request.id), ["per_created", "frm_moved"]);
+});
+
+test("failed descendant snapshots do not falsely settle existing pending controls", async (t) => {
+  let fail = false;
+  const f = await fixture(t, { onRequest: ({ url, json }) => {
+    if (fail && url.pathname === "/api/session/ses_child/form") { json({}, 500); return true; }
+  } });
+  f.sessions.set("ses_child", { parentID: "ses_one", location: { directory: "/outside/child" } });
+  f.permissions.push({ id: "per_pending", sessionID: "ses_one", action: "bash", resources: ["pwd"] });
+  const interactions = [];
+  const snapshots = [];
+  await f.adapter.followSession(f.input("ses_one", {
+    onInteraction: async (item) => { interactions.push(item); return { type: "cancelled" }; },
+    onPermissionsReconciled: async (item) => snapshots.push(item),
+  }));
+  await until(() => interactions.length === 1);
+  let settled = false;
+  void interactions[0].settled.then(() => { settled = true; });
+  snapshots.length = 0;
+  f.permissions.length = 0;
+  fail = true;
+  const reads = f.requests.filter((r) => r.path === "/api/session/ses_child/form").length;
+  f.globalEvent("session.moved", { sessionID: "ses_child", location: { directory: "/outside/child" }, projectID: "proj_native" }, { directory: "/outside/child" });
+  await until(() => f.requests.filter((r) => r.path === "/api/session/ses_child/form").length > reads);
+  await delay(10);
+  assert.equal(settled, false);
+  assert.deepEqual(snapshots, []);
+  fail = false;
+  f.globalEvent("session.moved", { sessionID: "ses_child", location: { directory: "/outside/child" }, projectID: "proj_native" }, { directory: "/outside/child" });
+  await until(() => settled);
+  await assert.rejects(interactions[0].submit({ type: "reply", reply: "once" }), /already settled/u);
+});
+
+test("existing session lookup and native ancestry retain session ID validation", async (t) => {
+  const f = await fixture(t);
+  f.sessions.set("ses_wrong", { id: "ses_other" });
+  await assert.rejects(f.adapter.resolveSession("ses_wrong", process.cwd(), new AbortController()), /session identity mismatch/u);
+  const interactions = [];
+  await f.adapter.followSession(f.input("ses_one", { onInteraction: async (item) => { interactions.push(item); return { type: "cancelled" }; } }));
+  f.sessions.set("ses_child", { id: "ses_other", parentID: "ses_one", location: { directory: "/outside/child" } });
+  f.permissions.push({ id: "per_wrong_identity", sessionID: "ses_child", action: "bash", resources: ["pwd"] });
+  f.globalEvent("permission.asked", f.permissions[0], { directory: "/outside/child" });
+  const form = { id: "frm_root", sessionID: "ses_one", title: "Continue?", fields: [{ key: "answer", type: "string" }] };
+  f.forms.push(form);
+  f.globalEvent("form.created", { form });
+  await until(() => interactions.length === 1);
+  assert.equal(interactions[0].request.id, "frm_root");
 });
 
 test("explicit permission rejection completes headless caller without a native idle", async (t) => {

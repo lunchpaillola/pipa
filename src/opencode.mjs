@@ -192,7 +192,6 @@ export function createOpenCodeExecutor(options = {}) {
     if (legacySession && sessionId && activeSessions.has(sessionId)) throw new Error("OpenCode attribution conflict: the session already has an active writer.");
     let temporaryDirectory;
     const selectedModel = normalizeModel(model);
-    const newThreadModel = normalizeModel(defaultModel);
     const slackTurn = contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack";
     const controller = new AbortController();
     const abort = () => controller.abort(signal.reason);
@@ -211,6 +210,7 @@ export function createOpenCodeExecutor(options = {}) {
         await abortable(ready(workingDirectory), controller.signal);
         const prepared = await adapter.resolveSession(sessionId, workingDirectory, controller);
         const selectedSessionId = prepared.sessionId;
+        const newThreadModel = !selectedModel && (prepared.defaultEligible ?? !prepared.threadModel) ? normalizeModel(defaultModel) : null;
 
         if (!capabilities.backgroundResponses && activeSessions.has(selectedSessionId) && activeSessions.get(selectedSessionId).controller !== controller) throw new Error("OpenCode attribution conflict: the session already has an active writer.");
         activeSessions.set(selectedSessionId, { controller, workingDirectory, resolved: true });

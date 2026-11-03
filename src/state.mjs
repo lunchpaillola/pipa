@@ -204,7 +204,6 @@ export async function loadConfig(file = pipaPaths().config) {
   if (config.mentionOnly !== undefined && typeof config.mentionOnly !== "boolean") {
     throw new Error("Invalid Pipa config: mentionOnly must be a boolean.");
   }
-  normalizeModel(config.defaultModel);
   return { ...config, slackMode };
 }
 

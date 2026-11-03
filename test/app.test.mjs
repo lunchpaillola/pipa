@@ -81,11 +81,15 @@ test("a delayed model read cannot let an older message supersede a newer one", a
 });
 
 test("v2 forwards background replies after admission without another Slack message", async (t) => {
+  const runtime = await createRuntimeFixture();
+  t.after(() => runtime.teardown());
+  const paths = pipaPaths(runtime.home);
   const handlers = {};
   const posts = [];
   let submitted;
-  const config = { botName: "Pipa", workingDirectory: "/work", slackBotToken: "xoxb-test", slackAppToken: "xapp-test", allowedSlackChannelIds: ["C1"] };
-  const app = await startPipa({ config, checkSlackToken: async () => ({ ok: true }),
+  const config = { botName: "Pipa", workingDirectory: runtime.workspace, slackBotToken: "xoxb-test", slackAppToken: "xapp-test", allowedSlackChannelIds: ["C1"], defaultModel: false };
+  await writePrivateJson(paths.config, config);
+  const app = await startPipa({ paths, checkSlackToken: async () => ({ ok: true }),
     sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
     executor: { capabilities: { backgroundResponses: true }, runTurn: async (input) => { submitted = input; await input.onSession("ses_background"); return { sessionId: "ses_background", pending: true }; }, stopAll() {} },
     chat: { onNewMention: (fn) => { handlers.mention = fn; }, onSubscribedMessage() {}, initialize: async () => undefined, shutdown: async () => undefined } });
@@ -94,15 +98,18 @@ test("v2 forwards background replies after admission without another Slack messa
     adapter: { addReaction: async () => undefined, removeReaction: async () => undefined }, post: async (payload) => posts.push(payload) };
   await handlers.mention(thread, { id: "1.0", text: "render", author: { userId: "U1" }, raw: {} });
   await waitFor(() => submitted);
+  assert.equal(submitted.defaultModel, false);
   assert.equal(typeof submitted.onResponse, "function");
   await submitted.onResponse({ sessionId: "ses_background", text: "Rendering; I will verify it." }, new AbortController().signal);
   await submitted.onResponse({ sessionId: "ses_background", text: "Render verified." }, new AbortController().signal);
   assert.deepEqual(posts, [{ markdown: "Rendering; I will verify it." }, { markdown: "Render verified." }]);
   config.allowedSlackUserIds = ["U2"];
+  await writePrivateJson(paths.config, config);
   await submitted.onResponse({ sessionId: "ses_background", text: "Requester no longer allowed." }, new AbortController().signal);
   assert.equal(posts.length, 2);
   config.allowedSlackUserIds = [];
   config.allowedSlackChannelIds = ["C2"];
+  await writePrivateJson(paths.config, config);
   await submitted.onResponse({ sessionId: "ses_background", text: "No longer allowed." }, new AbortController().signal);
   assert.equal(posts.length, 2);
   app.stop();

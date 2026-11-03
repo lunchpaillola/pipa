@@ -12,11 +12,11 @@ Pipa is a local runtime. It has no hosted relay, database, public HTTP endpoint,
 - Local mode starts and owns that server. An attached non-loopback server is externally owned and returns inline text instead of artifacts.
 - Slack access is controlled by channel, human user, and bot allowlists. Every turn, interaction, and delivery rechecks the relevant limits.
 - Slack tokens stay in the local profile under `~/.pipa` (or `PIPA_HOME`) with private file permissions. OpenCode manages provider credentials through its own credential store or provider environment variables. Credentials are not posted to Slack.
-- Pipa reads generated files only from a private per-turn directory under `.pipa/artifacts` in the configured working directory. It validates path, type, identity, and size, limits delivery to 10 files and 100 MB, and attempts removal after delivery.
+- Pipa reads generated files only from a private session directory under `.pipa/artifacts` in the configured starting directory. It validates path, type, identity, and size and limits delivery to 10 files and 100 MB. V2 retains that directory for background responses; v1 attempts removal after each turn. Native session moves do not relocate or widen this publication boundary.
 - Incoming attachments are copied to a temporary directory for the turn, and Pipa attempts to remove it on every terminal path.
 - Raw upstream errors and credentials are not posted to Slack.
 - Pipa never silently switches models.
-- The agent has the permissions of the OpenCode profile and the configured working directory. Invite the Slack app only to channels whose members may use that access.
+- The agent has the permissions of the OpenCode profile. In v2, the configured directory is a starting location, not a sandbox: native clients and agents can move sessions, including outside it. Pipa follows the mapped session and its descendants, never unrelated sessions. Invite the Slack app only to channels whose members may use that profile's full access.
 
 ## Supported versions
 
