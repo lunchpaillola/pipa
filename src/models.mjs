@@ -13,6 +13,10 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
   const command = commands[0];
   const pending = new Map();
   const saves = new Set();
+  const discard = (token) => {
+    pending.get(token)?.controller.abort();
+    pending.delete(token);
+  };
   let closed = false;
   const userId = (event) => event.user?.userId ?? event.user?.id;
   const authorize = (entry, event, config) => {
@@ -32,11 +36,11 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
       const config = await loadConfig();
       const channelId = event.channel.id.split(":")[1];
       if (!/^[CG][A-Z0-9]+$/u.test(channelId ?? "") || !userId(event) || event.user?.isBot) throw new Error("Model selection isn't enabled for this account or channel.");
-      const entry = { userId: userId(event), channelId, expires: now() + 30 * 60_000 };
+      const entry = { userId: userId(event), channelId, expires: now() + 30 * 60_000, controller: new AbortController() };
       authorize(entry, event, config);
-      for (const [id, context] of pending) if (context.expires <= now()) pending.delete(id);
+      for (const [id, context] of pending) if (context.expires <= now()) discard(id);
       // ponytail: bound abandoned modals in memory; reopen when the oldest context is evicted.
-      if (pending.size >= 1000) pending.delete(pending.keys().next().value);
+      if (pending.size >= 1000) discard(pending.keys().next().value);
       token = randomUUID();
       pending.set(token, entry);
       const view = {
@@ -48,7 +52,7 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
         view: { ...view, blocks: [{ type: "section", text: { type: "plain_text", text: "Loading available models…" } }] } });
       if (!opened?.view?.id) throw new Error("Slack did not return a model window ID.");
       entry.viewId = opened.view.id;
-      const models = await listModels();
+      const models = await listModels(entry.controller.signal);
       if (closed || !pending.has(token)) return;
       const currentConfig = await loadConfig();
       if (closed || pending.get(token) !== entry) return;
@@ -65,7 +69,7 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
       } });
     } catch (error) {
       const entry = pending.get(token);
-      pending.delete(token);
+      discard(token);
       if (closed || (token && !entry)) return;
       const message = safeError(error);
       if (entry?.viewId) {
@@ -126,7 +130,7 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
         authorize(entry, event, await loadConfig());
         await event.adapter.postEphemeral(`slack:${entry.channelId}`, entry.userId, message);
       } finally {
-        pending.delete(event.privateMetadata);
+        discard(event.privateMetadata);
       }
     })();
     saves.add(task);
@@ -138,7 +142,7 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
   });
   chat.onModalClose?.("pipa_model", (event) => {
     const entry = pending.get(event.privateMetadata);
-    if (entry?.userId === userId(event) && !entry.saving) pending.delete(event.privateMetadata);
+    if (entry?.userId === userId(event) && !entry.saving) discard(event.privateMetadata);
   });
-  return { close() { closed = true; pending.clear(); }, async drain() { await Promise.allSettled([...saves]); } };
+  return { close() { closed = true; for (const token of pending.keys()) discard(token); }, async drain() { await Promise.allSettled([...saves]); } };
 }

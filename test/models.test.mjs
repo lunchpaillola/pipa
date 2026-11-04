@@ -177,15 +177,16 @@ for (const shutdown of [false, true]) test(`Save acknowledges before slow work; 
   if (!shutdown) assert.equal(notices[0][2], "New threads will use Model A.");
 });
 
-for (const cancel of [false, true]) test(`opens before slow discovery and ${cancel ? "does not refill a cancelled window" : "populates the window afterward"}`, async () => {
+for (const outcome of ["populate", "cancel", "shutdown"]) test(`opens before slow discovery: ${outcome}`, async () => {
   const handlers = {};
   const started = Promise.withResolvers();
   const gate = Promise.withResolvers();
   let loading;
+  let discoverySignal;
   const updates = [];
   const picker = createModelPicker({ botName: "Chopper", commands: ["/chopper"], loadConfig: async () => ({}), setting: {},
     chat: { onSlashCommand: (_id, fn) => { handlers.open = fn; }, onModalClose: (_id, fn) => { handlers.close = fn; } },
-    listModels: async () => { started.resolve(Boolean(loading)); await gate.promise; return [{ providerID: "openai", modelID: "a" }]; } });
+    listModels: async (signal) => { discoverySignal = signal; started.resolve(Boolean(loading)); await gate.promise; signal?.throwIfAborted(); return [{ providerID: "openai", modelID: "a" }]; } });
   const opening = handlers.open({ text: "model", user: { userId: "U1" }, channel: { id: "slack:C1", postEphemeral: async () => undefined },
     adapter: { webClient: { views: {
       open: async ({ view }) => { loading = view; return { view: { id: "V1" } }; },
@@ -194,14 +195,20 @@ for (const cancel of [false, true]) test(`opens before slow discovery and ${canc
   try {
     assert.equal(await started.promise, true, "catalog discovery starts only after the trigger has opened a window");
     assert.equal(loading.submit, undefined);
-    if (cancel) handlers.close({ user: { userId: "U1" }, privateMetadata: JSON.parse(loading.private_metadata).m });
+    if (outcome === "cancel") {
+      handlers.close({ user: { userId: "U2" }, privateMetadata: JSON.parse(loading.private_metadata).m });
+      assert.equal(discoverySignal?.aborted, false, "another user cannot cancel discovery");
+      handlers.close({ user: { userId: "U1" }, privateMetadata: JSON.parse(loading.private_metadata).m });
+    }
+    if (outcome === "shutdown") picker.close();
+    assert.equal(discoverySignal?.aborted, outcome !== "populate", "closed pickers abort discovery, not just the later UI update");
   } finally {
     gate.resolve();
     await opening;
     picker.close();
   }
-  assert.equal(updates.length, cancel ? 0 : 1);
-  if (!cancel) assert.equal(updates[0].blocks[0].element.type, "external_select");
+  assert.equal(updates.length, outcome === "populate" ? 1 : 0);
+  if (outcome === "populate") assert.equal(updates[0].blocks[0].element.type, "external_select");
 });
 
 test("Cancel during the post-discovery config read suppresses the populated view update", async () => {
@@ -253,7 +260,12 @@ for (const [botName, command] of [["Chopper", "/chopper"], ["Chopper", "/pipa"],
   const calls = [];
   let discoveries = 0;
   const app = await startPipa({ paths, chat, routinesEnabled: false, checkSlackToken: async () => ({ ok: true }),
-    executor: { listModels: async () => { discoveries++; return models; }, runTurn: async (input) => { calls.push(input); return { text: "done", sessionId: "ses_same" }; }, stopAll() {} },
+    executor: { listModels: async ({ workingDirectory, signal }) => {
+      assert.equal(workingDirectory, config.workingDirectory);
+      assert.ok(signal instanceof AbortSignal);
+      discoveries++;
+      return { models: models.map((model) => ({ providerID: model.providerID, id: model.modelID, name: model.name })) };
+    }, runTurn: async (input) => { calls.push(input); return { text: "done", sessionId: "ses_same" }; }, stopAll() {} },
     sessionStore: await createSessionStore(paths.sessions) });
   t.after(() => app.shutdown());
   const open = async () => {

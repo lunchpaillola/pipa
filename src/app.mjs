@@ -176,7 +176,10 @@ export async function startPipa(options = {}) {
     },
   }) : null;
   const modelPicker = createModelPicker({ chat, botName: config.botName, commands, loadConfig: loadCurrentConfig,
-    listModels: () => executor.listModels(config.workingDirectory), setting: createModelSetting(paths.config) });
+    listModels: async (signal) => {
+      const catalog = await executor.listModels({ workingDirectory: config.workingDirectory, signal });
+      return catalog.models.map((model) => ({ providerID: model.providerID, modelID: model.id, name: model.name }));
+    }, setting: createModelSetting(paths.config) });
   chat.onAction?.(interactions.onAction);
   chat.onModalSubmit?.("pipa_custom", interactions.onCustomAnswer);
 

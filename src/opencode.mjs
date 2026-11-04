@@ -273,12 +273,11 @@ export function createOpenCodeExecutor(options = {}) {
       if (signal?.aborted) abort();
       else signal?.addEventListener("abort", abort, { once: true });
       active.add(controller);
-      const timer = options.connection?.major === 2 ? undefined
-        : setTimeout(() => controller.abort(new Error("Model discovery timed out.")), 30_000);
+      let timer;
       try {
         await abortable(ready(workingDirectory), controller.signal);
         controller.signal.throwIfAborted();
-        if (capabilities.backgroundResponses) clearTimeout(timer);
+        if (!capabilities.backgroundResponses) timer = setTimeout(() => controller.abort(new Error("Model discovery timed out.")), 30_000);
         const catalog = await abortable(adapter.listModels(workingDirectory, controller.signal), controller.signal);
         controller.signal.throwIfAborted();
         return flat ? catalog.models.map((model) => ({ providerID: model.providerID, modelID: model.id, name: model.name })) : catalog;

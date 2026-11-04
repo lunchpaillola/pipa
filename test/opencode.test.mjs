@@ -241,21 +241,46 @@ test("ordinary owned startup can wait for a listening URL beyond thirty seconds"
   server.stop(); await server.wait();
 });
 
-test("legacy discovery retains its thirty-second bound while readiness is pending", async (t) => {
+for (const major of [1, 2]) test(`v${major} discovery waits for readiness before applying version-specific timing`, async (t) => {
   const requested = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const discovery = Promise.withResolvers();
+  let discoverySignal;
   const executor = createExecutor({ baseUrl: "http://localhost:5555", environment: {},
-    fetch: async (_url, { signal }) => {
-      requested.resolve();
+    fetch: async (url, { signal }) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/global/health") {
+        requested.resolve();
+        await release.promise;
+        return major === 1 ? jsonResponse({ healthy: true, version: "1.19.0" }) : new Response("<html>");
+      }
+      if (pathname === "/api/info") return jsonResponse(v2Info);
+      if (["/api/location", "/path"].includes(pathname)) return jsonResponse({ directory: "/work" });
+      if (pathname === "/session/status") return jsonResponse({});
+      assert.equal(pathname, major === 1 ? "/config/providers" : "/api/model");
+      discoverySignal = signal;
+      discovery.resolve();
+      if (major === 2) return jsonResponse({ data: [] });
       return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
     },
   });
   t.after(() => executor.stopAll());
+  t.after(() => release.resolve());
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const operation = executor.listModels("/work");
-  const rejected = assert.rejects(operation, /Model discovery timed out/u);
+  const outcome = executor.listModels("/work").then((value) => ({ value }), (error) => ({ error }));
   await requested.promise;
-  t.mock.timers.tick(30_000);
-  await rejected;
+  t.mock.timers.tick(30_001);
+  await new Promise(setImmediate);
+  assert.equal(await Promise.race([outcome, Promise.resolve("waiting")]), "waiting");
+  release.resolve();
+  await discovery.promise;
+  if (major === 1) {
+    t.mock.timers.tick(29_999);
+    assert.equal(discoverySignal.aborted, false);
+    t.mock.timers.tick(1);
+    assert.match((await outcome).error.message, /Model discovery timed out/u);
+    assert.equal(discoverySignal.aborted, true);
+  } else assert.deepEqual((await outcome).value, []);
   t.mock.timers.reset();
 });
 
