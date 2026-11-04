@@ -562,7 +562,13 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
   assert.match(promptBody.system, /PIPA_MESSAGE_CHANNEL=slack/u);
   assert.match(promptBody.system, /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
   assert.match(promptBody.system, /consult `pipa routine --help`/u);
-  assert.doesNotMatch(promptBody.system, /When asked to restart|instance\/dispose/u);
+  assert.match(promptBody.system, /run `pipa restart --channel C1 --thread 123\.456`/u);
+  assert.match(promptBody.system, /existing messaging authorization is sufficient/u);
+  assert.match(promptBody.system, /pipa restart --status/u);
+  assert.match(promptBody.system, /do not claim completion from the request alone/u);
+  assert.ok(promptBody.system.includes(`The Pipa profile home on that host is ${JSON.stringify(path.resolve(process.env.PIPA_HOME || os.homedir()))}`));
+  assert.match(promptBody.system, /ensure PIPA_HOME has this value/u);
+  assert.match(promptBody.system, /Do not use sequential stop\/start or OpenCode \/instance\/dispose/u);
   assert.match(promptBody.system, /IANA timezone/u);
   assert.match(promptBody.system, /preview first/u);
   assert.match(promptBody.system, /create only after user confirmation/u);
@@ -1489,14 +1495,28 @@ test("short Slack answers stay inline and remote attached servers get no local a
     response: async (body) => { remoteSystem = body.system; return 'Summary.\nPIPA_ARTIFACTS: ["private.pdf"]'; },
   });
   assert.match(remoteSystem, /For deeper work or larger deliverables/u);
-  assert.doesNotMatch(remoteSystem, /When asked to restart|instance\/dispose/u);
+  assert.match(remoteSystem, /run `pipa restart`/u);
+  assert.match(remoteSystem, /Both commands must run on the Pipa host, not a remote attached OpenCode host/u);
+  assert.match(remoteSystem, /If you lack command access to the Pipa host, explain that limitation/u);
   assert.doesNotMatch(remoteSystem, /PIPA_ARTIFACTS|artifact director|pipa-artifacts-/u);
   assert.deepEqual(remote, { text: "Summary.", sessionId: "ses_1" });
 
   let plainSystem;
   const plain = await artifactTurn({ contextEnvironment: { PIPA_MESSAGE_CHANNEL: "web" }, response: async (body) => { plainSystem = body.system; return 'Hello.\nPIPA_ARTIFACTS: ["ordinary.txt"]'; } });
   assert.doesNotMatch(plainSystem, /executive summary|TL;DR|PIPA_ARTIFACTS/u);
+  assert.match(plainSystem, /run `pipa restart`/u);
+  assert.doesNotMatch(plainSystem, /pipa restart --channel/u);
   assert.equal(plain.text, 'Hello.\nPIPA_ARTIFACTS: ["ordinary.txt"]');
+});
+
+test("Slack restart guidance routes channel-only messages without inventing a thread", async () => {
+  let system;
+  await artifactTurn({
+    contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack", PIPA_CURRENT_SLACK_CHANNEL_ID: "C2" },
+    response: async (body) => { system = body.system; return "Ready."; },
+  });
+  assert.match(system, /run `pipa restart --channel C2`/u);
+  assert.doesNotMatch(system, /--thread/u);
 });
 
 test("malformed or non-private artifact declarations are stripped and upload nothing", async () => {
