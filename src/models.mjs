@@ -57,7 +57,7 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
       const currentConfig = await loadConfig();
       if (closed || pending.get(token) !== entry) return;
       authorize(entry, { ...event, viewId: entry.viewId }, currentConfig);
-      if (!models.length) throw new Error("No configured models are available. Connect a provider in OpenCode, then reopen the model picker.");
+      if (!models.length) throw new Error("No configured models are available. In a terminal on the machine running Pipa, run `opencode auth login` to connect a provider, then reopen this picker. If Pipa uses an attached OpenCode server, ask its operator to connect a provider there.");
       entry.options = models.map((model) => ({ model: { providerID: model.providerID, modelID: model.modelID, name: model.name }, option: modelOption(model), search: `${model.providerID} ${model.modelID} ${model.name ?? ""}`.toLowerCase() }));
       const initialModel = currentConfig.defaultModel && models.find((model) => model.providerID === currentConfig.defaultModel.providerID && model.modelID === currentConfig.defaultModel.modelID);
       await event.adapter.webClient.views.update({ view_id: entry.viewId, view: {

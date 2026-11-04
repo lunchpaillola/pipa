@@ -106,7 +106,8 @@ export function createV2Adapter(options) {
     const normalized = question ? { ...request, questions: fields.map((field) => ({
       header: field.title || request.title, question: field.description || field.title || request.title,
       multiple: field.type === "multiselect", custom: field.custom ?? !field.options?.length,
-      options: field.options?.map((option) => ({ label: option.label, description: option.description })),
+      required: field.required ?? false,
+      options: field.options,
     })) } : tool ? { ...request, tool } : request;
     const entry = { kind, request, settled: Promise.withResolvers() };
     observer.interactions.set(key, entry);
@@ -128,11 +129,11 @@ export function createV2Adapter(options) {
             await client.session.form.cancel(native, { signal });
           } else if (question && decision?.type === "answer") {
             if (!Array.isArray(decision.answers) || decision.answers.length !== fields.length) throw new Error("Invalid OpenCode question answers.");
-            const answer = Object.fromEntries(fields.map((field, index) => {
+            const answer = Object.fromEntries(fields.flatMap((field, index) => {
               const values = decision.answers[index];
+              if (values === null && !field.required) return [];
               if (!Array.isArray(values) || !values.every((value) => typeof value === "string") || (field.type === "string" && values.length !== 1)) throw new Error("Invalid OpenCode question answer.");
-              const encoded = values.map((value) => field.options?.find((option) => option.label === value)?.value ?? value);
-              return [field.key, field.type === "multiselect" ? encoded : encoded[0]];
+              return [[field.key, field.type === "multiselect" ? values : values[0]]];
             }));
             await client.session.form.reply({ ...native, answer }, { signal });
           } else throw new Error("This form requires an OpenCode client response.");
