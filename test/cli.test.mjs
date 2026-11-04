@@ -434,33 +434,56 @@ test("prompt files preserve exact multiline and shell-like bytes", async () => {
   assert.equal(result.routine.schedule.until, "2030-09-05");
 });
 
-test("prompt files stay inside the configured workspace and reject symlinks", async () => {
-  const { home } = await setup();
+test("prompt files outside the configured workspace and symlinks preserve exact bytes", async (t) => {
+  const { home, paths } = await setup();
+  t.after(() => rm(home, { recursive: true, force: true }));
   const outside = await mkdtemp(path.join(os.tmpdir(), "pipa-prompt-outside-"));
+  t.after(() => rm(outside, { recursive: true, force: true }));
   const outsideFile = path.join(outside, "secret.txt");
-  await writeFile(outsideFile, "secret");
+  const prompt = "  --option `tick` $(touch nope) \"quotes\"\r\nUnicode café  \n";
+  await writeFile(outsideFile, prompt);
+  const inline = json(run(home, "create", "--prompt", prompt, "--timezone", "UTC", "--channel", "C123", "--in", "5m", "--preview", "--json"));
   const escaped = run(home, "create", "--prompt-file", outsideFile, "--timezone", "UTC", "--channel", "C123", "--in", "5m", "--preview", "--json");
-  assert.notEqual(escaped.status, 0);
-  assert.match(JSON.parse(escaped.stdout).error.message, /configured working directory/u);
+  assert.equal(json(escaped).routine.prompt, inline.routine.prompt);
 
   if (process.platform !== "win32") {
     const link = path.join(home, "prompt-link.txt");
     await symlink(outsideFile, link);
     const linked = run(home, "create", "--prompt-file", link, "--timezone", "UTC", "--channel", "C123", "--in", "5m", "--preview", "--json");
-    assert.notEqual(linked.status, 0);
-    assert.match(JSON.parse(linked.stdout).error.message, /configured working directory|symbolic link/u);
+    assert.equal(json(linked).routine.prompt, inline.routine.prompt);
 
     const nested = path.join(home, "prompts");
     await mkdir(nested);
     await symlink(outside, path.join(nested, "outside"));
     const nestedLink = run(home, "create", "--prompt-file", path.join(nested, "outside", "secret.txt"), "--timezone", "UTC", "--channel", "C123", "--in", "5m", "--preview", "--json");
-    assert.notEqual(nestedLink.status, 0);
-    assert.match(JSON.parse(nestedLink.stdout).error.message, /configured working directory/u);
+    assert.equal(json(nestedLink).routine.prompt, inline.routine.prompt);
   }
+
+  const disallowed = run(home, "create", "--prompt-file", outsideFile, "--timezone", "UTC", "--channel", "C999", "--in", "5m", "--preview", "--json");
+  assert.notEqual(disallowed.status, 0);
+  assert.match(JSON.parse(disallowed.stdout).error.message, /not allowed/u);
+  await assert.rejects(readFile(paths.routines), { code: "ENOENT" });
+});
+
+test("prompt files resolve relative paths from the configured workspace and retain read failures", async (t) => {
+  const { home, paths } = await setup();
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const prompt = "  relative prompt\n";
+  await writeFile(path.join(home, "prompt.txt"), prompt);
+  const result = json(run(home, "create", "--prompt-file", "prompt.txt", "--timezone", "UTC", "--channel", "C123", "--in", "5m", "--preview", "--json"));
+  assert.equal(result.routine.prompt, prompt);
+
+  const directory = run(home, "create", "--prompt-file", home, "--timezone", "UTC", "--channel", "C123", "--in", "5m", "--preview", "--json");
+  assert.notEqual(directory.status, 0);
+  assert.match(JSON.parse(directory.stdout).error.message, /regular file/u);
+  const missing = run(home, "create", "--prompt-file", "missing.txt", "--timezone", "UTC", "--channel", "C123", "--in", "5m", "--preview", "--json");
+  assert.notEqual(missing.status, 0);
+  assert.match(JSON.parse(missing.stdout).error.message, /ENOENT/u);
 
   const oversized = path.join(home, "oversized.txt");
   await writeFile(oversized, Buffer.alloc((1024 * 1024) + 1));
   const tooLarge = run(home, "create", "--prompt-file", oversized, "--timezone", "UTC", "--channel", "C123", "--in", "5m", "--preview", "--json");
   assert.notEqual(tooLarge.status, 0);
   assert.match(JSON.parse(tooLarge.stdout).error.message, /no larger than 1 MB/u);
+  await assert.rejects(readFile(paths.routines), { code: "ENOENT" });
 });
