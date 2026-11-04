@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { safeError } from "./errors.mjs";
 
 function modelOption(model) {
   return {
@@ -12,6 +13,10 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
   const command = commands[0];
   const pending = new Map();
   const saves = new Set();
+  const discard = (token) => {
+    pending.get(token)?.controller.abort();
+    pending.delete(token);
+  };
   let closed = false;
   const userId = (event) => event.user?.userId ?? event.user?.id;
   const authorize = (entry, event, config) => {
@@ -27,45 +32,34 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
     if (closed) return;
     if (event.text.trim() !== "model") return reply(`Use ${command} model to choose the default for this Pipa installation.`);
     let token;
-    let failure = `I couldn't read ${botName}'s saved settings. Try ${command} model again in a moment.`;
     try {
       const config = await loadConfig();
       const channelId = event.channel.id.split(":")[1];
-      failure = "Model selection isn't enabled for this account or channel. Ask the installation owner to update its access settings.";
-      if (!/^[CG][A-Z0-9]+$/u.test(channelId ?? "") || !userId(event) || event.user?.isBot) throw new Error("denied");
-      const entry = { userId: userId(event), channelId, expires: now() + 30 * 60_000 };
+      if (!/^[CG][A-Z0-9]+$/u.test(channelId ?? "") || !userId(event) || event.user?.isBot) throw new Error("Model selection isn't enabled for this account or channel.");
+      const entry = { userId: userId(event), channelId, expires: now() + 30 * 60_000, controller: new AbortController() };
       authorize(entry, event, config);
-      for (const [id, context] of pending) if (context.expires <= now()) pending.delete(id);
+      for (const [id, context] of pending) if (context.expires <= now()) discard(id);
       // ponytail: bound abandoned modals in memory; reopen when the oldest context is evicted.
-      if (pending.size >= 1000) pending.delete(pending.keys().next().value);
+      if (pending.size >= 1000) discard(pending.keys().next().value);
       token = randomUUID();
       pending.set(token, entry);
       const view = {
         type: "modal", callback_id: "pipa_model", private_metadata: JSON.stringify({ m: token }), notify_on_close: true,
         title: { type: "plain_text", text: "Pipa model" }, close: { type: "plain_text", text: "Cancel" },
       };
-      failure = `Slack couldn't open the model window. Try ${command} model again in a moment.`;
       // Exchange Slack's short-lived trigger before waiting on catalog discovery.
       const opened = await event.adapter.webClient.views.open({ trigger_id: event.triggerId,
         view: { ...view, blocks: [{ type: "section", text: { type: "plain_text", text: "Loading available models…" } }] } });
-      if (!opened?.view?.id) throw new Error("modal unavailable");
+      if (!opened?.view?.id) throw new Error("Slack did not return a model window ID.");
       entry.viewId = opened.view.id;
-      failure = `I couldn't load the available models from OpenCode. Try ${command} model again in a moment.`;
-      const models = await listModels();
+      const models = await listModels(entry.controller.signal);
       if (closed || !pending.has(token)) return;
-      failure = `I couldn't read ${botName}'s saved settings. Try ${command} model again in a moment.`;
       const currentConfig = await loadConfig();
       if (closed || pending.get(token) !== entry) return;
-      failure = "Model selection isn't enabled for this account or channel. Ask the installation owner to update its access settings.";
       authorize(entry, { ...event, viewId: entry.viewId }, currentConfig);
-      failure = "I couldn't prepare the model list. This is a Pipa issue, not an access problem.";
-      if (!models.length) {
-        failure = "No configured models are available. Connect a provider in OpenCode, then reopen the model picker.";
-        throw new Error("empty catalog");
-      }
-      entry.options = models.map((model) => ({ option: modelOption(model), search: `${model.providerID} ${model.modelID} ${model.name ?? ""}`.toLowerCase() }));
+      if (!models.length) throw new Error("No configured models are available. Connect a provider in OpenCode, then reopen the model picker.");
+      entry.options = models.map((model) => ({ model: { providerID: model.providerID, modelID: model.modelID, name: model.name }, option: modelOption(model), search: `${model.providerID} ${model.modelID} ${model.name ?? ""}`.toLowerCase() }));
       const initialModel = currentConfig.defaultModel && models.find((model) => model.providerID === currentConfig.defaultModel.providerID && model.modelID === currentConfig.defaultModel.modelID);
-      failure = `Slack couldn't display the model list. Try ${command} model again in a moment.`;
       await event.adapter.webClient.views.update({ view_id: entry.viewId, view: {
         ...view, submit: { type: "plain_text", text: "Save" },
         blocks: [{ type: "input", block_id: `pipa_model_${token}`, label: { type: "plain_text", text: `Default for new ${botName} threads` },
@@ -75,12 +69,9 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
       } });
     } catch (error) {
       const entry = pending.get(token);
-      pending.delete(token);
+      discard(token);
       if (closed || (token && !entry)) return;
-      if (error?.data?.error === "expired_trigger_id") failure = `Slack's request to open this window expired. Run ${command} model again.`;
-      if (error?.data?.error === "invalid_trigger_id") failure = `Slack couldn't use the request to open this window. Run ${command} model again.`;
-      if (error?.data?.error === "invalid_arguments") failure = "Slack rejected the model window. This is a Pipa issue, not an access problem.";
-      const message = `${failure} Your saved model hasn't changed.`;
+      const message = safeError(error);
       if (entry?.viewId) {
         try {
           await event.adapter.webClient.views.update({ view_id: entry.viewId, view: {
@@ -117,34 +108,29 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
     const inputId = `pipa_model_${event.privateMetadata}`;
     try {
       authorize(entry, event, {});
-    } catch {
-      return { action: "errors", errors: { [inputId]: `I couldn't verify this model change. Reopen ${command} model. Your saved model hasn't changed.` } };
+    } catch (error) {
+      return { action: "errors", errors: { [inputId]: safeError(error) } };
     }
     if (entry.saving) return { action: "close" };
     entry.saving = true;
-    // Acknowledge Save before config I/O as well as catalog/network/persistence work.
+    // Acknowledge Save before config I/O and persistence work.
     const task = (async () => {
       let message;
-      let failure = `I couldn't verify this model change. Reopen ${command} model. Your saved model hasn't changed.`;
       try {
         try {
           authorize(entry, event, await loadConfig());
-          failure = `I couldn't check the available models in OpenCode. Reopen ${command} model to try again. Your saved model hasn't changed.`;
-          const models = await listModels();
-          const model = models.find((item) => modelOption(item).value === event.values?.[inputId]);
-          failure = `That model is no longer available. Reopen ${command} model and choose another. Your saved model hasn't changed.`;
-          if (!model) throw new Error("unavailable model");
-          failure = `I couldn't save your model choice. Reopen ${command} model to try again. Your saved model hasn't changed.`;
+          const model = entry.options?.find((item) => item.option.value === event.values?.[inputId])?.model;
+          if (!model) throw new Error(`That model is not in this picker. Reopen ${command} model.`);
           await setting.save({ providerID: model.providerID, modelID: model.modelID }, (config) => authorize(entry, event, config));
           message = `New threads will use ${model.name || model.modelID}.`;
-        } catch {
-          message = failure;
+        } catch (error) {
+          message = safeError(error);
         }
         if (closed) return;
         authorize(entry, event, await loadConfig());
         await event.adapter.postEphemeral(`slack:${entry.channelId}`, entry.userId, message);
       } finally {
-        pending.delete(event.privateMetadata);
+        discard(event.privateMetadata);
       }
     })();
     saves.add(task);
@@ -156,7 +142,7 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
   });
   chat.onModalClose?.("pipa_model", (event) => {
     const entry = pending.get(event.privateMetadata);
-    if (entry?.userId === userId(event) && !entry.saving) pending.delete(event.privateMetadata);
+    if (entry?.userId === userId(event) && !entry.saving) discard(event.privateMetadata);
   });
-  return { close() { closed = true; pending.clear(); }, async drain() { await Promise.allSettled([...saves]); } };
+  return { close() { closed = true; for (const token of pending.keys()) discard(token); }, async drain() { await Promise.allSettled([...saves]); } };
 }

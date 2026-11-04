@@ -114,12 +114,25 @@ test("native events deliver initial and later background responses after admissi
   assert.equal(f.requests.find((r) => r.path.endsWith("/prompt")).body.text, "exact prompt");
 });
 
-test("unavailable response observation fails before admitting unobservable work", async (t) => {
-  const f = await fixture(t, { connectionRecoveryTimeoutMs: 25, onRequest: ({ url, json }) => {
-    if (url.pathname === "/api/event") { json({}, 503); return true; }
+test("native session creation accepts returned identity without a directory-spelling veto", async (t) => {
+  const f = await fixture(t, { onRequest: ({ req, url, json }) => {
+    if (url.pathname !== "/api/session" || req.method !== "POST") return;
+    json({ data: { id: "ses_created", location: { directory: "/native/canonical/location" } } });
+    return true;
   } });
-  await assert.rejects(f.adapter.execute(f.input("ses_one", { onResponse: async () => {} })), /event attachment timed out/u);
-  assert.equal(f.requests.some((request) => request.path.endsWith("/prompt")), false);
+  assert.deepEqual(await f.adapter.resolveSession(null, process.cwd(), new AbortController()), { sessionId: "ses_created", defaultEligible: true });
+  assert.equal(f.requests.filter((request) => request.path === "/api/session" && request.method === "POST").length, 1);
+  assert.deepEqual(await f.adapter.execute(f.input("ses_created", { onResponse: async () => {} })), { pending: true });
+  assert.equal(f.requests.find((request) => request.path.endsWith("/prompt")).path, "/api/session/ses_created/prompt");
+});
+
+for (const id of [undefined, ""]) test(`native session creation requires usable identity (${String(id)})`, async (t) => {
+  const f = await fixture(t, { onRequest: ({ req, url, json }) => {
+    if (url.pathname !== "/api/session" || req.method !== "POST") return;
+    json({ data: { id } });
+    return true;
+  } });
+  await assert.rejects(f.adapter.resolveSession(null, process.cwd(), new AbortController()), /session identity/u);
 });
 
 test("successful native admission is not vetoed by a changed prompt echo", async (t) => {
@@ -190,18 +203,21 @@ test("slow interaction lookup does not block another session's live response", a
   } finally { release.resolve(); }
 });
 
-test("native active session lookup is allowed and failures stay session-local and sanitized", async (t) => {
+test("native active session failures retain native messages and later replies stay session-local", async (t) => {
   const f = await fixture(t);
   assert.deepEqual(await f.adapter.resolveSession("ses_one", process.cwd(), new AbortController()), { sessionId: "ses_one", defaultEligible: false });
   const errors = [];
   const responses = [];
-  await f.adapter.followSession(f.input("ses_one", { onError: async (error) => errors.push(error) }));
+  await f.adapter.followSession(f.input("ses_one", { onError: async (error) => errors.push(error), onResponse: async (text) => responses.push(text) }));
   await f.adapter.followSession(f.input("ses_two", { onResponse: async (text) => responses.push(text) }));
-  f.emit("ses_one", "session.execution.failed", { error: { type: "provider.auth", status: 401, message: "secret-token" } });
+  f.emit("ses_one", "session.execution.failed", { error: { type: "provider.auth", status: 401, message: "Native provider rejected authentication.", response: { body: "not message text" } } });
   f.reply("ses_two", "msg_ok", "Other session works");
   await until(() => errors.length === 1 && responses.length === 1);
-  assert.match(errors[0].message, /authentication failed/u);
-  assert.doesNotMatch(errors[0].message, /secret-token/u);
+  assert.equal(errors[0].message, "Native provider rejected authentication.");
+  assert.equal(errors[0].status, 401);
+  f.reply("ses_one", "msg_recovered", "Same session continues");
+  await until(() => responses.length === 2);
+  assert.deepEqual(responses, ["Other session works", "Same session continues"]);
 });
 
 test("live moves, follow-ups and reconnect retain the original session and response deduplication", async (t) => {
@@ -259,6 +275,79 @@ test("failed consumer delivery is not replayed and later responses still deliver
   await delay(10);
   assert.deepEqual(delivered, [firstChunk, "Next response"]);
   assert.equal(errors.length, 1);
+  assert.equal(errors[0].message, "Slack unavailable");
+});
+
+test("native response reads fail once with their original message and later responses still deliver", async (t) => {
+  const f = await fixture(t, { onRequest: ({ url, json }) => {
+    if (url.pathname.endsWith("/message/msg_failed")) {
+      json({ _tag: "ServiceUnavailableError", message: "Native response storage unavailable" }, 503);
+      return true;
+    }
+  } });
+  const errors = [], responses = [];
+  await f.adapter.followSession(f.input("ses_one", { onError: async (error) => errors.push(error), onResponse: async (text) => responses.push(text) }));
+  f.reply("ses_one", "msg_failed", "Unreadable");
+  await until(() => errors.length === 1);
+  assert.equal(errors[0].message, "UnexpectedStatus: 503");
+  assert.equal(errors[0].reason, "UnexpectedStatus");
+  assert.equal(errors[0].cause.status, 503);
+  assert.equal(f.requests.filter((request) => request.path.endsWith("/message/msg_failed")).length, 1);
+  f.reply("ses_one", "msg_after_failure", "Still followed");
+  await until(() => responses.length === 1);
+  assert.deepEqual(responses, ["Still followed"]);
+});
+
+test("native catalog requests preserve the caller's cancellation signal without an added deadline", async () => {
+  const controller = new AbortController();
+  let requestSignal;
+  const adapter = createV2Adapter({ baseUrl: "http://native.test", fetch: async (_url, init) => {
+    requestSignal = init.signal;
+    return Response.json({ data: [{ providerID: "native", id: "model", enabled: true }] });
+  } });
+  assert.deepEqual(await adapter.listModels(process.cwd(), controller.signal), { models: [{ providerID: "native", id: "model", name: undefined }] });
+  assert.equal(requestSignal, controller.signal);
+});
+
+test("shutdown cancels an unfinished native response body and drains without delivery", async (t) => {
+  const reached = Promise.withResolvers();
+  const disconnected = Promise.withResolvers();
+  const f = await fixture(t, { onRequest: ({ url, res }) => {
+    if (!url.pathname.endsWith("/message/msg_stalled")) return;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.write('{"data":');
+    res.on("close", () => disconnected.resolve());
+    reached.resolve();
+    return true;
+  } });
+  const responses = [], errors = [];
+  await f.adapter.followSession(f.input("ses_one", { onResponse: async (text) => responses.push(text), onError: async (error) => errors.push(error) }));
+  f.reply("ses_one", "msg_stalled", "Must not deliver");
+  await reached.promise;
+  f.adapter.stopAll(new Error("shutdown"));
+  await f.adapter.drain();
+  await disconnected.promise;
+  assert.deepEqual(responses, []);
+  assert.deepEqual(errors, []);
+});
+
+test("shutdown cancels a stalled explicit interrupt without a deadline or another submission", async (t) => {
+  const reached = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const f = await fixture(t, { onRequest: async ({ url }) => {
+    if (url.pathname.endsWith("/interrupt")) { reached.resolve(); await release.promise; }
+  } });
+  let settled = false;
+  const outcome = f.adapter.abortTurn("ses_one").then(() => null, (error) => error).then((result) => { settled = true; return result; });
+  await reached.promise;
+  f.adapter.stopAll(new Error("shutdown"));
+  try {
+    await until(() => settled);
+    assert.match((await outcome).message, /shutdown/u);
+    await f.adapter.drain();
+    await assert.rejects(f.adapter.abortTurn("ses_one"), /shutdown/u);
+    assert.equal(f.requests.filter((request) => request.path.endsWith("/interrupt")).length, 1);
+  } finally { release.resolve(); await outcome; }
 });
 
 test("a failed instruction update does not detach an existing background observer", async (t) => {
@@ -291,7 +380,7 @@ test("headless execution returns native text and detaches; explicit stop settles
 });
 
 test("consecutive headless requests reattach to the same native session", async (t) => {
-  const f = await fixture(t, { connectionRecoveryTimeoutMs: 100 });
+  const f = await fixture(t);
   for (let i = 0; i < 2; i++) {
     const turn = f.adapter.execute(f.input("ses_one"));
     await until(() => f.requests.filter((r) => r.path.endsWith("/prompt")).length === i + 1);
@@ -318,7 +407,7 @@ test("stopAll detaches local observers without interrupting independently submit
 });
 
 test("long-lived event bodies have no ordinary HTTP body deadline", async (t) => {
-  const f = await fixture(t, { connectionRequestTimeoutMs: 250 });
+  const f = await fixture(t);
   const responses = [];
   await f.adapter.followSession(f.input("ses_one", { onResponse: async (text) => responses.push(text), onInteraction: async () => ({ type: "cancelled" }) }));
   await delay(350);
@@ -778,20 +867,34 @@ test("failed legacy-context migration does not block this or unrelated native se
   assert.equal(f.entries.get("ses_one").get("pipa.slack"), "Stable Slack context");
 });
 
+test("native model discovery accepts missing display names", async (t) => {
+  const f = await fixture(t, { onRequest: ({ url, json }) => {
+    if (url.pathname !== "/api/model") return;
+    json({ data: [{ providerID: "native", id: "unnamed", enabled: true }] });
+    return true;
+  } });
+  const catalog = await f.adapter.listModels(process.cwd(), new AbortController().signal);
+  assert.deepEqual(catalog.models, [{ providerID: "native", id: "unnamed", name: undefined }]);
+});
+
 test("native model discovery is credential-free and switching precedes exact prompt admission", async (t) => {
+  let defaultUnavailable = true;
   const f = await fixture(t, { onRequest: async ({ req, res, url, json }) => {
     if (url.pathname === "/api/model") {
-      json({ location: { directory: process.cwd() }, data: [{ providerID: "native", id: "chosen", name: "Chosen model", enabled: true, variants: [{ id: "fast" }], headers: { authorization: "secret" } }] });
+      json({ location: { directory: "unused-catalog-location" }, data: [{ providerID: "native", id: "chosen", name: "Chosen model", enabled: true, variants: [{ id: null }], headers: { authorization: "secret" } }, { enabled: false, variants: null }] });
       return true;
     }
     if (url.pathname === "/api/model/default") {
+      if (defaultUnavailable) { res.writeHead(503); res.end(); return true; }
       json({ location: { directory: process.cwd() }, data: { providerID: "native", id: "chosen" } });
       return true;
     }
     if (req.method === "POST" && url.pathname.endsWith("/model")) { res.writeHead(204); res.end(); return true; }
   } });
   const catalog = await f.adapter.listModels(process.cwd(), new AbortController().signal);
-  assert.deepEqual(catalog, { models: [{ providerID: "native", id: "chosen", name: "Chosen model", variants: ["default", "fast"] }], defaultModel: { providerID: "native", id: "chosen", variant: "default" } });
+  assert.deepEqual(catalog, { models: [{ providerID: "native", id: "chosen", name: "Chosen model" }] });
+  assert.equal(f.requests.some((request) => request.path === "/api/model/default"), false);
+  defaultUnavailable = false;
   await f.adapter.switchModel("ses_one", null, process.cwd(), new AbortController().signal);
   await f.adapter.execute(f.input("ses_one", { model: { providerID: "native", modelID: "chosen" }, onResponse: async () => {} }));
   const switchIndex = f.requests.findLastIndex((request) => request.path.endsWith("/model") && request.method === "POST");

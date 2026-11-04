@@ -2,7 +2,7 @@
 
 import crossSpawn from "cross-spawn";
 import { constants } from "node:fs";
-import { lstat, open, readFile, realpath } from "node:fs/promises";
+import { open, readFile, realpath, stat } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
@@ -214,18 +214,13 @@ async function readPromptFile(file, workingDirectory) {
   const maxBytes = 1024 * 1024;
   const root = await realpath(workingDirectory);
   const requested = path.resolve(root, file);
-  const beforeOpen = await realpath(requested);
-  if (!isInside(root, beforeOpen)) cliError("--prompt-file must be inside the configured working directory");
-  const initial = await lstat(requested, { bigint: true });
-  if (initial.isSymbolicLink()) cliError("--prompt-file cannot be a symbolic link");
+  const initial = await stat(requested, { bigint: true });
   if (!initial.isFile()) cliError("--prompt-file must be a regular file");
-  const handle = await open(requested, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  const handle = await open(requested, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
   try {
     const opened = await handle.stat({ bigint: true });
-    const resolved = await realpath(requested);
-    if (!isInside(root, resolved)) cliError("--prompt-file must be inside the configured working directory");
-    const current = await lstat(requested, { bigint: true });
-    if (!opened.isFile() || current.isSymbolicLink()
+    const current = await stat(requested, { bigint: true });
+    if (!opened.isFile()
       || initial.dev !== opened.dev || initial.ino !== opened.ino
       || current.dev !== opened.dev || current.ino !== opened.ino) cliError("--prompt-file must be an unchanged regular file");
     if (opened.size > BigInt(maxBytes)) cliError("--prompt-file must be no larger than 1 MB");
@@ -245,11 +240,6 @@ async function readPromptFile(file, workingDirectory) {
   } finally {
     await handle.close();
   }
-}
-
-function isInside(root, candidate) {
-  const relative = path.relative(root, candidate);
-  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 function scheduleFromOptions(values, now) {

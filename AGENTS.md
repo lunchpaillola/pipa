@@ -13,6 +13,7 @@ Setup, checks, contribution, release process: [`CONTRIBUTING.md`](CONTRIBUTING.m
 - Shutdown rejects new work and drains local observers/callbacks before disconnecting Slack. V1 aborts its server-side turns; v2 does not interrupt independently continuing native sessions. Owned OpenCode processes still stop; attached servers stay running.
 - Attached OpenCode servers are health-checked, never process-owned.
 - V2 follows native session responses beyond the first reply. Do not add turn-ownership policy or a second execution/recovery journal over OpenCode.
+- V2 execution failures use OpenCode's message text. Do not add provider-error classification, recovery advice, or another sanitization layer.
 - Runtime stays plain ESM. Prefer Node APIs and existing dependencies.
 
 ## Security

@@ -976,11 +976,12 @@ throw Error('Native file-command completion deadline exceeded');
       };
       const before = await get();
       const writesBefore = wires.filter((wire) => wire.method === "POST" && wire.path.endsWith("/model")).length;
-      for (const model of [{ providerID: "absent", id: "matrix" }, { providerID: "excluded", id: "matrix" }, { providerID: "matrix", id: "disabled" }, { providerID: "matrix", id: "matrix", variant: "absent" }]) {
-        await assert.rejects(executor.switchModel({ sessionId: first.sessionId, model, workingDirectory: runtime.workspace }), /unavailable/u);
+      const invalidModels = [{ providerID: "absent", id: "matrix" }, { providerID: "excluded", id: "matrix" }, { providerID: "matrix", id: "disabled" }, { providerID: "matrix", id: "matrix", variant: "absent" }];
+      for (const model of invalidModels) {
+        await assert.rejects(executor.switchModel({ sessionId: first.sessionId, model, workingDirectory: runtime.workspace }));
         assert.deepEqual(await get(), before, "Unavailable selection mutated the native session");
       }
-      assert.equal(wires.filter((wire) => wire.method === "POST" && wire.path.endsWith("/model")).length, writesBefore);
+      assert.equal(wires.filter((wire) => wire.method === "POST" && wire.path.endsWith("/model")).length, writesBefore + invalidModels.length);
       await executor.switchModel({ sessionId: first.sessionId, model: { providerID: "matrix", id: "matrix-next" }, workingDirectory: runtime.workspace });
       const next = await turn("model-next", { sessionId: first.sessionId }, { verify: (messages) => assert.ok(JSON.stringify(messages).includes(promptFor("model-first"))) });
       assertTurnOutcome(next, { sessionId: first.sessionId, text: textFor("model-next") });
@@ -1017,8 +1018,6 @@ throw Error('Native file-command completion deadline exceeded');
     },
     "models-default": async () => {
       if (requireExecutor()) return requireExecutor();
-      const catalog = await executor.listModels({ workingDirectory: runtime.workspace });
-      assert.deepEqual(catalog.defaultModel, { providerID: "matrix", id: "matrix", variant: "default" });
       await turn("model-default");
       const receipt = provider.receipts.find((receipt) => receipt.prompt === promptFor("model-default"));
       assert.deepEqual([receipt.provider, receipt.model, receipt.temperature], ["matrix", "matrix", undefined]);

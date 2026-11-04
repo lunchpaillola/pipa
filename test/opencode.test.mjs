@@ -100,17 +100,18 @@ test("U1 v2 startup checks workspace readiness without consulting migration stat
       const pathname = new URL(url).pathname;
       calls.push(pathname);
       if (pathname === "/global/health") return new Response("<html>");
-      if (pathname === "/api/info") return jsonResponse(v2Info);
+      if (pathname === "/api/info") return jsonResponse({ version: v2Info.version });
       assert.equal(pathname, "/api/location");
-      return jsonResponse(v2Location);
+      return jsonResponse({ directory: v2Location.directory });
     },
   });
   assert.deepEqual(calls, ["/global/health", "/api/info", "/api/location"]);
   server.stop(); await server.wait();
 });
 
-test("owned v2 launch preserves regex-stack overrides, supports 10 MiB, authenticates and catches mismatch", async () => {
-  for (const regexStack of [undefined, "805306368"]) for (const mismatch of [false, true]) {
+test("owned v2 launch authenticates, accepts different v2 versions and rejects a different protocol", async () => {
+  for (const regexStack of [undefined, "805306368"]) for (const version of ["2.0.29", "2.2.5", "1.19.0"]) {
+    const mismatch = version === "1.19.0";
     const child = childProcess();
     let invocation;
     let killed = false;
@@ -122,7 +123,7 @@ test("owned v2 launch preserves regex-stack overrides, supports 10 MiB, authenti
         assert.equal(init.headers.authorization, `Basic ${Buffer.from(`opencode:${invocation.options.env.OPENCODE_PASSWORD}`).toString("base64")}`);
         const pathname = new URL(url).pathname;
         if (pathname === "/global/health") return mismatch ? jsonResponse({ healthy: true, version: "1.19.0" }) : new Response("<html>");
-        if (pathname === "/api/info") return jsonResponse(v2Info);
+        if (pathname === "/api/info") return jsonResponse({ ...v2Info, version });
         if (pathname === "/api/experimental/migration/v1") return jsonResponse({ status: "completed" });
         return jsonResponse(v2Location);
       },
@@ -143,7 +144,7 @@ test("owned v2 launch preserves regex-stack overrides, supports 10 MiB, authenti
 for (const invalid of ["html", "schema", "major"]) test(`U1 invalid identity ${invalid} is actionable`, async () => {
   await assert.rejects(startSocketOpenCodeServer({ workingDirectory: "/work" }, {
     attachUrl: "http://localhost:5555", environment: {}, startupTimeoutMs: 20,
-    fetch: async () => invalid === "html" ? new Response("<html>") : jsonResponse(invalid === "major" ? { healthy: true, version: "3.0.0" } : { version: "2.0.29" }),
+    fetch: async () => invalid === "html" ? new Response("<html>") : jsonResponse(invalid === "major" ? { healthy: true, version: "3.0.0" } : { version: null }),
   }), /unsupported|protocol|identity/iu);
 });
 
@@ -238,6 +239,49 @@ test("ordinary owned startup can wait for a listening URL beyond thirty seconds"
   const server = await starting;
   assert.equal(server.connection.major, 1);
   server.stop(); await server.wait();
+});
+
+for (const major of [1, 2]) test(`v${major} discovery waits for readiness before applying version-specific timing`, async (t) => {
+  const requested = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const discovery = Promise.withResolvers();
+  let discoverySignal;
+  const executor = createExecutor({ baseUrl: "http://localhost:5555", environment: {},
+    fetch: async (url, { signal }) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/global/health") {
+        requested.resolve();
+        await release.promise;
+        return major === 1 ? jsonResponse({ healthy: true, version: "1.19.0" }) : new Response("<html>");
+      }
+      if (pathname === "/api/info") return jsonResponse(v2Info);
+      if (["/api/location", "/path"].includes(pathname)) return jsonResponse({ directory: "/work" });
+      if (pathname === "/session/status") return jsonResponse({});
+      assert.equal(pathname, major === 1 ? "/config/providers" : "/api/model");
+      discoverySignal = signal;
+      discovery.resolve();
+      if (major === 2) return jsonResponse({ data: [] });
+      return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    },
+  });
+  t.after(() => executor.stopAll());
+  t.after(() => release.resolve());
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const outcome = executor.listModels("/work").then((value) => ({ value }), (error) => ({ error }));
+  await requested.promise;
+  t.mock.timers.tick(30_001);
+  await new Promise(setImmediate);
+  assert.equal(await Promise.race([outcome, Promise.resolve("waiting")]), "waiting");
+  release.resolve();
+  await discovery.promise;
+  if (major === 1) {
+    t.mock.timers.tick(29_999);
+    assert.equal(discoverySignal.aborted, false);
+    t.mock.timers.tick(1);
+    assert.match((await outcome).error.message, /Model discovery timed out/u);
+    assert.equal(discoverySignal.aborted, true);
+  } else assert.deepEqual((await outcome).value, []);
+  t.mock.timers.reset();
 });
 
 test("a turn can be cancelled while unbounded readiness is pending, and stopAll cancels the probe", async (t) => {

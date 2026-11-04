@@ -273,12 +273,11 @@ export function createOpenCodeExecutor(options = {}) {
       if (signal?.aborted) abort();
       else signal?.addEventListener("abort", abort, { once: true });
       active.add(controller);
-      // Slack is acknowledged before discovery; allow slow catalogs without waiting forever.
-      const timer = setTimeout(() => controller.abort(new Error("Model discovery timed out.")), 30_000);
+      let timer;
       try {
         await abortable(ready(workingDirectory), controller.signal);
         controller.signal.throwIfAborted();
-        if (!capabilities.modelDiscovery) throw new Error("OpenCode model discovery is not supported by this adapter.");
+        if (!capabilities.backgroundResponses) timer = setTimeout(() => controller.abort(new Error("Model discovery timed out.")), 30_000);
         const catalog = await abortable(adapter.listModels(workingDirectory, controller.signal), controller.signal);
         controller.signal.throwIfAborted();
         return flat ? catalog.models.map((model) => ({ providerID: model.providerID, modelID: model.id, name: model.name })) : catalog;
@@ -632,22 +631,20 @@ export async function checkOpenCodeConnection(baseUrl, workingDirectory, options
         } else {
           const headers = authenticationHeaders(environment, 2);
           const info = await read("/api/info", headers, undefined, true);
-          if (!info || typeof info.version !== "string" || !Number.isSafeInteger(info.pid) || info.pid <= 0
-            || !Array.isArray(info.urls) || !info.urls.every((url) => typeof url === "string") || typeof info.paths?.tmp !== "string") {
+          if (typeof info?.version !== "string") {
             throw new Error("OpenCode identity protocol is unsupported. Check the selected server URL and install a supported v1 or v2 runtime.");
           }
           const identity = parseOpenCodeVersion(info.version);
           if (identity.major !== 2) throw new Error("OpenCode identity/protocol mismatch at /api/info.");
           connection = { ...identity, headers };
         }
-        if (options.identity && options.identity.version !== connection.version) throw new Error("OpenCode CLI/server identity mismatch. Check the executable and selected listening server.");
+        if (options.identity && (options.identity.major !== connection.major || (connection.major === 1 && options.identity.version !== connection.version))) throw new Error("OpenCode CLI/server identity mismatch. Check the executable and selected listening server.");
       }
       const headers = connection.headers;
       if (connection.major === 2) {
         const locationUrl = `/api/location?${new URLSearchParams({ "location[directory]": workingDirectory })}`;
         const location = await read(locationUrl, headers);
-        if (typeof location?.directory !== "string" || !path.isAbsolute(location.directory) || typeof location.project?.id !== "string"
-          || typeof location.project?.directory !== "string" || typeof location.project?.canonical !== "string") throw new Error("OpenCode location protocol has an invalid schema.");
+        if (typeof location?.directory !== "string" || !path.isAbsolute(location.directory)) throw new Error("OpenCode location protocol has an invalid schema.");
         if (path.resolve(location.directory) !== path.resolve(workingDirectory)) throw new Error("OpenCode workspace identity mismatch. Select a server serving the configured working directory.");
       } else {
         const location = await read("/path", headers, workingDirectory);
