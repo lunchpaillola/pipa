@@ -310,7 +310,7 @@ export function createV2Adapter(options) {
                   const message = await readWithRecovery((signal) => client.session.message.get({ sessionID: observer.sessionId, messageID: event.data.assistantMessageID }, { signal }), observer.controller.signal);
                   await deliverResponse(observer, message);
                 });
-                if (event.type === "session.execution.failed") queueResponse(observer, () => report(observer, executionError(event.data.error)));
+                if (event.type === "session.execution.failed") queueResponse(observer, () => report(observer, Object.assign(new Error(event.data.error.message), event.data.error)));
                 if (event.type === "session.execution.interrupted") settleWaiters(observer, "");
                 if (event.type === "session.tool.called") void reconcile(observer).catch(() => undefined);
               }
@@ -508,18 +508,4 @@ export function createV2Adapter(options) {
 
 function retryable(error) {
   return error.reason === "Transport" || (error.reason === "UnexpectedStatus" && [502, 503, 504].includes(error.cause?.status));
-}
-
-function executionError(error) {
-  const status = error?.status;
-  const http = Number.isInteger(status) && status >= 400 && status <= 599 ? ` (HTTP ${status})` : "";
-  // Classify native structured errors; provider messages/bodies can contain credentials.
-  if (typeof error?.type !== "string" || !error.type.startsWith("provider.")) return new Error(`OpenCode execution failed${http}.`);
-  if (status === 401 || error.type === "provider.auth") {
-    const expired = status === 401 && typeof error.message === "string" && /\bAPI key (?:has )?expired\b/iu.test(error.message);
-    return new Error(expired
-      ? "OpenCode selected provider API key has expired. Replace that provider's API key or change this session's model in OpenCode, then retry in this thread."
-      : `OpenCode selected provider authentication failed${http}. Reconnect that provider or change this session's model in OpenCode, then retry in this thread.`);
-  }
-  return new Error(`OpenCode selected provider ${http ? `failed${http}` : "failed to complete the turn"}.`);
 }

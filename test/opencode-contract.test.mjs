@@ -366,16 +366,16 @@ for (const generation of ["v1", "v2"]) test(`${generation} invalid selected defa
   wire.assertComplete();
 });
 
-for (const [label, error, providerID, expected] of [
-  ["HTTP 401", { type: "provider.auth", status: 401, message: "invalid key private-message-secret" }, "connected", /selected provider authentication failed \(HTTP 401\)\. Reconnect that provider/u],
-  ["expired key", { type: "provider.auth", status: 401, message: "This API key has expired. private-message-secret" }, "connected", /selected provider API key has expired\. Replace that provider's API key/u],
-  ["native auth", { type: "provider.auth", message: "private-message-secret" }, "connected", /selected provider authentication failed\. Reconnect that provider/u],
-  ["HTTP 429", { type: "provider.rate-limit", status: 429, message: "private-message-secret" }, "connected", /selected provider failed \(HTTP 429\)/u],
-  ["unsafe provider", { type: "provider.auth", status: 401, message: "private-message-secret" }, "connected\nprivate-provider-secret", /selected provider authentication failed \(HTTP 401\)/u],
-  ["unsafe type and misleading message", { type: "private-type-secret", status: 429, message: "HTTP 401 API key has expired private-message-secret" }, "connected", /OpenCode execution failed \(HTTP 429\)/u],
-  ["tool failure", { type: "tool.failure", message: "private-message-secret" }, "connected", /OpenCode execution failed\./u],
-  ["non-provider HTTP 401", { type: "tool.failure", status: 401, message: "private-message-secret" }, "connected", /OpenCode execution failed \(HTTP 401\)/u],
-]) test(`v2 provider diagnostics: ${label} uses only safe native structured fields`, async (t) => {
+for (const [label, error, providerID] of [
+  ["HTTP 401", { type: "provider.auth", status: 401, message: "Native provider rejected authentication." }, "connected"],
+  ["expired key", { type: "provider.auth", status: 401, message: "This API key has expired." }, "connected"],
+  ["native auth", { type: "provider.auth", message: "Sign in to the native provider." }, "connected"],
+  ["HTTP 429", { type: "provider.rate-limit", status: 429, message: "Native quota exhausted; try again later." }, "connected"],
+  ["provider metadata", { type: "provider.auth", status: 401, message: "The selected connection needs attention." }, "connected\nprovider-metadata"],
+  ["custom type", { type: "custom.failure", status: 429, message: "Native failure with its own explanation." }, "connected"],
+  ["tool failure", { type: "tool.failure", message: "Native tool could not open the file." }, "connected"],
+  ["non-provider HTTP 401", { type: "tool.failure", status: 401, message: "The tool endpoint rejected authentication." }, "connected"],
+]) test(`v2 native error messages: ${label} preserves the upstream text and metadata`, async (t) => {
   const { document, executor, input, wire, runtime } = await fixture(t, "v2");
   const timeline = document.routes.find((route) => route.path.endsWith("/message")).responses.at(-1).json.data;
   Object.assign(timeline.find((message) => message.type === "assistant"), {
@@ -383,11 +383,10 @@ for (const [label, error, providerID, expected] of [
   });
   timeline.find((message) => message.type === "idle").outcome = "failed";
   await assert.rejects(executor.runTurn(input), (failure) => {
-    assert.match(failure.message, expected);
-    assert.doesNotMatch(failure.message, /private-(?:message|response|provider|type)-secret/u);
-    if (error.type === "provider.auth") assert.match(failure.message, /change this session's model in OpenCode, then retry in this thread/u);
-    if (!error.type.startsWith("provider.")) assert.doesNotMatch(failure.message, /provider|authentication/u);
-    if (label !== "expired key") assert.doesNotMatch(failure.message, /expired/u);
+    assert.equal(failure.message, error.message);
+    assert.equal(failure.type, error.type);
+    assert.equal(failure.status, error.status);
+    assert.doesNotMatch(failure.message, /private-response-secret/u);
     return true;
   });
   assert.equal(wire.calls.filter((call) => call.path.endsWith("/prompt")).length, 1);

@@ -190,18 +190,21 @@ test("slow interaction lookup does not block another session's live response", a
   } finally { release.resolve(); }
 });
 
-test("native active session lookup is allowed and failures stay session-local and sanitized", async (t) => {
+test("native active session failures retain native messages and later replies stay session-local", async (t) => {
   const f = await fixture(t);
   assert.deepEqual(await f.adapter.resolveSession("ses_one", process.cwd(), new AbortController()), { sessionId: "ses_one", defaultEligible: false });
   const errors = [];
   const responses = [];
-  await f.adapter.followSession(f.input("ses_one", { onError: async (error) => errors.push(error) }));
+  await f.adapter.followSession(f.input("ses_one", { onError: async (error) => errors.push(error), onResponse: async (text) => responses.push(text) }));
   await f.adapter.followSession(f.input("ses_two", { onResponse: async (text) => responses.push(text) }));
-  f.emit("ses_one", "session.execution.failed", { error: { type: "provider.auth", status: 401, message: "secret-token" } });
+  f.emit("ses_one", "session.execution.failed", { error: { type: "provider.auth", status: 401, message: "Native provider rejected authentication.", response: { body: "not message text" } } });
   f.reply("ses_two", "msg_ok", "Other session works");
   await until(() => errors.length === 1 && responses.length === 1);
-  assert.match(errors[0].message, /authentication failed/u);
-  assert.doesNotMatch(errors[0].message, /secret-token/u);
+  assert.equal(errors[0].message, "Native provider rejected authentication.");
+  assert.equal(errors[0].status, 401);
+  f.reply("ses_one", "msg_recovered", "Same session continues");
+  await until(() => responses.length === 2);
+  assert.deepEqual(responses, ["Other session works", "Same session continues"]);
 });
 
 test("live moves, follow-ups and reconnect retain the original session and response deduplication", async (t) => {
