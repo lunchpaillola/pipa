@@ -79,7 +79,7 @@ export function createV2Adapter(options) {
     if (!Array.isArray(catalog.data)) throw new Error("OpenCode returned an invalid model catalog.");
     const enabled = catalog.data.filter((model) => model?.enabled);
     if (enabled.some((model) => typeof model.id !== "string" || !model.id
-      || typeof model.providerID !== "string" || !model.providerID || typeof model.name !== "string")) throw new Error("OpenCode returned an invalid model catalog.");
+      || typeof model.providerID !== "string" || !model.providerID)) throw new Error("OpenCode returned an invalid model catalog.");
     const models = enabled.map((model) => ({
       providerID: model.providerID, id: model.id, name: model.name,
     }));
@@ -445,7 +445,7 @@ export function createV2Adapter(options) {
       const created = !session;
       if (!session) {
         session = await client.session.create({ location: { directory: workingDirectory } }, { signal });
-        if (typeof session?.id !== "string" || session.location?.directory !== workingDirectory) throw new Error("OpenCode did not create a session in the configured workspace.");
+        if (typeof session?.id !== "string" || !session.id) throw new Error("OpenCode did not return a usable session identity.");
       }
       const history = !created && !session.model ? await readWithRecovery((signal) => client.message.list({ sessionID: session.id, limit: 1 }, { signal }), signal) : null;
       if (history && !Array.isArray(history.data)) throw new Error("OpenCode returned an invalid message projection.");

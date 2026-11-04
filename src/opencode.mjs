@@ -631,8 +631,7 @@ export async function checkOpenCodeConnection(baseUrl, workingDirectory, options
         } else {
           const headers = authenticationHeaders(environment, 2);
           const info = await read("/api/info", headers, undefined, true);
-          if (!info || typeof info.version !== "string" || !Number.isSafeInteger(info.pid) || info.pid <= 0
-            || !Array.isArray(info.urls) || !info.urls.every((url) => typeof url === "string") || typeof info.paths?.tmp !== "string") {
+          if (typeof info?.version !== "string") {
             throw new Error("OpenCode identity protocol is unsupported. Check the selected server URL and install a supported v1 or v2 runtime.");
           }
           const identity = parseOpenCodeVersion(info.version);
@@ -645,8 +644,7 @@ export async function checkOpenCodeConnection(baseUrl, workingDirectory, options
       if (connection.major === 2) {
         const locationUrl = `/api/location?${new URLSearchParams({ "location[directory]": workingDirectory })}`;
         const location = await read(locationUrl, headers);
-        if (typeof location?.directory !== "string" || !path.isAbsolute(location.directory) || typeof location.project?.id !== "string"
-          || typeof location.project?.directory !== "string" || typeof location.project?.canonical !== "string") throw new Error("OpenCode location protocol has an invalid schema.");
+        if (typeof location?.directory !== "string" || !path.isAbsolute(location.directory)) throw new Error("OpenCode location protocol has an invalid schema.");
         if (path.resolve(location.directory) !== path.resolve(workingDirectory)) throw new Error("OpenCode workspace identity mismatch. Select a server serving the configured working directory.");
       } else {
         const location = await read("/path", headers, workingDirectory);

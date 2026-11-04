@@ -100,9 +100,9 @@ test("U1 v2 startup checks workspace readiness without consulting migration stat
       const pathname = new URL(url).pathname;
       calls.push(pathname);
       if (pathname === "/global/health") return new Response("<html>");
-      if (pathname === "/api/info") return jsonResponse(v2Info);
+      if (pathname === "/api/info") return jsonResponse({ version: v2Info.version });
       assert.equal(pathname, "/api/location");
-      return jsonResponse(v2Location);
+      return jsonResponse({ directory: v2Location.directory });
     },
   });
   assert.deepEqual(calls, ["/global/health", "/api/info", "/api/location"]);
@@ -143,7 +143,7 @@ test("owned v2 launch preserves regex-stack overrides, supports 10 MiB, authenti
 for (const invalid of ["html", "schema", "major"]) test(`U1 invalid identity ${invalid} is actionable`, async () => {
   await assert.rejects(startSocketOpenCodeServer({ workingDirectory: "/work" }, {
     attachUrl: "http://localhost:5555", environment: {}, startupTimeoutMs: 20,
-    fetch: async () => invalid === "html" ? new Response("<html>") : jsonResponse(invalid === "major" ? { healthy: true, version: "3.0.0" } : { version: "2.0.29" }),
+    fetch: async () => invalid === "html" ? new Response("<html>") : jsonResponse(invalid === "major" ? { healthy: true, version: "3.0.0" } : { version: null }),
   }), /unsupported|protocol|identity/iu);
 });
 

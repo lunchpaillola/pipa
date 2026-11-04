@@ -114,6 +114,27 @@ test("native events deliver initial and later background responses after admissi
   assert.equal(f.requests.find((r) => r.path.endsWith("/prompt")).body.text, "exact prompt");
 });
 
+test("native session creation accepts returned identity without a directory-spelling veto", async (t) => {
+  const f = await fixture(t, { onRequest: ({ req, url, json }) => {
+    if (url.pathname !== "/api/session" || req.method !== "POST") return;
+    json({ data: { id: "ses_created", location: { directory: "/native/canonical/location" } } });
+    return true;
+  } });
+  assert.deepEqual(await f.adapter.resolveSession(null, process.cwd(), new AbortController()), { sessionId: "ses_created", defaultEligible: true });
+  assert.equal(f.requests.filter((request) => request.path === "/api/session" && request.method === "POST").length, 1);
+  assert.deepEqual(await f.adapter.execute(f.input("ses_created", { onResponse: async () => {} })), { pending: true });
+  assert.equal(f.requests.find((request) => request.path.endsWith("/prompt")).path, "/api/session/ses_created/prompt");
+});
+
+for (const id of [undefined, ""]) test(`native session creation requires usable identity (${String(id)})`, async (t) => {
+  const f = await fixture(t, { onRequest: ({ req, url, json }) => {
+    if (url.pathname !== "/api/session" || req.method !== "POST") return;
+    json({ data: { id } });
+    return true;
+  } });
+  await assert.rejects(f.adapter.resolveSession(null, process.cwd(), new AbortController()), /session identity/u);
+});
+
 test("unavailable response observation fails before admitting unobservable work", async (t) => {
   const f = await fixture(t, { connectionRecoveryTimeoutMs: 25, onRequest: ({ url, json }) => {
     if (url.pathname === "/api/event") { json({}, 503); return true; }
@@ -779,6 +800,16 @@ test("failed legacy-context migration does not block this or unrelated native se
   await f.adapter.followSession(f.input("ses_two"));
   assert.equal(f.globalStreams.size, 1);
   assert.equal(f.entries.get("ses_one").get("pipa.slack"), "Stable Slack context");
+});
+
+test("native model discovery accepts missing display names", async (t) => {
+  const f = await fixture(t, { onRequest: ({ url, json }) => {
+    if (url.pathname !== "/api/model") return;
+    json({ data: [{ providerID: "native", id: "unnamed", enabled: true }] });
+    return true;
+  } });
+  const catalog = await f.adapter.listModels(process.cwd(), new AbortController().signal);
+  assert.deepEqual(catalog.models, [{ providerID: "native", id: "unnamed", name: undefined }]);
 });
 
 test("native model discovery is credential-free and switching precedes exact prompt admission", async (t) => {
