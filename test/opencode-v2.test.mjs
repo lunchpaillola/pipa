@@ -570,6 +570,10 @@ test("Slack preserves duplicate-label choices, custom text, empty answers and op
       assert.match(JSON.stringify(updated[0]), /Default/u);
       assert.doesNotMatch(JSON.stringify(updated[0]), /account-b/u);
     }
+    if (["empty", "skip", "empty-multiselect"].includes(mode)) {
+      assert.equal(updated[0].text, "Optional answers left blank.");
+      assert.equal(updated[0].blocks[1].text.text, "Optional answers left blank.");
+    }
     });
   }
 });

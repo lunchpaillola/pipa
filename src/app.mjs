@@ -516,7 +516,7 @@ export function createPendingInteractions(allowedUserIds = []) {
     }
     if (event.actionId?.startsWith("pipa_custom_")) {
       const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
-      await event.openModal?.(Modal({ callbackId: "pipa_custom", privateMetadata: token, title: "Custom answer", submitLabel: "Submit", children: [TextInput({ id: "answer", label: question.multiple ? "Answer (replaces checkbox selections)" : "Answer", optional: question.required === false })] }));
+      await event.openModal?.(Modal({ callbackId: "pipa_custom", privateMetadata: `${token}.${entry.questionIndex}`, title: "Custom answer", submitLabel: "Submit", children: [TextInput({ id: "answer", label: question.multiple ? "Answer (replaces checkbox selections)" : "Answer", optional: question.required === false })] }));
       return;
     }
     if (entry.type !== "question") return;
@@ -546,11 +546,12 @@ export function createPendingInteractions(allowedUserIds = []) {
   }
 
   async function onCustomAnswer(event) {
-    const entry = pending.get(event.privateMetadata);
+    const entry = pending.get(String(event.privateMetadata ?? "").split(".")[0]);
     if (!entry) return;
     if (event.relatedThread?.id !== entry.threadId) return;
     if (!await canRespond(entry, event.user)) return;
     if (entry.busy || entry.decision !== undefined || entry.type !== "question") return;
+    if (event.privateMetadata !== `${entry.token}.${entry.questionIndex}`) return;
     const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
     const answer = question.required === undefined ? event.values?.answer?.trim() : event.values?.answer ?? "";
     if (!answer && question.required !== false) return { action: "errors", errors: { answer: "Enter an answer." } };
@@ -600,7 +601,7 @@ function renderSubmitted(entry, decision) {
   if (decision?.type === "stop") content = "Dismissed.";
   else if (entry.type === "permission") ({ title, content } = permissionOutcome(entry.request, decision));
   else {
-    const answers = entry.answers.flat().filter(answer => answer !== null && answer !== undefined);
+    const answers = entry.answers.flat().filter(answer => answer !== null && answer !== undefined && answer !== "");
     content = answers.length ? `${decision?.selectedBy ? `${decision.selectedBy} selected` : "Selected"}: ${answers.map((answer) => `“${typeof answer === "string" ? answer : answer.label}”`).join(", ")}.` : "Optional answers left blank.";
   }
   return { title, content };
