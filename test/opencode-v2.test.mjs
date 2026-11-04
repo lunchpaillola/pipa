@@ -779,19 +779,23 @@ test("failed legacy-context migration does not block this or unrelated native se
 });
 
 test("native model discovery is credential-free and switching precedes exact prompt admission", async (t) => {
+  let defaultUnavailable = true;
   const f = await fixture(t, { onRequest: async ({ req, res, url, json }) => {
     if (url.pathname === "/api/model") {
-      json({ location: { directory: process.cwd() }, data: [{ providerID: "native", id: "chosen", name: "Chosen model", enabled: true, variants: [{ id: "fast" }], headers: { authorization: "secret" } }] });
+      json({ location: { directory: "unused-catalog-location" }, data: [{ providerID: "native", id: "chosen", name: "Chosen model", enabled: true, variants: [{ id: null }], headers: { authorization: "secret" } }, { enabled: false, variants: null }] });
       return true;
     }
     if (url.pathname === "/api/model/default") {
+      if (defaultUnavailable) { res.writeHead(503); res.end(); return true; }
       json({ location: { directory: process.cwd() }, data: { providerID: "native", id: "chosen" } });
       return true;
     }
     if (req.method === "POST" && url.pathname.endsWith("/model")) { res.writeHead(204); res.end(); return true; }
   } });
   const catalog = await f.adapter.listModels(process.cwd(), new AbortController().signal);
-  assert.deepEqual(catalog, { models: [{ providerID: "native", id: "chosen", name: "Chosen model", variants: ["default", "fast"] }], defaultModel: { providerID: "native", id: "chosen", variant: "default" } });
+  assert.deepEqual(catalog, { models: [{ providerID: "native", id: "chosen", name: "Chosen model" }] });
+  assert.equal(f.requests.some((request) => request.path === "/api/model/default"), false);
+  defaultUnavailable = false;
   await f.adapter.switchModel("ses_one", null, process.cwd(), new AbortController().signal);
   await f.adapter.execute(f.input("ses_one", { model: { providerID: "native", modelID: "chosen" }, onResponse: async () => {} }));
   const switchIndex = f.requests.findLastIndex((request) => request.path.endsWith("/model") && request.method === "POST");

@@ -87,7 +87,7 @@ for (const revoked of [false, true]) test(`native Save acknowledges before confi
     await routing;
     await picker.drain();
   }
-  assert.equal(discoveries, revoked ? 1 : 2);
+  assert.equal(discoveries, 1);
   assert.equal(writes, revoked ? 0 : 1);
   assert.equal(notices.length, revoked ? 0 : 1);
 });
@@ -143,9 +143,9 @@ for (const shutdown of [false, true]) test(`Save acknowledges before slow work; 
     open: async () => ({ view: { id: "V1" } }),
     update: async (input) => { view = input.view; },
   } }, postEphemeral: async (...args) => notices.push(args) };
-  const picker = createModelPicker({ botName: "Chopper", commands: ["/chopper"], loadConfig: async () => ({}),
+  const picker = createModelPicker({ botName: "Chopper", commands: ["/chopper"], loadConfig: async () => { if (loadingSave) await gate.promise; return {}; },
     chat: { onSlashCommand: (_id, fn) => { handlers.open = fn; }, onModalSubmit: (_id, fn) => { handlers.save = fn; }, onOptionsLoad: (fn) => { handlers.options = fn; } },
-    listModels: async () => { if (loadingSave) await gate.promise; return [{ providerID: "openai", modelID: "a", name: "Model A" }]; },
+    listModels: async () => [{ providerID: "openai", modelID: "a", name: "Model A" }],
     setting: { save: async (_model, authorize) => { authorize({}); writes++; writeStarted.resolve(); await writeGate.promise; } } });
   await handlers.open({ text: "model", user: { userId: "U1" }, triggerId: "trigger", adapter,
     channel: { id: "slack:C1", postEphemeral: async () => undefined } });
@@ -314,7 +314,7 @@ for (const [botName, command] of [["Chopper", "/chopper"], ["Chopper", "/pipa"],
   assert.equal(calls.length, 2);
 });
 
-test("private picker searches/saves/reopens/cancels without inference and rechecks auth", async () => {
+for (const catalogChange of ["outage", "removal"]) test(`private picker searches/saves/reopens/cancels without inference and rechecks auth after catalog ${catalogChange}`, async () => {
   const paths = pipaPaths(await mkdtemp(path.join(os.tmpdir(), "pipa-picker-")));
   const config = { botName: "Pipa", workingDirectory: "/work", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", allowedSlackUserIds: ["U1"], allowedSlackChannelIds: ["C1"] };
   await writePrivateJson(paths.config, config);
@@ -328,7 +328,8 @@ test("private picker searches/saves/reopens/cancels without inference and rechec
   };
   let modal;
   let discoveries = 0;
-  const picker = createModelPicker({ chat, botName: "Pipa", commands: ["/pipa"], loadConfig: () => loadConfig(paths.config), setting: createModelSetting(paths.config), listModels: async () => { discoveries++; return models; } });
+  let unavailable = false;
+  const picker = createModelPicker({ chat, botName: "Pipa", commands: ["/pipa"], loadConfig: () => loadConfig(paths.config), setting: createModelSetting(paths.config), listModels: async () => { discoveries++; if (unavailable) throw new Error("catalog unavailable"); return models; } });
   const user = { userId: "U1" };
   const messages = [];
   const opening = { user, text: "model", triggerId: "trigger", channel: { id: "slack:C1", postEphemeral: async (...args) => messages.push(args) },
@@ -344,11 +345,17 @@ test("private picker searches/saves/reopens/cancels without inference and rechec
   assert.equal(options.length, 1);
   assert.equal(options[0].label, "Model A");
   const submission = { user, adapter: opening.adapter, privateMetadata: JSON.parse(modal.private_metadata).m, viewId: "V1", values: { [input.action_id]: options[0].value } };
+  const displayed = models[0];
+  unavailable = catalogChange === "outage";
+  if (catalogChange === "removal") models.length = 0;
   const saved = await handlers.submit(submission);
   assert.equal(saved.action, "close");
   await picker.drain();
   assert.equal(messages.at(-1)[2], "New threads will use Model A.");
   assert.deepEqual((await loadConfig(paths.config)).defaultModel, { providerID: "openai", modelID: "model/a.b" });
+  assert.equal(discoveries, 1, "Save uses the displayed model without catalog rediscovery");
+  unavailable = false;
+  if (catalogChange === "removal") models.push(displayed);
   await handlers.slash(opening);
   assert.equal(modal.blocks[0].element.initial_option.value, options[0].value);
   assert.equal(modal.blocks[0].element.initial_option.text.text, "Model A");
@@ -419,8 +426,8 @@ test("picker failure paths never persist and search results respect Slack bounds
   const [removed] = models.splice(99, 1);
   assert.equal((await handlers.save(save)).action, "close");
   await picker.drain();
-  assert.match(saveResults.at(-1), /no longer available/u, "Save rechecks models removed since opening");
-  assert.equal(writes, 0);
+  assert.match(saveResults.at(-1), /couldn't save/u, "Save attempts persistence using the cached model even after catalog removal");
+  assert.equal(writes, 1);
   models.push(removed);
   await handlers.open(event);
   save = submission();
@@ -428,17 +435,17 @@ test("picker failure paths never persist and search results respect Slack bounds
   assert.equal(failedWrite.action, "close");
   await picker.drain();
   assert.match(saveResults.at(-1), /couldn't save.*Reopen \/pipa-test model/u);
-  assert.equal(writes, 1);
+  assert.equal(writes, 2);
   await handlers.open(event);
   save = submission();
   config.allowedSlackChannelIds = ["C2"];
   assert.equal((await handlers.save(save)).action, "close");
   await picker.drain();
-  assert.equal(writes, 1);
+  assert.equal(writes, 2);
   config.allowedSlackChannelIds = ["C1"];
   clock = 31 * 60_000;
   assert.equal((await handlers.save(save)).action, "errors");
-  assert.equal(writes, 1);
+  assert.equal(writes, 2);
   const beforeClose = modal;
   picker.close();
   await handlers.open(event);

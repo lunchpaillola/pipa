@@ -278,7 +278,6 @@ export function createOpenCodeExecutor(options = {}) {
       try {
         await abortable(ready(workingDirectory), controller.signal);
         controller.signal.throwIfAborted();
-        if (!capabilities.modelDiscovery) throw new Error("OpenCode model discovery is not supported by this adapter.");
         const catalog = await abortable(adapter.listModels(workingDirectory, controller.signal), controller.signal);
         controller.signal.throwIfAborted();
         return flat ? catalog.models.map((model) => ({ providerID: model.providerID, modelID: model.id, name: model.name })) : catalog;

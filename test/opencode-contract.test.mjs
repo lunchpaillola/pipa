@@ -425,7 +425,7 @@ for (const generation of ["v1", "v2"]) test(`${generation} models: picker discov
   const { runtime, executor } = await fixture(t, generation, { transport: async (url, init, nativeFetch) => {
     if (["/config/providers", "/api/model", "/api/model/default"].includes(new URL(url).pathname)) {
       signals.push(init.signal);
-      if (signals.length === (generation === "v1" ? 1 : 2)) reading.resolve();
+      reading.resolve();
       return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
     }
     return nativeFetch(url, init);
@@ -439,7 +439,7 @@ for (const generation of ["v1", "v2"]) test(`${generation} models: picker discov
   t.mock.timers.tick(1);
   await rejected;
   t.mock.timers.reset();
-  assert.equal(signals.length, generation === "v1" ? 1 : 2);
+  assert.equal(signals.length, 1);
   assert.ok(signals.every((signal) => signal.aborted));
 });
 
@@ -471,8 +471,9 @@ test("v2 models: provider-qualified discovery, native explicit selection and mov
   );
   const catalog = await executor.listModels({ workingDirectory: runtime.workspace });
   assert.equal(executor.capabilities.liveModelSwitch, true);
-  assert.deepEqual(catalog, { models: ["connected", "other"].map((providerID) => ({ providerID, id: "shared", name: "Shared", variants: ["default", "measured"] })), defaultModel: { providerID: "connected", id: "shared", variant: "default" } });
+  assert.deepEqual(catalog, { models: ["connected", "other"].map((providerID) => ({ providerID, id: "shared", name: "Shared" })) });
   assert.deepEqual(await executor.listModels(runtime.workspace), ["connected", "other"].map((providerID) => ({ providerID, modelID: "shared", name: "Shared" })));
+  assert.equal(wire.calls.filter((call) => call.path === "/api/model/default").length, 0);
   const select = (model) => executor.switchModel({ sessionId: input.sessionId, model, workingDirectory: runtime.workspace });
   for (const invalid of [{ ...model, variant: "" }, undefined]) await assert.rejects(select(invalid), /Invalid/u);
   assert.equal(wire.calls.filter((call) => call.method === "POST" && call.path.endsWith("/model")).length, 0);
@@ -489,20 +490,24 @@ test("v2 models: provider-qualified discovery, native explicit selection and mov
   await select({ providerID: "native-other-location", id: "not-in-starting-catalog" });
   for (const pathname of ["/api/model", "/api/model/default"]) document.routes.push({ method: "GET", path: pathname,
     query: { "location[directory]": path.dirname(runtime.workspace) }, repeatLast: true,
-    responses: [{ json: { location: { directory: path.dirname(runtime.workspace) }, data: pathname.endsWith("/default") ? model : [model] } }] });
+    responses: pathname.endsWith("/default") ? [{ json: { location: { directory: path.dirname(runtime.workspace) }, data: { ...model, id: "not-in-catalog" } } }] : [{ status: 503 }] });
   await select(null);
+  assert.equal(wire.calls.filter((call) => call.path === "/api/model").length, 2, "Reset never lists the starting or moved location's catalog");
+  assert.deepEqual(wire.calls.filter((call) => call.method === "POST" && call.path.endsWith("/model")).at(-1).body,
+    { model: { providerID: "connected", id: "not-in-catalog", variant: "default" } });
   assert.equal(wire.calls.filter((call) => call.method === "POST" && call.path.endsWith("/model")).length, 5);
   executor.stopAll();
   await assert.rejects(select(null), /shutting down/u);
 });
 
-test("v2 explicit selection preserves native rejection without a catalog preflight or retry", async (t) => {
+for (const reset of [false, true]) test(`v2 ${reset ? "default reset" : "explicit selection"} preserves native rejection without a catalog preflight or retry`, async (t) => {
   let switches = 0;
   const { executor, input, wire } = await fixture(t, "v2", { transport: async (url, init, nativeFetch) => {
+    if (new URL(url).pathname === "/api/model/default") return Response.json({ data: { providerID: "native", id: "unavailable" } });
     if (new URL(url).pathname.endsWith("/model") && init.method === "POST") { switches++; return new Response(null, { status: 503 }); }
     return nativeFetch(url, init);
   } });
-  await assert.rejects(executor.switchModel({ ...input, model: { providerID: "native", id: "unavailable" } }),
+  await assert.rejects(executor.switchModel({ ...input, model: reset ? null : { providerID: "native", id: "unavailable" } }),
     (error) => error.reason === "UnexpectedStatus" && error.cause.status === 503);
   assert.equal(wire.calls.some((call) => call.path === "/api/model"), false);
   assert.equal(wire.calls.some((call) => call.path.endsWith("/prompt")), false);
@@ -518,7 +523,7 @@ for (const cancellation of ["stop", "caller"]) test(`v2 models: discovery reject
     const response = await nativeFetch(url, init);
     if (["/api/model", "/api/model/default"].includes(new URL(url).pathname)) {
       signals.push(init.signal);
-      if (signals.length === 2) reached.resolve();
+      reached.resolve();
       // Release a valid response even after cancellation to prove the facade
       // cannot return success from a transport that already received the body.
       await release.promise;
@@ -538,27 +543,18 @@ for (const cancellation of ["stop", "caller"]) test(`v2 models: discovery reject
   const abortedAtBarrier = signals.map((signal) => signal.aborted);
   release.resolve();
   await assert.rejects(operation, /shutting down|cancel model discovery/u);
-  assert.deepEqual(abortedAtBarrier, [true, true], "Cancellation must abort both native discovery requests");
+  assert.deepEqual(abortedAtBarrier, [true], "Cancellation must abort the native catalog request");
 });
 
-for (const method of ["listModels", "switchModel"]) test(`v2 models: ${method} aborts its pending sibling read on discovery failure`, async (t) => {
-  const reached = Promise.withResolvers();
-  const release = Promise.withResolvers();
-  let pendingSignal;
+for (const method of ["listModels", "switchModel"]) test(`v2 models: ${method} preserves its native read failure without mutation or unrelated reads`, async (t) => {
+  const reads = [];
   const failureBody = { _tag: "UnauthorizedError", message: "Discovery HTTP 401" };
   const failure = new Response(JSON.stringify(failureBody), { status: 401, headers: { "content-type": "application/json" } });
-  t.after(() => release.resolve());
   const { runtime, executor, input, wire } = await fixture(t, "v2", { transport: async (url, init, nativeFetch) => {
     const pathname = new URL(url).pathname;
-    if (pathname === "/api/model") {
-      await reached.promise;
+    if (["/api/model", "/api/model/default"].includes(pathname)) {
+      reads.push(pathname);
       return failure;
-    }
-    if (pathname === "/api/model/default") {
-      pendingSignal = init.signal;
-      reached.resolve();
-      await Promise.race([release.promise, new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }))]);
-      return new Response(JSON.stringify({ location: { directory: runtime.workspace }, data: null }), { headers: { "content-type": "application/json" } });
     }
     return nativeFetch(url, init);
   } });
@@ -567,22 +563,22 @@ for (const method of ["listModels", "switchModel"]) test(`v2 models: ${method} a
     assert.equal(error.message, failureBody.message, "The discovery failure must remain the original HTTP 401");
     return true;
   });
-  assert.equal(pendingSignal.aborted, true, "Operation settlement must abort the pending sibling before unregistering");
+  assert.deepEqual(reads, [method === "listModels" ? "/api/model" : "/api/model/default"]);
   assert.ok(!wire.calls.some((call) => call.method !== "GET"), "Failed discovery must not mutate the session");
 });
 
-for (const failure of ["no-default", "wrong-location", "missing-session", "cancel", "stop"]) test(`v2 models: ${failure} prevents native mutation and replacement`, async (t) => {
+for (const failure of ["no-default", "missing-session", "cancel", "stop"]) test(`v2 models: ${failure} prevents native mutation and replacement`, async (t) => {
   const reached = Promise.withResolvers();
   const release = Promise.withResolvers();
   const { runtime, document, executor, input, wire } = await fixture(t, "v2", { transport: async (url, init, nativeFetch) => {
-    if (new URL(url).pathname === "/api/model" && ["cancel", "stop"].includes(failure)) {
+    if (new URL(url).pathname === "/api/model/default" && ["cancel", "stop"].includes(failure)) {
       reached.resolve();
       await release.promise;
     }
     return nativeFetch(url, init);
   } });
   const model = { providerID: "connected", id: "shared", name: "Shared", enabled: true, variants: [] };
-  const location = { directory: failure === "wrong-location" ? path.dirname(runtime.workspace) : runtime.workspace };
+  const location = { directory: runtime.workspace };
   document.routes.push(
     { method: "GET", path: "/api/model", query: { "location[directory]": runtime.workspace }, repeatLast: true, responses: [{ json: { location, data: [model] } }] },
     { method: "GET", path: "/api/model/default", query: { "location[directory]": runtime.workspace }, repeatLast: true, responses: [{ json: { location, data: failure === "no-default" ? null : model } }] },

@@ -1,6 +1,5 @@
 import { OpenCode } from "@opencode/client";
 import { randomUUID } from "node:crypto";
-import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
 export function createV2Adapter(options) {
@@ -76,22 +75,15 @@ export function createV2Adapter(options) {
 
   async function listModels(workingDirectory, signal) {
     const input = { location: { directory: workingDirectory } };
-    const [catalog, defaults] = await readWithRecovery((signal) => Promise.all([
-      client.model.list(input, { signal }), client.model.default(input, { signal }),
-    ]), signal);
-    for (const snapshot of [catalog, defaults]) {
-      if (typeof snapshot?.location?.directory !== "string" || path.resolve(snapshot.location.directory) !== path.resolve(workingDirectory)) throw new Error("OpenCode model workspace identity mismatch.");
-    }
-    if (!Array.isArray(catalog.data) || catalog.data.some((model) => !model || typeof model.id !== "string" || !model.id
-      || typeof model.providerID !== "string" || !model.providerID || typeof model.name !== "string" || typeof model.enabled !== "boolean"
-      || !Array.isArray(model.variants) || model.variants.some((variant) => typeof variant?.id !== "string" || !variant.id))) throw new Error("OpenCode returned an invalid model catalog.");
-    const models = catalog.data.filter((model) => model.enabled).map((model) => ({
-      providerID: model.providerID, id: model.id, name: model.name, variants: [...new Set(["default", ...model.variants.map((variant) => variant.id)])],
+    const catalog = await readWithRecovery((signal) => client.model.list(input, { signal }), signal);
+    if (!Array.isArray(catalog.data)) throw new Error("OpenCode returned an invalid model catalog.");
+    const enabled = catalog.data.filter((model) => model?.enabled);
+    if (enabled.some((model) => typeof model.id !== "string" || !model.id
+      || typeof model.providerID !== "string" || !model.providerID || typeof model.name !== "string")) throw new Error("OpenCode returned an invalid model catalog.");
+    const models = enabled.map((model) => ({
+      providerID: model.providerID, id: model.id, name: model.name,
     }));
-    const selected = defaults.data;
-    if (selected !== null && (!selected || typeof selected.providerID !== "string" || typeof selected.id !== "string")) throw new Error("OpenCode returned an invalid default model.");
-    const defaultModel = selected && models.find((model) => model.providerID === selected.providerID && model.id === selected.id);
-    return { models, defaultModel: defaultModel ? { providerID: defaultModel.providerID, id: defaultModel.id, variant: "default" } : null };
+    return { models };
   }
 
   function settleWaiters(observer, value, error) {
@@ -440,11 +432,12 @@ export function createV2Adapter(options) {
         || (model.variant !== undefined && (typeof model.variant !== "string" || !model.variant)))) throw new Error("Invalid OpenCode model selection.");
       const session = await lookup(sessionId, signal);
       if (!session) throw new Error("OpenCode session is unavailable; model selection did not create a replacement.");
-      const selection = model === null ? (await listModels(session.location.directory, signal)).defaultModel
-        : { providerID: model.providerID, id: model.id, variant: model.variant ?? "default" };
+      const selection = model === null ? (await readWithRecovery((signal) => client.model.default({ location: { directory: session.location.directory } }, { signal }), signal)).data
+        : model;
+      if (selection !== null && (!selection || typeof selection.providerID !== "string" || typeof selection.id !== "string")) throw new Error("OpenCode returned an invalid default model.");
       if (!selection) throw new Error("OpenCode default model is unavailable.");
       signal.throwIfAborted();
-      await client.session.switchModel({ sessionID: sessionId, model: selection }, { signal });
+      await client.session.switchModel({ sessionID: sessionId, model: { providerID: selection.providerID, id: selection.id, variant: model?.variant ?? "default" } }, { signal });
     },
     async resolveSession(sessionId, workingDirectory, controller) {
       const signal = controller.signal;

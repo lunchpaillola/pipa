@@ -63,7 +63,7 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
         failure = "No configured models are available. Connect a provider in OpenCode, then reopen the model picker.";
         throw new Error("empty catalog");
       }
-      entry.options = models.map((model) => ({ option: modelOption(model), search: `${model.providerID} ${model.modelID} ${model.name ?? ""}`.toLowerCase() }));
+      entry.options = models.map((model) => ({ model: { providerID: model.providerID, modelID: model.modelID, name: model.name }, option: modelOption(model), search: `${model.providerID} ${model.modelID} ${model.name ?? ""}`.toLowerCase() }));
       const initialModel = currentConfig.defaultModel && models.find((model) => model.providerID === currentConfig.defaultModel.providerID && model.modelID === currentConfig.defaultModel.modelID);
       failure = `Slack couldn't display the model list. Try ${command} model again in a moment.`;
       await event.adapter.webClient.views.update({ view_id: entry.viewId, view: {
@@ -122,16 +122,14 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
     }
     if (entry.saving) return { action: "close" };
     entry.saving = true;
-    // Acknowledge Save before config I/O as well as catalog/network/persistence work.
+    // Acknowledge Save before config I/O and persistence work.
     const task = (async () => {
       let message;
       let failure = `I couldn't verify this model change. Reopen ${command} model. Your saved model hasn't changed.`;
       try {
         try {
           authorize(entry, event, await loadConfig());
-          failure = `I couldn't check the available models in OpenCode. Reopen ${command} model to try again. Your saved model hasn't changed.`;
-          const models = await listModels();
-          const model = models.find((item) => modelOption(item).value === event.values?.[inputId]);
+          const model = entry.options?.find((item) => item.option.value === event.values?.[inputId])?.model;
           failure = `That model is no longer available. Reopen ${command} model and choose another. Your saved model hasn't changed.`;
           if (!model) throw new Error("unavailable model");
           failure = `I couldn't save your model choice. Reopen ${command} model to try again. Your saved model hasn't changed.`;
