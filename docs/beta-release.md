@@ -1,15 +1,20 @@
-# Pipa 0.6.0-beta.3 (beta channel)
+# Pipa 0.6.0-beta.4 (beta channel)
 
 Preparation notes for an opt-in beta. This document does not mean the version has
 been published. Normal npm installs must continue to receive stable `0.5.6`
 unless the owner separately approves a stable release.
 
-The next release increments published beta `0.6.0-beta.2` to `0.6.0-beta.3`.
+The next release increments published beta `0.6.0-beta.3` to `0.6.0-beta.4`.
 Earlier preparation versions `0.6.2` and `0.6.3` were never published and are
 superseded. Publish only to npm's `beta` tag and mark the GitHub release
 **Pre-release**. Do not move `latest` or treat the version as stable qualification.
 
-## Changes from 0.6.0-beta.2
+## Changes from 0.6.0-beta.3
+
+- Restore the restart instructions that preserve the Slack channel/thread for the replacement process's ready notification. Instructions retain the correct Pipa host/profile and durable status check; the restart worker and native background-response behavior are unchanged.
+- Regression coverage includes threaded and channel-only Slack requests, non-Slack fallback, remote attached-host guidance and isolated profile-home instructions. Live Slack restart delivery has not been rerun.
+
+## Retained changes from 0.6.0-beta.2
 
 - OpenCode v2 execution failures retain OpenCode's own message instead of Pipa classifying provider errors or substituting recovery advice.
 - Remove Pipa-added v2 request/discovery deadlines and read-recovery loops. Native calls retain caller cancellation; readiness, shutdown and Slack lifecycle checks remain separate.
@@ -29,7 +34,7 @@ acceptable end-user workaround. See the [redirect audit and renderer research](r
 ## Retained changes from 0.6.0-beta.1
 
 - OpenCode v2 live responses keep returning to the same Slack thread after the first reply, including responses when native background work resumes. New follow-ups use native steering instead of cancelling the current execution. V1 retains interrupt-and-replace behavior.
-- Remove v2's foreign-writer attribution guard, recovery journal, temporary instruction cleanup and installation-wide blocked-intake policy. Old journal files are left untouched and ignored. Slack and artifact context stays in a stable native session instruction entry; the restart lecture is no longer repeated.
+- Remove v2's foreign-writer attribution guard, recovery journal, temporary instruction cleanup and installation-wide blocked-intake policy. Old journal files are left untouched and ignored. Slack and artifact context stays in a stable native session instruction entry. Focused restart guidance is restored in beta.4.
 - Forward live responses only. Missed replies are not replayed after disconnection or restart, and startup does not reattach old background observers. A new Slack message reattaches its thread to the saved native session.
 - The searchable Slack picker handles large catalogs without a size-limited dropdown. Authorization and live Save validation remain in place; current discovery timing is described above.
 - Native interaction work is queued per observer so it cannot stall other sessions' responses. Failed Slack delivery is reported when possible, not replayed. Shutdown drains local callbacks without interrupting attached native v2 sessions.
@@ -78,7 +83,7 @@ Slack results above have not been rerun for 0.6.3. CodeRabbit's automated review
 of the preparation PR was rate-limited, not approved. No production installation
 was changed; full release qualification remains false.
 
-### Current 0.6.0-beta.3 preparation
+### Historical 0.6.0-beta.3 preparation
 
 The owner clarified on November 4, 2026 that this release must increment the
 published beta, not use a stable-shaped version. npm `beta` was `0.6.0-beta.2`
@@ -119,10 +124,29 @@ contract fixtures and beta publish dry-run (13 expected public files). The
 release Git tag was confirmed absent. No runtime code changed in the version
 correction; no package or GitHub release has been published.
 
+### Current 0.6.0-beta.4 preparation
+
+On November 4, 2026, npm `beta` was `0.6.0-beta.3`, `latest` was `0.5.6`,
+and `0.6.0-beta.4` and its Git tag were unused. PR #66 contains the restart fix
+and this version update. The owner will tag and publish after handoff. No running
+installation is changed by release preparation.
+
+Exact-version checks on macOS arm64 with Node 22.23.2:
+
+- All 484 tests passed, with no failures or skips.
+- Installed-package smoke passed against the 1.19.0, 2.0.29 and 2.2.5 contract fixtures.
+- All 26 verification self-checks passed.
+- Native beta smoke passed all 24 applicable journey observations across six cells: OpenCode 1.19.0 and 2.2.5 in Socket-owned, attached and Managed modes. Every cell and report cleanup passed. The harness uses scripted provider/Chat fixtures, not live Slack or a paid provider.
+- Beta publish dry-run contained 13 expected public files, with matching package/lockfile versions and no profile data or credentials.
+
+This host did not rerun Linux or Windows native smoke. The historical Windows
+cleanup failure remains unresolved. External restart worker-PID observation is
+excluded by the beta smoke contract. Full release qualification remains false.
+
 Once published, install this exact beta with:
 
 ```sh
-npm install --global @usepipa/pipa@0.6.0-beta.3
+npm install --global @usepipa/pipa@0.6.0-beta.4
 ```
 
 For an existing daily installation, schedule a separate maintenance window:
@@ -139,16 +163,16 @@ needs a separate matched-snapshot backup/rollback plan; see
 
 ## Publisher checklist
 
-PR #64 contains the runtime changes and this release preparation. The release
+PR #66 contains the restart fix and this release preparation. The release
 metadata update changes no routine model-selection behavior: a saved routine
 model is passed explicitly; an unset model is left to OpenCode's native default.
-The owner merges the PR and publishes to npm. Release tagging and GitHub
+The agent may merge after owner approval and passing CI; the owner tags and publishes to npm. Release tagging and GitHub
 prerelease creation must target the actual merged commit, never the unmerged
 feature head. Installation remains a separate cutover.
 
 1. Recheck PR feedback and required CI for the exact beta commit. Run the [controlled-beta checks](../CONTRIBUTING.md#controlled-beta), including the installed-package smoke and publish dry-run. Record limitations separately from passing checks.
-2. Immediately before publication, run `npm view @usepipa/pipa dist-tags versions --json`. Confirm `0.6.0-beta.3` is still unused. At preparation on November 4, 2026, `beta` was `0.6.0-beta.2` and `latest` was `0.5.6`. Stop if the registry changed unexpectedly.
-3. After PR #64 is merged and required CI passes, check out the actual merged commit in a clean release checkout, verify both package files say `0.6.0-beta.3`, and rerun the package checks/dry-run there. Tag that merged commit `v0.6.0-beta.3`; never tag the old feature head by mistake. Create its GitHub release as **Pre-release**, not latest, using these changes and limits as the notes. Tagging and GitHub release creation do not publish to npm.
+2. Immediately before publication, run `npm view @usepipa/pipa dist-tags versions --json`. Confirm `0.6.0-beta.4` is still unused. At preparation on November 4, 2026, `beta` was `0.6.0-beta.3` and `latest` was `0.5.6`. Stop if the registry changed unexpectedly.
+3. After PR #66 is merged and required CI passes, check out the actual merged commit in a clean release checkout, verify both package files say `0.6.0-beta.4`, and rerun the package checks/dry-run there. Tag that merged commit `v0.6.0-beta.4`; never tag the old feature head by mistake. Create its GitHub release as **Pre-release**, not latest, using these changes and limits as the notes. Tagging and GitHub release creation do not publish to npm.
 4. The owner publishes from that release checkout:
 
 ```sh
@@ -156,5 +180,5 @@ npm publish --tag beta --access public
 npm view @usepipa/pipa dist-tags --json
 ```
 
-5. Verify `beta` is `0.6.0-beta.3` and `latest` matches the value recorded before publishing. Verify the published version and matching GitHub prerelease. Do not mark it stable/latest.
+5. Verify `beta` is `0.6.0-beta.4` and `latest` matches the value recorded before publishing. Verify the published version and matching GitHub prerelease. Do not mark it stable/latest.
 6. Arrange the daily-installation cutover separately. Later beta fixes need a new unused version; do not overwrite a published version.
