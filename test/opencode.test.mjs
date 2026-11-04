@@ -109,8 +109,9 @@ test("U1 v2 startup checks workspace readiness without consulting migration stat
   server.stop(); await server.wait();
 });
 
-test("owned v2 launch preserves regex-stack overrides, supports 10 MiB, authenticates and catches mismatch", async () => {
-  for (const regexStack of [undefined, "805306368"]) for (const mismatch of [false, true]) {
+test("owned v2 launch authenticates, accepts different v2 versions and rejects a different protocol", async () => {
+  for (const regexStack of [undefined, "805306368"]) for (const version of ["2.0.29", "2.2.5", "1.19.0"]) {
+    const mismatch = version === "1.19.0";
     const child = childProcess();
     let invocation;
     let killed = false;
@@ -122,7 +123,7 @@ test("owned v2 launch preserves regex-stack overrides, supports 10 MiB, authenti
         assert.equal(init.headers.authorization, `Basic ${Buffer.from(`opencode:${invocation.options.env.OPENCODE_PASSWORD}`).toString("base64")}`);
         const pathname = new URL(url).pathname;
         if (pathname === "/global/health") return mismatch ? jsonResponse({ healthy: true, version: "1.19.0" }) : new Response("<html>");
-        if (pathname === "/api/info") return jsonResponse(v2Info);
+        if (pathname === "/api/info") return jsonResponse({ ...v2Info, version });
         if (pathname === "/api/experimental/migration/v1") return jsonResponse({ status: "completed" });
         return jsonResponse(v2Location);
       },
@@ -238,6 +239,24 @@ test("ordinary owned startup can wait for a listening URL beyond thirty seconds"
   const server = await starting;
   assert.equal(server.connection.major, 1);
   server.stop(); await server.wait();
+});
+
+test("legacy discovery retains its thirty-second bound while readiness is pending", async (t) => {
+  const requested = Promise.withResolvers();
+  const executor = createExecutor({ baseUrl: "http://localhost:5555", environment: {},
+    fetch: async (_url, { signal }) => {
+      requested.resolve();
+      return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    },
+  });
+  t.after(() => executor.stopAll());
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const operation = executor.listModels("/work");
+  const rejected = assert.rejects(operation, /Model discovery timed out/u);
+  await requested.promise;
+  t.mock.timers.tick(30_000);
+  await rejected;
+  t.mock.timers.reset();
 });
 
 test("a turn can be cancelled while unbounded readiness is pending, and stopAll cancels the probe", async (t) => {

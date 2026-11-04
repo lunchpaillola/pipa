@@ -418,10 +418,10 @@ test("v2 models: healthy catalog reads can exceed five seconds without fatal rec
   assert.deepEqual(failures, []);
 });
 
-for (const generation of ["v1", "v2"]) test(`${generation} models: picker discovery is bounded at 30s and aborts native reads`, async (t) => {
+test("v1 models: picker discovery is bounded at 30s and aborts native reads", async (t) => {
   const signals = [];
   const reading = Promise.withResolvers();
-  const { runtime, executor } = await fixture(t, generation, { transport: async (url, init, nativeFetch) => {
+  const { runtime, executor } = await fixture(t, "v1", { transport: async (url, init, nativeFetch) => {
     if (["/config/providers", "/api/model", "/api/model/default"].includes(new URL(url).pathname)) {
       signals.push(init.signal);
       reading.resolve();
@@ -440,6 +440,66 @@ for (const generation of ["v1", "v2"]) test(`${generation} models: picker discov
   t.mock.timers.reset();
   assert.equal(signals.length, 1);
   assert.ok(signals.every((signal) => signal.aborted));
+});
+
+for (const cancel of [false, true]) test(`v2 event attachment waits without a Pipa deadline; ${cancel ? "shutdown cancels it" : "work waits for the result path"}`, async (t) => {
+  const reached = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  t.after(() => release.resolve());
+  const { executor, input, wire } = await fixture(t, "v2", { transport: async (url, init, nativeFetch) => {
+    if (new URL(url).pathname === "/api/event") {
+      reached.resolve();
+      await release.promise;
+      init.signal.throwIfAborted();
+    }
+    return nativeFetch(url, init);
+  } });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const turn = executor.runTurn({ ...input, onResponse: async () => {} });
+  const outcome = turn.then((value) => ({ value }), (error) => ({ error }));
+  await reached.promise;
+  try {
+    t.mock.timers.tick(10_001);
+    await new Promise(setImmediate);
+    assert.equal(await Promise.race([outcome, Promise.resolve("waiting")]), "waiting");
+    assert.equal(wire.calls.some((request) => request.path.endsWith("/prompt")), false);
+    if (cancel) executor.stopAll(new Error("shutdown"));
+  } finally { release.resolve(); t.mock.timers.reset(); }
+  const result = await outcome;
+  if (cancel) {
+    assert.match(result.error.message, /shutdown/u);
+    await executor.drain();
+    assert.equal(wire.calls.some((request) => request.path.endsWith("/prompt")), false);
+  } else assert.equal(result.value.pending, true);
+});
+
+test("v2 models: a catalog body can finish beyond the former 30s deadline", async (t) => {
+  const reached = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let requestSignal;
+  t.after(() => release.resolve());
+  const { runtime, executor } = await fixture(t, "v2", { transport: async (url, init, nativeFetch) => {
+    if (new URL(url).pathname !== "/api/model") return nativeFetch(url, init);
+    requestSignal = init.signal;
+    return new Response(new ReadableStream({ async start(controller) {
+      reached.resolve();
+      await release.promise;
+      controller.enqueue(new TextEncoder().encode(JSON.stringify({ data: [{ providerID: "native", id: "slow", enabled: true }] })));
+      controller.close();
+    } }), { headers: { "content-type": "application/json" } });
+  } });
+  await executor.ready(runtime.workspace);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const discovery = executor.listModels(runtime.workspace);
+  const outcome = discovery.then((value) => ({ value }), (error) => ({ error }));
+  await reached.promise;
+  t.mock.timers.tick(30_001);
+  assert.equal(requestSignal.aborted, false);
+  release.resolve();
+  const result = await outcome;
+  t.mock.timers.reset();
+  assert.equal(result.error, undefined);
+  assert.deepEqual(result.value, [{ providerID: "native", modelID: "slow", name: undefined }]);
 });
 
 for (const [error, expected] of [

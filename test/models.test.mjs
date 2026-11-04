@@ -412,12 +412,12 @@ test("picker failure paths never persist and search results respect Slack bounds
   assert.equal(writes, 0);
   assert.equal((await handlers.save({ ...save, values: { [id]: "missing" } })).action, "close");
   await picker.drain();
-  assert.match(saveResults.at(-1), /no longer available/u);
+  assert.match(saveResults.at(-1), /not in this picker/u);
   assert.equal(writes, 0);
   failed = true;
   await handlers.open(event);
   assert.equal(modal.submit, undefined, "catalog failure never offers an empty picker for submission");
-  assert.match(modal.blocks[0].text.text, /couldn't load the available models from OpenCode/u);
+  assert.equal(modal.blocks[0].text.text, "private upstream details");
   assert.equal((await handlers.save(save)).action, "errors");
   assert.equal(writes, 0);
   failed = false;
@@ -426,7 +426,7 @@ test("picker failure paths never persist and search results respect Slack bounds
   const [removed] = models.splice(99, 1);
   assert.equal((await handlers.save(save)).action, "close");
   await picker.drain();
-  assert.match(saveResults.at(-1), /couldn't save/u, "Save attempts persistence using the cached model even after catalog removal");
+  assert.equal(saveResults.at(-1), "disk unavailable", "Save attempts persistence using the cached model even after catalog removal");
   assert.equal(writes, 1);
   models.push(removed);
   await handlers.open(event);
@@ -434,7 +434,7 @@ test("picker failure paths never persist and search results respect Slack bounds
   const failedWrite = await handlers.save(save);
   assert.equal(failedWrite.action, "close");
   await picker.drain();
-  assert.match(saveResults.at(-1), /couldn't save.*Reopen \/pipa-test model/u);
+  assert.equal(saveResults.at(-1), "disk unavailable");
   assert.equal(writes, 2);
   await handlers.open(event);
   save = submission();
@@ -541,36 +541,36 @@ test("an empty catalog gives a private explanation instead of an empty modal", a
 });
 
 for (const [failure, expected] of [
-  ["configuration", /couldn't read.*saved settings/u],
-  ["access", /isn't enabled for this account or channel/u],
-  ["models", /couldn't load the available models from OpenCode/u],
-  ["expired_trigger_id", /Slack's request to open this window expired/u],
-  ["invalid_trigger_id", /Slack couldn't use the request to open this window/u],
-  ["invalid_arguments", /Slack rejected the model window.*Pipa issue/u],
-  ["unknown_slack_error", /Slack couldn't open the model window/u],
-]) test(`picker opening explains ${failure} without blaming access or exposing upstream details`, async () => {
+  ["configuration", "Settings file could not be read"],
+  ["access", "This picker is unavailable or you are not authorized. Reopen /chopper model."],
+  ["models", "Native catalog read failed"],
+  ["expired_trigger_id", "Slack API error: expired_trigger_id"],
+  ["invalid_trigger_id", "Slack API error: invalid_trigger_id"],
+  ["invalid_arguments", "Slack API error: invalid_arguments"],
+  ["unknown_slack_error", "Slack API error: unknown_slack_error"],
+  ["token", "Native catalog failed for [redacted] [redacted]"],
+]) test(`picker opening passes through ${failure} message without bodies, stacks or Slack tokens`, async () => {
   let open;
   const replies = [];
   const notices = [];
   const picker = createModelPicker({ chat: { onSlashCommand: (_id, fn) => { open = fn; } }, botName: "Chopper", commands: ["/chopper"], setting: {},
     loadConfig: async () => {
-      if (failure === "configuration") throw new Error("private-settings-secret");
+      if (failure === "configuration") throw new Error("Settings file could not be read");
       return failure === "access" ? { allowedSlackUserIds: ["U2"] } : {};
     },
     listModels: async () => {
-      if (failure === "models") throw new Error("private-provider-secret");
+      if (failure === "models" || failure === "token") throw Object.assign(new Error(failure === "token" ? "Native catalog failed for xoxb-test-token xapp-test-token" : "Native catalog read failed"), { body: "private-body" });
       return [{ providerID: "openai", modelID: "a" }];
     } });
   await open({ text: "model", user: { userId: "U1" }, channel: { id: "slack:C1", postEphemeral: async (...args) => replies.push(args) },
     adapter: { webClient: { views: {
-      open: async () => { if (failure === "models") return { view: { id: "V1" } }; throw Object.assign(new Error("private-slack-secret"), { data: { error: failure } }); },
+      open: async () => { if (failure === "models" || failure === "token") return { view: { id: "V1" } }; throw Object.assign(new Error(`Slack API error: ${failure}`), { data: { error: failure, body: "private-body" } }); },
       update: async ({ view }) => { notices.push(view.blocks[0].text.text); },
     } } } });
   assert.equal(replies.length + notices.length, 1);
   const message = replies[0]?.[1] ?? notices[0];
-  assert.match(message, expected);
-  assert.match(message, /saved model hasn't changed/u);
-  assert.doesNotMatch(message, /private-|Check your access/u);
+  assert.equal(message, expected);
+  assert.doesNotMatch(message, /private-body|xoxb-|xapp-|\n\s+at /u);
   if (replies.length) assert.equal(replies[0][2].fallbackToDM, false);
   picker.close();
 });

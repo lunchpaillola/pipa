@@ -10,61 +10,11 @@ export function createV2Adapter(options) {
   let connected = false;
   let stopped;
   let stopping = [];
-  const client = OpenCode.make({ baseUrl: options.baseUrl, headers: options.headers, fetch: async (url, init) => {
-    const pathname = new URL(url).pathname;
-    const streaming = pathname === "/api/event";
-    const modelRead = (init.method ?? "GET").toUpperCase() === "GET" && ["/api/model", "/api/model/default"].includes(pathname);
-    const signal = streaming ? init.signal : AbortSignal.any([...(init.signal ? [init.signal] : []), AbortSignal.timeout(options.connectionRequestTimeoutMs ?? (modelRead ? 30_000 : 5_000))]);
-    const response = await options.fetch(url, { ...init, signal });
-    if (!response.body || streaming) return response;
-    const reader = response.body.getReader();
-    let abort;
-    return new Response(new ReadableStream({
-      start(controller) {
-        abort = () => {
-          controller.error(signal.reason);
-          void reader.cancel(signal.reason).catch(() => undefined);
-        };
-        if (signal.aborted) abort();
-        else signal.addEventListener("abort", abort, { once: true });
-      },
-      async pull(controller) {
-        try {
-          const next = await reader.read();
-          signal.throwIfAborted();
-          if (next.done) {
-            signal.removeEventListener("abort", abort);
-            reader.releaseLock();
-            controller.close();
-          } else controller.enqueue(next.value);
-        } catch (error) {
-          signal.removeEventListener("abort", abort);
-          controller.error(error);
-        }
-      },
-      cancel(reason) {
-        signal.removeEventListener("abort", abort);
-        void reader.cancel(reason).catch(() => undefined);
-      },
-    }), { status: response.status, statusText: response.statusText, headers: response.headers });
-  } });
-
-  async function readWithRecovery(operation, signal) {
-    const start = Date.now();
-    while (true) {
-      signal?.throwIfAborted();
-      try { return await operation(signal); }
-      catch (error) {
-        signal?.throwIfAborted();
-        if (!retryable(error) || Date.now() - start >= (options.connectionRecoveryTimeoutMs ?? 10_000)) throw error;
-        await delay(options.pollIntervalMs ?? 100, undefined, { signal });
-      }
-    }
-  }
+  const client = OpenCode.make({ baseUrl: options.baseUrl, headers: options.headers, fetch: options.fetch });
 
   async function lookup(sessionId, signal) {
     let session;
-    try { session = await readWithRecovery((signal) => client.session.get({ sessionID: sessionId }, { signal }), signal); }
+    try { session = await client.session.get({ sessionID: sessionId }, { signal }); }
     catch (error) {
       if (error._tag === "SessionNotFoundError" && error.sessionID === sessionId) return null;
       throw error;
@@ -75,7 +25,7 @@ export function createV2Adapter(options) {
 
   async function listModels(workingDirectory, signal) {
     const input = { location: { directory: workingDirectory } };
-    const catalog = await readWithRecovery((signal) => client.model.list(input, { signal }), signal);
+    const catalog = await client.model.list(input, { signal });
     if (!Array.isArray(catalog.data)) throw new Error("OpenCode returned an invalid model catalog.");
     const enabled = catalog.data.filter((model) => model?.enabled);
     if (enabled.some((model) => typeof model.id !== "string" || !model.id
@@ -188,7 +138,9 @@ export function createV2Adapter(options) {
           } else throw new Error("This form requires an OpenCode client response.");
         } catch (error) {
           signal.throwIfAborted();
-          if (retryable(error) || error.reason === "MalformedResponse" || ["FormAlreadySettledError", "FormNotFoundError", "PermissionNotFoundError"].includes(error._tag)) {
+          if (["Transport", "MalformedResponse"].includes(error.reason)
+            || (error.reason === "UnexpectedStatus" && [502, 503, 504].includes(error.cause?.status))
+            || ["FormAlreadySettledError", "FormNotFoundError", "PermissionNotFoundError"].includes(error._tag)) {
             if (!await pending(observer, entry)) { settle(entry); return; }
             else throw error;
           } else throw error;
@@ -245,8 +197,8 @@ export function createV2Adapter(options) {
       const results = await Promise.allSettled(["form", "permission"].map(async (kind) => {
         let snapshot;
         try {
-          snapshot = await readWithRecovery((signal) => kind === "form"
-            ? client.session.form.list(input, { signal }) : client.permission.list(input, { signal }), signal);
+          snapshot = await (kind === "form"
+            ? client.session.form.list(input, { signal }) : client.permission.list(input, { signal }));
           if (!Array.isArray(snapshot) || snapshot.some((request) => request.sessionID !== sessionId)) throw new Error("OpenCode returned an invalid interaction projection.");
         } catch {
           if (!signal.aborted) process.stderr.write(`OpenCode ${kind} reconciliation read failed.\n`);
@@ -271,7 +223,7 @@ export function createV2Adapter(options) {
       let cursor;
       do {
         try {
-          const page = await readWithRecovery((signal) => client.session.list({ parentID: sessionId, ...(cursor ? { cursor } : {}) }, { signal }), signal);
+          const page = await client.session.list({ parentID: sessionId, ...(cursor ? { cursor } : {}) }, { signal });
           if (!Array.isArray(page.data)) throw new Error("OpenCode returned an invalid session projection.");
           for (const child of page.data) if (typeof child.id === "string" && child.parentID === sessionId) sessionIds.add(child.id);
           cursor = page.cursor.next;
@@ -307,7 +259,7 @@ export function createV2Adapter(options) {
             for (const observer of observers.values()) {
               if (event.data?.sessionID === observer.sessionId) {
                 if (event.type === "session.step.ended" && event.data.finish === "stop") queueResponse(observer, async () => {
-                  const message = await readWithRecovery((signal) => client.session.message.get({ sessionID: observer.sessionId, messageID: event.data.assistantMessageID }, { signal }), observer.controller.signal);
+                  const message = await client.session.message.get({ sessionID: observer.sessionId, messageID: event.data.assistantMessageID }, { signal: observer.controller.signal });
                   await deliverResponse(observer, message);
                 });
                 if (event.type === "session.execution.failed") queueResponse(observer, () => report(observer, Object.assign(new Error(event.data.error.message), event.data.error)));
@@ -351,17 +303,15 @@ export function createV2Adapter(options) {
       const signal = observer.controller.signal;
       if (signal.aborted) return;
       try { await operation(); }
-      catch {
+      catch (error) {
         if (signal.aborted) return;
         if (fatal) {
-          const safe = new Error("OpenCode session responses are unavailable.");
-          observer.initialized.reject(safe);
-          await report(observer, safe).catch(() => undefined);
-          detach(observer, safe);
+          observer.initialized.reject(error);
+          await report(observer, error).catch(() => undefined);
+          detach(observer, error);
           return;
         }
-        const safe = new Error("OpenCode response could not be delivered; it will not be replayed.");
-        await report(observer, safe).catch(() => process.stderr.write("Pipa could not deliver an OpenCode response.\n"));
+        await report(observer, error).catch(() => process.stderr.write("Pipa could not deliver an OpenCode response.\n"));
       }
     });
   }
@@ -399,8 +349,7 @@ export function createV2Adapter(options) {
         } catch { signal.throwIfAborted(); /* Old context migration is best effort and session-local. */ }
         watchEvents();
         if (connected) observer.initialized.resolve();
-        const timer = setTimeout(() => observer.initialized.reject(new Error("OpenCode event attachment timed out.")), options.connectionRecoveryTimeoutMs ?? 10_000);
-        try { await observer.initialized.promise; } finally { clearTimeout(timer); }
+        await observer.initialized.promise;
       })();
     }
     if (waiter) observer.waiters.add(waiter);
@@ -432,7 +381,7 @@ export function createV2Adapter(options) {
         || (model.variant !== undefined && (typeof model.variant !== "string" || !model.variant)))) throw new Error("Invalid OpenCode model selection.");
       const session = await lookup(sessionId, signal);
       if (!session) throw new Error("OpenCode session is unavailable; model selection did not create a replacement.");
-      const selection = model === null ? (await readWithRecovery((signal) => client.model.default({ location: { directory: session.location.directory } }, { signal }), signal)).data
+      const selection = model === null ? (await client.model.default({ location: { directory: session.location.directory } }, { signal })).data
         : model;
       if (selection !== null && (!selection || typeof selection.providerID !== "string" || typeof selection.id !== "string")) throw new Error("OpenCode returned an invalid default model.");
       if (!selection) throw new Error("OpenCode default model is unavailable.");
@@ -447,7 +396,7 @@ export function createV2Adapter(options) {
         session = await client.session.create({ location: { directory: workingDirectory } }, { signal });
         if (typeof session?.id !== "string" || !session.id) throw new Error("OpenCode did not return a usable session identity.");
       }
-      const history = !created && !session.model ? await readWithRecovery((signal) => client.message.list({ sessionID: session.id, limit: 1 }, { signal }), signal) : null;
+      const history = !created && !session.model ? await client.message.list({ sessionID: session.id, limit: 1 }, { signal }) : null;
       if (history && !Array.isArray(history.data)) throw new Error("OpenCode returned an invalid message projection.");
       return { sessionId: session.id, defaultEligible: !session.model && (created || !history.data.length) };
     },
@@ -490,9 +439,13 @@ export function createV2Adapter(options) {
       }
     },
     async abortTurn(sessionId) {
+      if (stopped) throw stopped;
       const observer = observers.get(sessionId);
       if (observer) settleWaiters(observer, "");
-      await client.session.interrupt({ sessionID: sessionId, resume: false });
+      const controller = new AbortController();
+      controllers.add(controller);
+      try { await client.session.interrupt({ sessionID: sessionId, resume: false }, { signal: controller.signal }); }
+      finally { controllers.delete(controller); }
     },
     stopAll(reason = new Error("OpenCode bridge stopped.")) {
       stopped = reason;
@@ -504,8 +457,4 @@ export function createV2Adapter(options) {
     },
     async drain() { await Promise.allSettled(stopping); },
   };
-}
-
-function retryable(error) {
-  return error.reason === "Transport" || (error.reason === "UnexpectedStatus" && [502, 503, 504].includes(error.cause?.status));
 }
