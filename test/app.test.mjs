@@ -107,14 +107,17 @@ test("v2 forwards background replies and native errors without another Slack mes
   config.allowedSlackUserIds = ["U2"];
   await writePrivateJson(paths.config, config);
   await submitted.onResponse({ sessionId: "ses_background", text: "Requester no longer allowed." }, new AbortController().signal);
+  await submitted.onError(new Error("Requester no longer allowed."), new AbortController().signal);
   assert.equal(posts.length, 3);
   config.allowedSlackUserIds = [];
   config.allowedSlackChannelIds = ["C2"];
   await writePrivateJson(paths.config, config);
   await submitted.onResponse({ sessionId: "ses_background", text: "No longer allowed." }, new AbortController().signal);
+  await submitted.onError(new Error("No longer allowed."), new AbortController().signal);
   assert.equal(posts.length, 3);
   app.stop();
   await submitted.onResponse({ sessionId: "ses_background", text: "Stopped." }, new AbortController().signal);
+  await submitted.onError(new Error("Stopped."), new AbortController().signal);
   assert.equal(posts.length, 3);
 });
 
