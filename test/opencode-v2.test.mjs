@@ -447,7 +447,8 @@ test("questions preserve options, multiselect and custom answers after admission
   assert.equal(interactions[0].type, "question");
   assert.equal(interactions[0].request.questions[1].multiple, true);
   assert.equal(interactions[0].request.questions[1].custom, true);
-  await interactions[0].submit({ type: "answer", answers: [["Blue"], ["Red", "custom text"]] });
+  assert.equal(interactions[0].request.questions[0].options[0].value, "blue_value");
+  await interactions[0].submit({ type: "answer", answers: [["blue_value"], ["red_value", "custom text"]] });
   assert.deepEqual(f.requests.find((r) => r.path.endsWith("/frm_choices/reply")).body, { answer: { q0: "blue_value", q1: ["red_value", "custom text"] } });
 });
 
@@ -520,8 +521,60 @@ test("simple forms use field shapes rather than a closed list of metadata kinds 
     await f.adapter.followSession(f.input("ses_one", { onInteraction: async (interaction) => { interactions.push(interaction); return { type: "cancelled" }; } }));
     await until(() => interactions.length === 1);
     assert.equal(interactions[0].type, "question");
-    await interactions[0].submit({ type: "answer", answers: [["Pipa"], ["Blue"]] });
+    await interactions[0].submit({ type: "answer", answers: [["Pipa"], ["blue"]] });
     assert.deepEqual(f.requests.find((request) => request.path.endsWith("/frm_plugin/reply")).body, { answer: { project: "Pipa", colors: ["blue"] } });
+  }
+});
+
+test("Slack preserves duplicate-label choices, custom text, empty answers and optional omission", async (t) => {
+  for (const mode of ["choice", "custom", "empty", "skip", "empty-multiselect"]) {
+    await t.test(mode, async (t) => {
+    const f = await fixture(t);
+    const posted = [], updated = [];
+    const interactions = createPendingInteractions(["U1"]);
+    t.after(() => interactions.close());
+    const thread = { id: "slack:C1:1.0", adapter: { webClient: { chat: {
+      postMessage: async message => { posted.push(message); return { ts: "2.0" }; },
+      update: async message => { updated.push(message); },
+      delete: async () => {},
+    } } } };
+    const field = { key: "answer", type: mode === "empty-multiselect" ? "multiselect" : "string", custom: true, required: false,
+      options: [{ label: "Default", value: "account-a" }, { label: "Default", value: "account-b" }] };
+    f.forms.push({ id: "frm_answers", sessionID: "ses_one", title: "Choose", fields: [field] });
+    await f.adapter.followSession(f.input("ses_one", { onInteraction: interaction => interactions.onInteraction({ thread }, interaction) }));
+    await until(() => posted.length === 1);
+    const card = posted[0];
+    const actions = card.blocks.flatMap(block => block.elements ?? []);
+    const event = action => ({ actionId: action.action_id, value: action.value, threadId: thread.id, user: { userId: "U1" } });
+    if (mode === "choice" || mode === "empty-multiselect") {
+      const select = actions.find(action => action.action_id.startsWith("pipa_select_"));
+      assert.notEqual(select.options[0].value, select.options[1].value);
+      const blockId = card.blocks.find(block => block.elements?.includes(select)).block_id;
+      await interactions.onAction({ ...event(actions.find(action => action.action_id.startsWith("pipa_submit_"))), raw: { state: { values: {
+        [blockId]: { [select.action_id]: mode === "choice" ? { selected_option: select.options[1] } : { selected_options: [] } },
+      } } } });
+    } else if (mode === "skip") {
+      const skip = actions.find(action => action.action_id.startsWith("pipa_skip_"));
+      assert.ok(skip, "Optional fields need an omission path");
+      await interactions.onAction(event(skip));
+    } else {
+      let modal;
+      await interactions.onAction({ ...event(actions.find(action => action.action_id.startsWith("pipa_custom_"))), openModal: async value => { modal = value; } });
+      assert.equal(modal.children[0].optional, true);
+      await interactions.onCustomAnswer({ privateMetadata: modal.privateMetadata, relatedThread: thread, user: { userId: "U1" }, values: { answer: mode === "custom" ? "Default" : "" } });
+    }
+    await until(() => updated.length === 1);
+    const expected = mode === "skip" ? {} : { answer: mode === "choice" ? "account-b" : mode === "custom" ? "Default" : mode === "empty" ? "" : [] };
+    assert.deepEqual(f.requests.find(request => request.path.endsWith("/frm_answers/reply"))?.body, { answer: expected });
+    if (mode === "choice") {
+      assert.match(JSON.stringify(updated[0]), /Default/u);
+      assert.doesNotMatch(JSON.stringify(updated[0]), /account-b/u);
+    }
+    if (["empty", "skip", "empty-multiselect"].includes(mode)) {
+      assert.equal(updated[0].text, "Optional answers left blank.");
+      assert.equal(updated[0].blocks[1].text.text, "Optional answers left blank.");
+    }
+    });
   }
 });
 

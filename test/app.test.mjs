@@ -2047,6 +2047,40 @@ test("custom answers explicitly replace prior checkbox selections for the curren
   }
 });
 
+test("stale custom-answer modals cannot answer the next question after another participant skips", async () => {
+  const posted = [], updated = [], submitted = [];
+  const thread = slackInteractionThread({ posted, updated });
+  const interactions = createPendingInteractions(["U1", "U2"]);
+  const decision = interactions.onInteraction({ thread }, {
+    type: "question", sessionId: "ses_custom", signal: AbortSignal.timeout(5000),
+    request: { questions: [
+      { question: "First?", custom: true, required: false },
+      { question: "Second?", custom: true, required: true },
+    ] }, submit: async value => { submitted.push(value); },
+  });
+  try {
+    await waitFor(() => posted.length === 1);
+    const openCustom = async card => {
+      let modal;
+      const custom = slackAction(card, "pipa_custom_");
+      await interactions.onAction({ actionId: custom.action_id, value: custom.value, threadId: thread.id, user: { userId: "U1" }, openModal: async value => { modal = value; } });
+      return modal;
+    };
+    const first = await openCustom(posted[0]);
+    const skip = slackAction(posted[0], "pipa_skip_");
+    await interactions.onAction({ actionId: skip.action_id, value: skip.value, threadId: thread.id, user: { userId: "U2" } });
+    await waitFor(() => updated.length === 1);
+    await interactions.onCustomAnswer({ privateMetadata: first.privateMetadata, values: { answer: "Stale" }, user: { userId: "U1" }, relatedThread: thread });
+    assert.deepEqual(submitted, []);
+    assert.equal(updated.length, 1);
+    const second = await openCustom(updated[0]);
+    assert.notEqual(first.privateMetadata, second.privateMetadata);
+    await interactions.onCustomAnswer({ privateMetadata: second.privateMetadata, values: { answer: "Current" }, user: { userId: "U1" }, relatedThread: thread });
+    assert.deepEqual((await decision).answers, [null, ["Current"]]);
+    assert.equal(submitted.length, 1);
+  } finally { await interactions.close(); await decision.catch(() => undefined); }
+});
+
 test("question Submit uses current Slack state after an older selection finishes authorization last", async () => {
   const posted = [];
   const thread = slackInteractionThread({ posted });
@@ -2180,10 +2214,11 @@ test("interaction registry restricts custom answers to allowed users", async () 
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(posted[0].blocks.some((block) => block.elements?.some((element) => ["radio_buttons", "checkboxes"].includes(element.type))), false);
   const custom = posted[0].blocks.at(-1).elements.find((element) => element.action_id.startsWith("pipa_custom_"));
-  await actionHandler({ actionId: custom.action_id, value: custom.value, user: { userId: "U1" }, thread, openModal: async () => undefined });
-  await customAnswerHandler({ privateMetadata: custom.value, values: { answer: "Wrong" }, user: { userId: "U2", fullName: "other" }, relatedThread: thread });
+  let modal;
+  await actionHandler({ actionId: custom.action_id, value: custom.value, user: { userId: "U1" }, thread, openModal: async value => { modal = value; } });
+  await customAnswerHandler({ privateMetadata: modal.privateMetadata, values: { answer: "Wrong" }, user: { userId: "U2", fullName: "other" }, relatedThread: thread });
   assert.equal(decision, undefined);
-  await customAnswerHandler({ privateMetadata: custom.value, values: { answer: "Orbit" }, user: { userId: "U1", fullName: "lola" }, relatedThread: thread });
+  await customAnswerHandler({ privateMetadata: modal.privateMetadata, values: { answer: "Orbit" }, user: { userId: "U1", fullName: "lola" }, relatedThread: thread });
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.deepEqual(decision, { type: "answer", answers: [["Orbit"]], selectedBy: "Lola" });
   assert.equal(updated[0].blocks[1].text.text, "Lola selected: “Orbit”.");
@@ -2562,11 +2597,13 @@ test("routine interaction callbacks reload responder authorization", async () =>
   }).then((value) => answerDecision = value);
   await waitFor(() => posted.length === 2);
   const custom = slackAction(posted[1], "pipa_custom_");
+  let modal;
+  await interactions.onAction({ actionId: custom.action_id, value: custom.value, threadId: "slack:C1:2.0", user: { userId: "U2" }, openModal: async value => { modal = value; } });
   allowedUserIds = ["U1"];
   const relatedThread = { id: "slack:C1:2.0" };
-  await interactions.onCustomAnswer({ privateMetadata: custom.value, values: { answer: "Wrong" }, user: { userId: "U2" }, relatedThread });
+  await interactions.onCustomAnswer({ privateMetadata: modal.privateMetadata, values: { answer: "Wrong" }, user: { userId: "U2" }, relatedThread });
   assert.equal(answerDecision, undefined);
-  await interactions.onCustomAnswer({ privateMetadata: custom.value, values: { answer: "Orbit" }, user: { userId: "U1" }, relatedThread });
+  await interactions.onCustomAnswer({ privateMetadata: modal.privateMetadata, values: { answer: "Orbit" }, user: { userId: "U1" }, relatedThread });
   await answer;
   assert.deepEqual(answerDecision, { type: "answer", answers: [["Orbit"]] });
 });

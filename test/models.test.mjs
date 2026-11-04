@@ -549,6 +549,8 @@ test("an empty catalog gives a private explanation instead of an empty modal", a
   assert.equal(replies.length, 0);
   assert.equal(notice.submit, undefined);
   assert.match(notice.blocks[0].text.text, /No configured models/u);
+  assert.match(notice.blocks[0].text.text, /terminal.*opencode auth login/u);
+  assert.match(notice.blocks[0].text.text, /operator/u);
   picker.close();
 });
 

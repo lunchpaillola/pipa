@@ -19,10 +19,12 @@ superseded. Publish only to npm's `beta` tag and mark the GitHub release
 - Simple visible text and multiselect forms use Slack question controls regardless of their metadata kind or field names. Unsupported shapes still require an OpenCode client; native validation and session/workspace authorization remain in place.
 - Large model-search results stay within Slack's response-size limit. Models omitted from the initial results remain searchable.
 
-Known form edge cases from review remain: duplicate option labels can map to the
-first option's native value; custom text matching an option label can be mapped
-to that value; optional fields cannot be submitted empty through Slack. Use an
-OpenCode client for these cases. These are not covered by a live Slack form smoke.
+- Slack choices preserve native option values even when labels repeat; typed custom answers are no longer interpreted as option labels. Optional text fields accept an empty string, optional multiselects accept an empty selection, and Skip omits the field from the native answer. Native validation can still reject an answer that violates field constraints. Automated Slack-to-native HTTP fixtures cover these cases; a live Slack form smoke has not run.
+- An empty model picker explains the terminal provider-connection command and directs attached-server users to their operator.
+
+Unsupported numeric, boolean, hidden, conditional and external-action forms still
+have a dead-end OpenCode-client notice. This is an unresolved Slack UX gap, not an
+acceptable end-user workaround. See the [redirect audit and renderer research](research/slack-forms-and-opencode-redirects.md).
 
 ## Retained changes from 0.6.0-beta.1
 

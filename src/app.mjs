@@ -516,12 +516,18 @@ export function createPendingInteractions(allowedUserIds = []) {
     }
     if (event.actionId?.startsWith("pipa_custom_")) {
       const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
-      await event.openModal?.(Modal({ callbackId: "pipa_custom", privateMetadata: token, title: "Custom answer", submitLabel: "Submit", children: [TextInput({ id: "answer", label: question.multiple ? "Answer (replaces checkbox selections)" : "Answer" })] }));
+      await event.openModal?.(Modal({ callbackId: "pipa_custom", privateMetadata: `${token}.${entry.questionIndex}`, title: "Custom answer", submitLabel: "Submit", children: [TextInput({ id: "answer", label: question.multiple ? "Answer (replaces checkbox selections)" : "Answer", optional: question.required === false })] }));
       return;
     }
     if (entry.type !== "question") return;
+    const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
+    if (event.actionId === `pipa_skip_${entry.token}_${entry.questionIndex}` && question.required === false) {
+      entry.answers[entry.questionIndex] = null;
+      await advance(entry, event.user);
+      return;
+    }
     if (event.actionId?.startsWith("pipa_select_")) {
-      const answers = selectedAnswers(event);
+      const answers = selectedAnswers(event, entry);
       if (!answers.length) return;
       entry.answers[entry.questionIndex] = answers;
       return;
@@ -532,21 +538,23 @@ export function createPendingInteractions(allowedUserIds = []) {
       const blockId = `pipa_question_${entry.token}_${entry.questionIndex}`;
       if (values && !Object.hasOwn(values, blockId)) return;
       const selection = values?.[blockId]?.[`pipa_select_${entry.token}`];
-      if (selection) entry.answers[entry.questionIndex] = selectedAnswers(event, selection);
-      if (!entry.answers[entry.questionIndex]?.length) return;
+      if (selection) entry.answers[entry.questionIndex] = selectedAnswers(event, entry, selection);
+      if (!entry.answers[entry.questionIndex]?.length && !(selection && question.multiple && question.required === false)) return;
       await advance(entry, event.user);
       return;
     }
   }
 
   async function onCustomAnswer(event) {
-    const entry = pending.get(event.privateMetadata);
+    const entry = pending.get(String(event.privateMetadata ?? "").split(".")[0]);
     if (!entry) return;
     if (event.relatedThread?.id !== entry.threadId) return;
     if (!await canRespond(entry, event.user)) return;
     if (entry.busy || entry.decision !== undefined || entry.type !== "question") return;
-    const answer = event.values?.answer?.trim();
-    if (!answer) return { action: "errors", errors: { answer: "Enter an answer." } };
+    if (event.privateMetadata !== `${entry.token}.${entry.questionIndex}`) return;
+    const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
+    const answer = question.required === undefined ? event.values?.answer?.trim() : event.values?.answer ?? "";
+    if (!answer && question.required !== false) return { action: "errors", errors: { answer: "Enter an answer." } };
     // Custom answers intentionally replace selections rather than combine with them.
     entry.answers[entry.questionIndex] = [answer];
     await advance(entry, event.user);
@@ -555,7 +563,8 @@ export function createPendingInteractions(allowedUserIds = []) {
   async function advance(entry, user) {
     if (++entry.questionIndex === (entry.request.questions?.length ?? 1)) {
       const selectedBy = displayName(user?.fullName ?? user?.userName);
-      await entry.choose({ type: "answer", answers: entry.answers, ...(selectedBy ? { selectedBy } : {}) });
+      const answers = entry.answers.map(values => values?.map(answer => typeof answer === "string" ? answer : answer.value ?? answer.label) ?? null);
+      await entry.choose({ type: "answer", answers, ...(selectedBy ? { selectedBy } : {}) });
     }
     else entry.message?.edit();
   }
@@ -592,8 +601,8 @@ function renderSubmitted(entry, decision) {
   if (decision?.type === "stop") content = "Dismissed.";
   else if (entry.type === "permission") ({ title, content } = permissionOutcome(entry.request, decision));
   else {
-    const answers = decision?.answers?.flat().filter(Boolean) ?? [];
-    content = `${decision?.selectedBy ? `${decision.selectedBy} selected` : "Selected"}: ${answers.map((answer) => `“${answer}”`).join(", ")}.`;
+    const answers = entry.answers.flat().filter(answer => answer !== null && answer !== undefined && answer !== "");
+    content = answers.length ? `${decision?.selectedBy ? `${decision.selectedBy} selected` : "Selected"}: ${answers.map((answer) => `“${typeof answer === "string" ? answer : answer.label}”`).join(", ")}.` : "Optional answers left blank.";
   }
   return { title, content };
 }
@@ -636,9 +645,9 @@ function renderSlackInteraction(entry) {
     ];
   }
   const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
-  const options = (question.options ?? []).map((option) => ({
+  const options = (question.options ?? []).map((option, index) => ({
     text: { type: "plain_text", text: option.label ?? option },
-    value: `${entry.token}.${option.label ?? option}`,
+    value: `${entry.token}.${entry.questionIndex}.${index}`,
   }));
   const selector = options.length && (question.multiple
     ? { type: "checkboxes", action_id: `pipa_select_${entry.token}`, options }
@@ -646,6 +655,7 @@ function renderSlackInteraction(entry) {
   const actions = [
     ...(question.custom || !options.length ? [slackButton(`pipa_custom_${entry.token}`, "Custom answer", entry.token)] : []),
     ...(options.length ? [slackButton(`pipa_submit_${entry.token}`, "Submit", entry.token, "primary")] : []),
+    ...(question.required === false ? [slackButton(`pipa_skip_${entry.token}_${entry.questionIndex}`, "Skip", entry.token)] : []),
     slackButton(`pipa_dismiss_${entry.token}`, "Dismiss", entry.token, "danger"),
   ];
   return [slackHeader(question.header || "Question"), ...(entry.error ? [slackText(entry.error)] : []), slackText(question.question ?? question.header ?? "Choose an answer."), ...(selector ? [{ ...slackActions([selector]), block_id: `pipa_question_${entry.token}_${entry.questionIndex}` }] : []), slackActions(actions)];
@@ -714,9 +724,16 @@ function slackButton(actionId, text, value, style) {
   return { type: "button", action_id: actionId, text: { type: "plain_text", text }, value, ...(style ? { style } : {}) };
 }
 
-function selectedAnswers(event, action = event.raw?.actions?.find((item) => item.action_id === event.actionId)) {
+function selectedAnswers(event, entry, action = event.raw?.actions?.find((item) => item.action_id === event.actionId)) {
   const values = action?.selected_options?.map((option) => option.value) ?? [action?.selected_option?.value ?? event.value];
-  return values.filter(Boolean).map((value) => String(value).split(".").slice(1).join(".")).filter(Boolean);
+  const question = entry.request.questions?.[entry.questionIndex] ?? entry.request;
+  const prefix = `${entry.token}.${entry.questionIndex}.`;
+  return values.flatMap(value => {
+    if (typeof value !== "string" || !value.startsWith(prefix)) return [];
+    const index = value.slice(prefix.length);
+    const option = question.options?.[Number(index)];
+    return option !== undefined && String(Number(index)) === index ? [option] : [];
+  });
 }
 
 function interactionToken(event) {

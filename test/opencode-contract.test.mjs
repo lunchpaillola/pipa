@@ -1129,14 +1129,17 @@ test("U3 real Slack controls + v2: rejected keyed answer stays editable, correct
   await click(multi, { raw: { actions: [{ action_id: multi.action_id, selected_options: multi.options }] } });
   await click(action("pipa_submit_"));
   const custom = action("pipa_custom_");
-  await controls.onCustomAnswer({ privateMetadata: custom.value, relatedThread: thread, user: { userId: "U1" }, values: { answer: "first" } });
+  let modal;
+  await click(custom, { openModal: async value => { modal = value; } });
+  await controls.onCustomAnswer({ privateMetadata: modal.privateMetadata, relatedThread: thread, user: { userId: "U1" }, values: { answer: "first" } });
   assert.equal(current.calls.length, 1);
   assert.match(JSON.stringify(updated.at(-1)), /rejected/iu);
   assert.ok(action("pipa_submit_"), "same card still has controls");
   // Retry all three questions on the same token/card, with a corrected custom value.
   await click(action("pipa_submit_"));
   await click(action("pipa_submit_"));
-  await controls.onCustomAnswer({ privateMetadata: custom.value, relatedThread: thread, user: { userId: "U1" }, values: { answer: "corrected" } });
+  await click(action("pipa_custom_"), { openModal: async value => { modal = value; } });
+  await controls.onCustomAnswer({ privateMetadata: modal.privateMetadata, relatedThread: thread, user: { userId: "U1" }, values: { answer: "corrected" } });
   complete.resolve();
   assertTurnOutcome(await turn, current.document.expected);
   assert.deepEqual(current.calls.map((call) => call.body), [

@@ -765,8 +765,9 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
         } else if (kind === "custom") {
           const custom = elements.find((item) => item.action_id.startsWith("pipa_custom_"));
           assert.ok(custom, "Native custom answer control absent");
-          await chat.handlers.action({ ...event, actionId: custom.action_id, value: custom.value, openModal: async () => {} });
-          await chat.handlers.custom({ privateMetadata: custom.value, relatedThread: { id: thread }, user: event.user, values: { answer: "Custom matrix answer" } });
+          let modal;
+          await chat.handlers.action({ ...event, actionId: custom.action_id, value: custom.value, openModal: async value => { modal = value; } });
+          await chat.handlers.custom({ privateMetadata: modal.privateMetadata, relatedThread: { id: thread }, user: event.user, values: { answer: "Custom matrix answer" } });
         } else {
           const dismiss = elements.find((item) => item.action_id.startsWith("pipa_dismiss_"));
           await chat.handlers.action({ ...event, actionId: dismiss.action_id, value: dismiss.value });
