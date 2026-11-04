@@ -63,15 +63,14 @@ export function createV2Adapter(options) {
     }
   }
 
-  async function lookup(sessionId, workingDirectory, signal) {
+  async function lookup(sessionId, signal) {
     let session;
     try { session = await readWithRecovery((signal) => client.session.get({ sessionID: sessionId }, { signal }), signal); }
     catch (error) {
       if (error._tag === "SessionNotFoundError" && error.sessionID === sessionId) return null;
       throw error;
     }
-    if (session?.id !== sessionId || typeof session.location?.directory !== "string"
-      || path.resolve(session.location.directory) !== path.resolve(workingDirectory)) throw new Error("OpenCode session workspace identity mismatch.");
+    if (session?.id !== sessionId) throw new Error("OpenCode session identity mismatch.");
     return session;
   }
 
@@ -117,16 +116,14 @@ export function createV2Adapter(options) {
   }
 
   async function belongs(observer, candidate) {
-    const original = candidate;
     const visited = new Set();
     while (candidate && !visited.has(candidate)) {
       visited.add(candidate);
       let session;
       try { session = await client.session.get({ sessionID: candidate }, { signal: observer.controller.signal }); }
       catch (error) { if (error._tag === "SessionNotFoundError") return false; throw error; }
-      if (session?.id !== candidate || typeof session.location?.directory !== "string"
-        || path.resolve(session.location.directory) !== path.resolve(observer.workingDirectory)) return false;
-      if (candidate === observer.sessionId) { observer.interactionSessions.add(original); return true; }
+      if (session?.id !== candidate) return false;
+      if (candidate === observer.sessionId) return true;
       candidate = session.parentID;
     }
     return false;
@@ -231,7 +228,17 @@ export function createV2Adapter(options) {
   }
 
   function reconcile(observer) {
-    observer.reconciliation = (observer.reconciliation ?? Promise.resolve()).catch(() => undefined).then(() => reconcilePending(observer));
+    observer.reconcileRequested = true;
+    if (observer.reconciliation) return observer.reconciliation;
+    observer.reconciliation = Promise.resolve().then(async () => {
+      try {
+        while (observer.reconcileRequested && !observer.controller.signal.aborted) {
+          observer.reconcileRequested = false;
+          try { await reconcilePending(observer); }
+          catch (error) { if (!observer.reconcileRequested) throw error; }
+        }
+      } finally { observer.reconciliation = undefined; }
+    });
     return observer.reconciliation;
   }
 
@@ -239,26 +246,48 @@ export function createV2Adapter(options) {
     if (!observer.onInteraction && !observer.onPermissionsReconciled) return;
     const signal = observer.controller.signal;
     const revision = observer.interactionRevision;
-    const input = { location: { directory: observer.workingDirectory } };
-    const snapshots = await readWithRecovery((signal) => Promise.all([client.form.list(input, { signal }), client.permission.request.list(input, { signal })]), signal);
-    if (revision !== observer.interactionRevision) return;
-    for (const [index, snapshot] of snapshots.entries()) {
-      if (revision !== observer.interactionRevision) return;
-      if (path.resolve(snapshot.location?.directory ?? "") !== path.resolve(observer.workingDirectory) || !Array.isArray(snapshot.data)) throw new Error("OpenCode returned invalid interaction location projections.");
-      const kind = index === 0 ? "form" : "permission";
-      for (const request of snapshot.data) await dispatch(observer, kind, request);
-      if (revision !== observer.interactionRevision) return;
-      for (const [key, entry] of observer.interactions) {
-        if (entry.kind === kind && !entry.submitting && !snapshot.data.some((request) => request.id === entry.request.id && request.sessionID === entry.request.sessionID)) {
-          settle(entry);
-          observer.interactions.delete(key);
+    const sessionIds = new Set([observer.sessionId]);
+    for (const sessionId of sessionIds) {
+      signal.throwIfAborted();
+      const input = { sessionID: sessionId };
+      const results = await Promise.allSettled(["form", "permission"].map(async (kind) => {
+        let snapshot;
+        try {
+          snapshot = await readWithRecovery((signal) => kind === "form"
+            ? client.session.form.list(input, { signal }) : client.permission.list(input, { signal }), signal);
+          if (!Array.isArray(snapshot) || snapshot.some((request) => request.sessionID !== sessionId)) throw new Error("OpenCode returned an invalid interaction projection.");
+        } catch {
+          if (!signal.aborted) process.stderr.write(`OpenCode ${kind} reconciliation read failed.\n`);
+          return;
         }
-      }
-      if (kind === "permission" && observer.onPermissionsReconciled) {
-        const scoped = [];
-        for (const request of snapshot.data) if (await belongs(observer, request.sessionID)) scoped.push(request);
-        for (const sessionId of observer.interactionSessions) await observer.onPermissionsReconciled({ sessionId, requestIds: new Set(scoped.filter((request) => request.sessionID === sessionId).map((request) => request.id)) });
-      }
+        if (signal.aborted || revision !== observer.interactionRevision) return;
+        for (const request of snapshot) await dispatch(observer, kind, request);
+        if (signal.aborted || revision !== observer.interactionRevision) return;
+        for (const [key, entry] of observer.interactions) {
+          if (entry.kind === kind && entry.request.sessionID === sessionId && !entry.submitting && !snapshot.some((request) => request.id === entry.request.id)) {
+            settle(entry);
+            observer.interactions.delete(key);
+          }
+        }
+        if (kind === "permission" && observer.onPermissionsReconciled && await belongs(observer, sessionId)
+          && !signal.aborted && revision === observer.interactionRevision) {
+          await observer.onPermissionsReconciled({ sessionId, requestIds: new Set(snapshot.map((request) => request.id)) });
+        }
+      }));
+      for (const result of results) if (result.status === "rejected") throw result.reason;
+      if (signal.aborted || revision !== observer.interactionRevision) return;
+      let cursor;
+      do {
+        try {
+          const page = await readWithRecovery((signal) => client.session.list({ parentID: sessionId, ...(cursor ? { cursor } : {}) }, { signal }), signal);
+          if (!Array.isArray(page.data)) throw new Error("OpenCode returned an invalid session projection.");
+          for (const child of page.data) if (typeof child.id === "string" && child.parentID === sessionId) sessionIds.add(child.id);
+          cursor = page.cursor.next;
+        } catch {
+          if (!signal.aborted) process.stderr.write("OpenCode descendant discovery failed.\n");
+          break;
+        }
+      } while (cursor);
     }
   }
 
@@ -276,7 +305,7 @@ export function createV2Adapter(options) {
               connected = true;
               for (const observer of observers.values()) {
                 queueResponse(observer, async () => {
-                  if (!await lookup(observer.sessionId, observer.workingDirectory, observer.controller.signal)) throw new Error("OpenCode session is unavailable.");
+                  if (!await lookup(observer.sessionId, observer.controller.signal)) throw new Error("OpenCode session is unavailable.");
                   observer.initialized.resolve();
                 }, true);
                 void reconcile(observer).catch(() => undefined);
@@ -284,7 +313,6 @@ export function createV2Adapter(options) {
               continue;
             }
             for (const observer of observers.values()) {
-              if (event.location && path.resolve(event.location.directory ?? "") !== path.resolve(observer.workingDirectory)) continue;
               if (event.data?.sessionID === observer.sessionId) {
                 if (event.type === "session.step.ended" && event.data.finish === "stop") queueResponse(observer, async () => {
                   const message = await readWithRecovery((signal) => client.session.message.get({ sessionID: observer.sessionId, messageID: event.data.assistantMessageID }, { signal }), observer.controller.signal);
@@ -294,9 +322,11 @@ export function createV2Adapter(options) {
                 if (event.type === "session.execution.interrupted") settleWaiters(observer, "");
                 if (event.type === "session.tool.called") void reconcile(observer).catch(() => undefined);
               }
-              if (!["form.created", "permission.asked", "form.replied", "form.cancelled", "permission.replied", "location.shutdown"].includes(event.type)) continue;
+              if (!["form.created", "permission.asked", "form.replied", "form.cancelled", "permission.replied", "location.shutdown", "session.created", "session.forked", "session.moved"].includes(event.type)) continue;
               observer.interactionTask = (observer.interactionTask ?? Promise.resolve()).then(async () => {
                 if (observer.controller.signal.aborted) return;
+                if (["session.created", "session.forked", "session.moved"].includes(event.type)
+                  && await belongs(observer, event.data.parentID ?? event.data.sessionID)) void reconcile(observer).catch(() => undefined);
                 if (event.type === "form.created") await dispatch(observer, "form", event.data.form);
                 if (event.type === "permission.asked") await dispatch(observer, "permission", event.data);
                 if (event.type === "permission.replied" && await belongs(observer, event.data.sessionID)) {
@@ -312,7 +342,7 @@ export function createV2Adapter(options) {
                   const id = kind === "form" ? event.data?.id : event.data?.requestID;
                   const entry = observer.interactions.get(`${kind}:${event.data?.sessionID}:${id}`);
                   if (entry && !entry.submitting) settle(entry);
-                  await reconcile(observer);
+                  void reconcile(observer).catch(() => undefined);
                 }
               }).catch(() => { if (!observer.controller.signal.aborted) process.stderr.write("OpenCode interaction event failed.\n"); });
             }
@@ -363,13 +393,13 @@ export function createV2Adapter(options) {
     let observer = observers.get(input.sessionId);
     const created = !observer;
     if (!observer) {
-      observer = { sessionId: input.sessionId, workingDirectory: input.workingDirectory, controller: new AbortController(), initialized: Promise.withResolvers(), delivered: new Set(), replied: new Set(), waiters: new Set(), handlers: new Set(), interactions: new Map(), interactionSessions: new Set([input.sessionId]), interactionRevision: 0, persistent };
+      observer = { sessionId: input.sessionId, controller: new AbortController(), initialized: Promise.withResolvers(), delivered: new Set(), replied: new Set(), waiters: new Set(), handlers: new Set(), interactions: new Map(), interactionRevision: 0, persistent };
       observers.set(input.sessionId, observer);
       // Observe rejection immediately, including shutdown during initial attachment.
       void observer.initialized.promise.catch(() => undefined);
       observer.registration = (async () => {
         const signal = observer.controller.signal;
-        if (!await lookup(input.sessionId, input.workingDirectory, signal)) throw new Error("OpenCode session is unavailable.");
+        if (!await lookup(input.sessionId, signal)) throw new Error("OpenCode session is unavailable.");
         try {
           const entries = await client.session.instructions.entry.list({ sessionID: input.sessionId }, { signal });
           observer.instructions = entries.find((entry) => entry.key === "pipa.slack")?.value;
@@ -381,7 +411,6 @@ export function createV2Adapter(options) {
         try { await observer.initialized.promise; } finally { clearTimeout(timer); }
       })();
     }
-    if (path.resolve(observer.workingDirectory) !== path.resolve(input.workingDirectory)) throw new Error("OpenCode session workspace identity mismatch.");
     if (waiter) observer.waiters.add(waiter);
     observer.persistent ||= persistent;
     for (const key of ["onResponse", "onError", "onInteraction", "onPermissionReplied", "onPermissionsReconciled"]) if (input[key] !== undefined) observer[key] = input[key];
@@ -409,17 +438,17 @@ export function createV2Adapter(options) {
       if (typeof sessionId !== "string" || !sessionId) throw new Error("Invalid OpenCode session ID.");
       if (model !== null && (!model || typeof model.providerID !== "string" || !model.providerID || typeof model.id !== "string" || !model.id
         || (model.variant !== undefined && (typeof model.variant !== "string" || !model.variant)))) throw new Error("Invalid OpenCode model selection.");
-      const catalog = await listModels(workingDirectory, signal);
-      const selection = model === null ? catalog.defaultModel : { providerID: model.providerID, id: model.id, variant: model.variant ?? "default" };
-      const available = selection && catalog.models.find((item) => item.providerID === selection.providerID && item.id === selection.id);
-      if (!available || !available.variants.includes(selection.variant)) throw new Error("OpenCode model or variant is unavailable.");
-      if (!await lookup(sessionId, workingDirectory, signal)) throw new Error("OpenCode session is unavailable; model selection did not create a replacement.");
+      const session = await lookup(sessionId, signal);
+      if (!session) throw new Error("OpenCode session is unavailable; model selection did not create a replacement.");
+      const selection = model === null ? (await listModels(session.location.directory, signal)).defaultModel
+        : { providerID: model.providerID, id: model.id, variant: model.variant ?? "default" };
+      if (!selection) throw new Error("OpenCode default model is unavailable.");
       signal.throwIfAborted();
       await client.session.switchModel({ sessionID: sessionId, model: selection }, { signal });
     },
     async resolveSession(sessionId, workingDirectory, controller) {
       const signal = controller.signal;
-      let session = sessionId ? await lookup(sessionId, workingDirectory, signal) : null;
+      let session = sessionId ? await lookup(sessionId, signal) : null;
       const created = !session;
       if (!session) {
         session = await client.session.create({ location: { directory: workingDirectory } }, { signal });
@@ -452,10 +481,9 @@ export function createV2Adapter(options) {
         const selected = input.model ?? (input.defaultEligible ? input.defaultModel : null);
         if (selected) await client.session.switchModel({ sessionID: input.sessionId, model: { providerID: selected.providerID, id: selected.modelID ?? selected.id, variant: selected.variant ?? "default" } }, { signal });
         const id = options.inputId?.() ?? `msg_${randomUUID().replaceAll("-", "")}`;
-        const admitted = await client.session.prompt({ sessionID: input.sessionId, id, text: input.prompt,
+        await client.session.prompt({ sessionID: input.sessionId, id, text: input.prompt,
           ...(input.files?.length ? { files: input.files.map((file) => ({ uri: file.url, name: file.filename })) } : {}),
         }, { signal });
-        if (admitted?.id !== id || admitted.sessionID !== input.sessionId || admitted.type !== "user" || admitted.payload?.text !== input.prompt) throw new Error("OpenCode returned an invalid prompt admission.");
         if (input.onResponse) return { pending: true };
         return await waiter.promise;
       } catch (error) {
@@ -493,11 +521,12 @@ function executionError(error) {
   const status = error?.status;
   const http = Number.isInteger(status) && status >= 400 && status <= 599 ? ` (HTTP ${status})` : "";
   // Classify native structured errors; provider messages/bodies can contain credentials.
-  if (status === 401 || error?.type === "provider.auth") {
+  if (typeof error?.type !== "string" || !error.type.startsWith("provider.")) return new Error(`OpenCode execution failed${http}.`);
+  if (status === 401 || error.type === "provider.auth") {
     const expired = status === 401 && typeof error.message === "string" && /\bAPI key (?:has )?expired\b/iu.test(error.message);
     return new Error(expired
-      ? "OpenCode selected provider API key has expired. Replace that provider's API key in OpenCode, or choose another provider with your installation's model command, then start a new thread."
-      : `OpenCode selected provider authentication failed${http}. Reconnect that provider in OpenCode, or choose another provider with your installation's model command, then start a new thread.`);
+      ? "OpenCode selected provider API key has expired. Replace that provider's API key or change this session's model in OpenCode, then retry in this thread."
+      : `OpenCode selected provider authentication failed${http}. Reconnect that provider or change this session's model in OpenCode, then retry in this thread.`);
   }
   return new Error(`OpenCode selected provider ${http ? `failed${http}` : "failed to complete the turn"}.`);
 }
