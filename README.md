@@ -53,10 +53,10 @@ pipa start
 
 ### Opt-in 0.6 beta
 
-`0.6.0-beta.3` is being prepared for controlled testing, not stable release. Once published, opt in with:
+`0.6.0-beta.4` is being prepared for controlled testing, not stable release. Once published, opt in with:
 
 ```sh
-npm install --global @usepipa/pipa@0.6.0-beta.3
+npm install --global @usepipa/pipa@0.6.0-beta.4
 ```
 
 Normal installs use npm's `latest` tag; later betas use `@beta`. This updates Pipa, not OpenCode. Before upgrading, stop Pipa and back up its profile. Keep your current OpenCode version initially. Do not rerun `pipa init` or start a second listener. Read the [beta release notes](https://github.com/lunchpaillola/pipa/blob/main/docs/beta-release.md) for limits and rollback steps.

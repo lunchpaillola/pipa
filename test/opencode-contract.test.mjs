@@ -233,7 +233,7 @@ test("v1 baseline: exact prompt, trusted context and persisted-session continuat
   const contextLines = admission.body.system.split("\n").filter((line) => line.startsWith("PIPA_") && line.includes("="));
   assertPromptReceipt({ prompt: admission.body.parts[0].text, context: Object.fromEntries(contextLines.map((line) => line.split("="))) }, { prompt: document.prompt, context }, "v1 context");
   assert.match(admission.body.system, /pipa routine --help/u);
-  assert.doesNotMatch(admission.body.system, /When asked to restart|instance\/dispose/u);
+  assert.match(admission.body.system, /run `pipa restart --channel C1 --thread 1\.0`/u);
   assert.doesNotMatch(admission.body.parts[0].text, /PIPA_CURRENT/u);
   const continued = await runner.enqueue("slack:C1:1.0", { ...input, prompt: "continue", deliver: (result) => delivered.push(result.text) });
   assertTurnOutcome(continued, document.continuation, "v1 continuation");
@@ -1833,7 +1833,9 @@ test("isolated production attachment/artifact turn uses private HOME/temp and re
       staged = new URL(call.body.parts[1].url);
       assert.equal(await readFile(staged, 'utf8'), 'attachment bytes');
       assert.ok(staged.pathname.includes('/temp/'));
-        assert.doesNotMatch(call.body.system, /When asked to restart|ensure PIPA_HOME/u);
+      assert.match(call.body.system, /run \x60pipa restart\x60/u);
+      assert.ok(call.body.system.includes('The Pipa profile home on that host is ' + JSON.stringify(process.env.PIPA_HOME)));
+      assert.match(call.body.system, /ensure PIPA_HOME has this value/u);
       artifacts = call.body.system.match(/private artifact directory: (.+)\n/)[1];
       await writeFile(path.join(artifacts, 'report.txt'), 'artifact bytes');
       document.routes.find(route => route.path.endsWith('/message')).responses[1].json[0].parts[1].text += '\nPIPA_ARTIFACTS: ["report.txt"]';
