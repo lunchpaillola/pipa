@@ -260,6 +260,11 @@ for (const [botName, command] of [["Chopper", "/chopper"], ["Chopper", "/pipa"],
   const calls = [];
   let discoveries = 0;
   const app = await startPipa({ paths, chat, routinesEnabled: false, checkSlackToken: async () => ({ ok: true }),
+    slackFetch: async (url, input) => {
+      assert.equal(new URL(url).pathname, "/api/conversations.replies");
+      assert.equal(input.headers.authorization, "Bearer xoxb-test");
+      return Response.json({ ok: true, messages: [{ ts: "1.0", user: "U1", text: "<@UPIPA> begin" }] });
+    },
     executor: { listModels: async ({ workingDirectory, signal }) => {
       assert.equal(workingDirectory, config.workingDirectory);
       assert.ok(signal instanceof AbortSignal);

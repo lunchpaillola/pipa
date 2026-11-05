@@ -393,13 +393,53 @@ export function createV2Adapter(options) {
       const signal = controller.signal;
       let session = sessionId ? await lookup(sessionId, signal) : null;
       const created = !session;
+      let locationRecovered;
+      if (session) {
+        const directory = session.location?.directory;
+        if (typeof directory !== "string" || !directory) throw new Error("OpenCode returned an invalid session location.");
+        try { await client.location.get({ location: { directory } }, { signal }); }
+        catch (error) {
+          if (error._tag !== "LocationNotFoundError" || error.location?.directory !== directory) throw error;
+          session = await lookup(sessionId, signal);
+          if (!session) throw new Error("OpenCode session is unavailable; the current request was not sent.");
+          if (typeof session.location?.directory !== "string" || !session.location.directory) throw new Error("OpenCode returned an invalid session location; the current request was not sent.");
+          if (session.location?.directory !== directory) {
+            await client.location.get({ location: session.location }, { signal });
+          } else {
+            const target = await client.location.get({ location: { directory: workingDirectory } }, { signal });
+            if (typeof target?.directory !== "string" || !target.directory) throw new Error("OpenCode returned an invalid fallback location; the current request was not sent.");
+            // These snapshots refuse visible work, but are not a lock on other native clients.
+            const active = await client.session.active({ signal });
+            const inbox = await client.session.inbox.list({ sessionID: session.id }, { signal });
+            if (!active || typeof active !== "object" || Array.isArray(active) || !Array.isArray(inbox)
+              || Object.hasOwn(active, session.id) || inbox.length) throw new Error("Pipa could not repair the working folder while native work is active or pending; the current request was not sent.");
+            session = await lookup(sessionId, signal);
+            if (!session) throw new Error("OpenCode session is unavailable; the current request was not sent.");
+            if (typeof session.location?.directory !== "string" || !session.location.directory) throw new Error("OpenCode returned an invalid session location; the current request was not sent.");
+            if (session.location?.directory !== directory) {
+              await client.location.get({ location: session.location }, { signal });
+            } else {
+              signal.throwIfAborted();
+              try {
+                await client.session.move({ sessionID: session.id, directory: target.directory, delivery: "queue" }, { signal });
+                session = await lookup(sessionId, signal);
+                if (session?.location?.directory !== target.directory) throw new Error("Move not applied.");
+              } catch {
+                signal.throwIfAborted();
+                throw new Error("Pipa could not confirm the working-folder move. The current request was not sent; the move may still apply later.");
+              }
+              locationRecovered = { previousDirectory: directory, directory: target.directory };
+            }
+          }
+        }
+      }
       if (!session) {
         session = await client.session.create({ location: { directory: workingDirectory } }, { signal });
         if (typeof session?.id !== "string" || !session.id) throw new Error("OpenCode did not return a usable session identity.");
       }
       const history = !created && !session.model ? await client.message.list({ sessionID: session.id, limit: 1 }, { signal }) : null;
       if (history && !Array.isArray(history.data)) throw new Error("OpenCode returned an invalid message projection.");
-      return { sessionId: session.id, defaultEligible: !session.model && (created || !history.data.length) };
+      return { sessionId: session.id, defaultEligible: !session.model && (created || !history.data.length), ...(locationRecovered ? { locationRecovered } : {}) };
     },
     async followSession(input) { await follow(input, true); },
     async execute(input) {

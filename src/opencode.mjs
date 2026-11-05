@@ -185,7 +185,7 @@ export function createOpenCodeExecutor(options = {}) {
     }
   }
 
-  async function runTurn({ prompt, sessionId, model, defaultModel, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled, onResponse, onError }) {
+  async function runTurn({ prompt, sessionId, model, defaultModel, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onLocationRecovered, onInteraction, onPermissionReplied, onPermissionsReconciled, onResponse, onError }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     if (stopReason) throw stopReason;
     const legacySession = options.connection?.major === 1 || capabilities?.backgroundResponses === false;
@@ -215,6 +215,8 @@ export function createOpenCodeExecutor(options = {}) {
         activeSessions.set(selectedSessionId, { controller, workingDirectory, resolved: true });
         await onSession?.(selectedSessionId);
         if (controller.signal.aborted) throw controller.signal.reason;
+        if (prepared.locationRecovered) await onLocationRecovered?.(prepared.locationRecovered);
+        controller.signal.throwIfAborted();
         const newThreadModel = !selectedModel && (prepared.defaultEligible ?? !prepared.threadModel) ? normalizeModel(defaultModel) : null;
 
         if (slackTurn) artifactDirectory = await prepareArtifacts(selectedSessionId, workingDirectory, capabilities.backgroundResponses && !!onResponse);
