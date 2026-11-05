@@ -3,11 +3,9 @@ import { normalizeModel } from "./state.mjs";
 
 // The facade owns files, controllers and caller callbacks; this adapter owns v1 wire data.
 export function createV1Adapter({ request, baseUrl, fetchImpl, headers, pollIntervalMs }) {
-  let blocked;
   return {
-    async ready() { if (blocked) throw blocked; },
     async listModels(workingDirectory, signal) {
-      const catalog = await request("/config/providers", { method: "GET" }, workingDirectory, { signal }, [200], false);
+      const catalog = await request("/config/providers", { method: "GET" }, workingDirectory, { signal });
       if (!Array.isArray(catalog?.providers)) throw new Error("OpenCode returned an invalid model catalog.");
       const models = catalog.providers.flatMap((provider) => {
         if (!provider?.models || typeof provider.models !== "object" || Array.isArray(provider.models)) throw new Error("Invalid provider models.");
@@ -77,12 +75,6 @@ export function createV1Adapter({ request, baseUrl, fetchImpl, headers, pollInte
           await request(`/session/${encodeURIComponent(sessionId)}/prompt_async`, {
             method: "POST", body: JSON.stringify({ parts: [{ type: "text", text: prompt }, ...files.map((file) => ({ type: "file", ...file }))], system: instructions, ...(selectedModel ? { model: selectedModel } : {}) }),
           }, workingDirectory, admission, [204]);
-        } catch (cause) {
-          if (cause.status === undefined) {
-            blocked = new Error("OpenCode prompt admission remains uncertain. New intake is blocked until the native work is reconciled.", { cause });
-            controller.abort(blocked);
-          }
-          throw cause;
         } finally { clearTimeout(timeout); }
         controller.signal.throwIfAborted();
         while (true) {
@@ -130,19 +122,18 @@ export function createV1Adapter({ request, baseUrl, fetchImpl, headers, pollInte
           try {
             await watcher?.done;
             const sessions = watcher?.sessionIds ?? new Set([sessionId]);
-            await request(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }, workingDirectory, cleanup, [200, 204, 404], false);
+            await request(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }, workingDirectory, cleanup, [200, 204, 404]);
             if (watcher) {
               // The watcher stops on local cancellation, but a child may ask while
               // the independent admission acknowledgement is still in flight.
               const pending = await watcher.pending(cleanup);
-              await Promise.all([...sessions].filter((id) => id !== sessionId).map((id) => request(`/session/${encodeURIComponent(id)}/abort`, { method: "POST" }, workingDirectory, cleanup, [200, 204, 404], false)));
+              await Promise.all([...sessions].filter((id) => id !== sessionId).map((id) => request(`/session/${encodeURIComponent(id)}/abort`, { method: "POST" }, workingDirectory, cleanup, [200, 204, 404])));
               await Promise.all(pending.map(({ type, id }) => request(`/${type}/${encodeURIComponent(id)}/${type === "question" ? "reject" : "reply"}`, {
                 method: "POST", ...(type === "permission" ? { body: JSON.stringify({ reply: "reject" }) } : {}),
-              }, workingDirectory, cleanup, [200, 204, 404], false)));
+              }, workingDirectory, cleanup, [200, 204, 404])));
             }
           } catch (cause) {
-            blocked = new Error("Pipa OpenCode cancellation failed. New intake is blocked until the native work is reconciled.", { cause });
-            throw blocked;
+            throw new Error("Pipa OpenCode cancellation could not be confirmed.", { cause });
           }
         }
       }
@@ -266,7 +257,7 @@ function watchInteractions({ baseUrl, fetchImpl, headers, sessionId, workingDire
     async pending(cleanup) {
       parents.clear(); // Discard ancestry lookups cancelled with the old turn.
       const pending = await Promise.all(["question", "permission"].map(async (type) => {
-        const requests = await requestTurn(`/${type}`, { method: "GET" }, workingDirectory, cleanup, [200], false);
+        const requests = await requestTurn(`/${type}`, { method: "GET" }, workingDirectory, cleanup);
         return (await Promise.all(requests.map(async (request) => await belongsToSession(request.sessionID, cleanup) ? { type, id: request.id } : null))).filter(Boolean);
       }));
       return pending.flat();
@@ -300,17 +291,17 @@ async function settleInteraction({ type, requestId, sessionId, request: interact
     try {
       if (settlement.uncertain && !await stillPending()) return;
       if (type === "permission") {
-        await requestTurn(`/permission/${encodeURIComponent(requestId)}/reply`, { method: "POST", body: JSON.stringify({ reply }) }, workingDirectory, controller, [200, 204], false);
+        await requestTurn(`/permission/${encodeURIComponent(requestId)}/reply`, { method: "POST", body: JSON.stringify({ reply }) }, workingDirectory, controller, [200, 204]);
         if (reply === "reject") onPermissionRejected?.();
       } else {
         const answer = decision.type === "answer";
         await requestTurn(`/question/${encodeURIComponent(requestId)}/${answer ? "reply" : "reject"}`, {
           method: "POST", ...(answer ? { body: JSON.stringify({ answers: decision.answers }) } : {}),
-        }, workingDirectory, controller, [200, 204], false);
+        }, workingDirectory, controller, [200, 204]);
       }
       settlement.accepted = true;
       if (decision.type === "stop") {
-        const cancellation = requestTurn(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }, workingDirectory, controller, [200, 204], false);
+        const cancellation = requestTurn(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }, workingDirectory, controller, [200, 204]);
         onDismiss?.(cancellation);
         await cancellation;
       }

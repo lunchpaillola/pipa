@@ -391,30 +391,44 @@ async function threadContextApp(t, options = {}) {
   return { app, config, thread, calls, reads, posts, finished, send, reply: handlers.reply };
 }
 
-test("confirmed folder recovery is announced before the request continues without exposing paths", async (t) => {
+test("folder recovery posts a short best-effort heads-up without exposing paths", async (t) => {
   let continued = false;
   const fixture = await threadContextApp(t, { runTurn: async (input) => {
     await input.onLocationRecovered({ previousDirectory: "/private/missing-project", directory: "/private/start" });
-    assert.match(fixture.posts[0], /starting folder/u);
     continued = true;
     return { text: "done", sessionId: "ses_existing" };
   } });
   fixture.send();
   await waitFor(() => fixture.finished.length === 1);
   assert.equal(continued, true);
-  assert.match(fixture.posts[0], /Missing project files have not been restored/u);
+  assert.equal(fixture.posts[0], "The old working folder is no longer available.");
   assert.doesNotMatch(JSON.stringify(fixture.posts), /\/private\//u);
   assert.deepEqual(fixture.posts.at(-1), { markdown: "done" });
 });
 
-for (const failure of ["post failed", "authorization revoked", "stopped"]) test(`folder recovery notice prevents continuation when ${failure}`, async (t) => {
+for (const failure of ["post failed", "never settles"]) test(`folder recovery continues when its heads-up ${failure}`, async (t) => {
   let continued = false;
   const fixture = await threadContextApp(t, { post: async (payload) => {
-    if (typeof payload !== "string" || !payload.includes("starting folder")) return;
+    if (payload !== "The old working folder is no longer available.") return;
     if (failure === "post failed") throw new Error("Notice failed");
-    if (failure === "authorization revoked") fixture.config.allowedSlackUserIds = ["U2"];
-    if (failure === "stopped") fixture.app.stop();
+    return new Promise(() => {});
   }, runTurn: async (input) => {
+    await input.onLocationRecovered({ previousDirectory: "/old", directory: "/start" });
+    continued = true;
+    return { text: "done", sessionId: "ses_existing" };
+  } });
+  fixture.send();
+  await waitFor(() => fixture.finished.length === 1);
+  assert.equal(continued, true);
+  assert.equal(fixture.posts.filter(payload => payload === "The old working folder is no longer available.").length, 1);
+  assert.deepEqual(fixture.posts.at(-1), { markdown: "done" });
+});
+
+for (const failure of ["authorization revoked", "stopped"]) test(`folder recovery still checks Slack access when ${failure}`, async (t) => {
+  let continued = false;
+  const fixture = await threadContextApp(t, { runTurn: async input => {
+    if (failure === "authorization revoked") fixture.config.allowedSlackUserIds = ["U2"];
+    else fixture.app.stop();
     await input.onLocationRecovered({ previousDirectory: "/old", directory: "/start" });
     continued = true;
     return { text: "must not deliver", sessionId: "ses_existing" };
@@ -422,8 +436,7 @@ for (const failure of ["post failed", "authorization revoked", "stopped"]) test(
   fixture.send();
   await waitFor(() => fixture.finished.length === 1);
   assert.equal(continued, false);
-  assert.equal(fixture.posts.filter((payload) => typeof payload === "string" && payload.includes("starting folder")).length, 1);
-  assert.equal(fixture.posts.some((payload) => payload?.markdown === "must not deliver"), false);
+  assert.equal(fixture.posts.some(payload => payload?.markdown === "must not deliver"), false);
 });
 
 test("Slack thread context skips top-level events even when Chat assigns a thread ID", async (t) => {
@@ -1328,7 +1341,7 @@ test("starts and health-checks OpenCode before Slack, then stops only the owned 
     createExecutor: ({ artifactRoot, baseUrl, onFatal, connection }) => {
       events.push(`executor:${baseUrl}`);
       assert.equal(artifactRoot, path.join("/work", ".pipa", "artifacts"));
-      assert.equal(onFatal, server.fail);
+      assert.equal(onFatal, undefined, "Request failures must not stop the server");
       assert.equal(connection, server.connection);
       return { runTurn: async () => undefined, stopAll: () => events.push("executor:stop") };
     },

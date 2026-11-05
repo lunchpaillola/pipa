@@ -29,13 +29,13 @@ Pipa connects Slack to OpenCode. It should not invent execution failures for beh
 
 ## Narrow missing-folder repair
 
-Existing v2 session resolution checks its actual location through OpenCode before sending the current request. A matching native `LocationNotFoundError` can trigger one native move back to the configured starting folder. Native running/inbox reads and an applied-location check bound that attempt; they are not a lock against other native clients. The Slack thread receives a factual location-change notice before execution continues. Missing source files are not restored, the model is not changed, and healthy session moves remain accepted.
+V2 submits the current request normally. Only a prompt-time `LocationNotFoundError` matching the same session's current directory triggers one native queued move to the configured starting folder. Pipa waits for the native location to change, with caller/shutdown cancellation, then submits the definitely rejected request once using the same message ID and payload. It does not inspect or veto active or queued work. Normal folder switches remain valid, history and model identity are retained, and missing source files are not restored.
 
-An accepted but unapplied move is not reported as recovery. Current requests are never automatically replayed after prompt submission or transport uncertainty. Recovery is separate from native execution-error text, reconnect, missed-response catch-up, and process ownership. V1 receives no new location-repair policy.
+The short heads-up, “The old working folder is no longer available,” is best-effort: a failed or stalled Slack post does not gate continuation. Slack authorization is still checked before the recovered request continues. A pending native move is awaited, not treated as immediate failure. Native move failure, unrelated errors, retry rejection and transport uncertainty do not start another recovery attempt. V1 receives no new location-repair policy. Recovery remains separate from reconnect, response catch-up and process ownership.
 
 ## Deliberately separate legacy behavior
 
-V1 still uses interrupt-and-replace and blocks intake after uncertain admission/cancellation. It does not have v2's independent native steering semantics. Removing those guards without replacing the v1 attribution contract can report another turn's output, so this PR does not mechanically delete them. That is remaining Pipa policy, not a claim that all extra behavior has been removed.
+V1 still uses interrupt-and-replace, not v2's independent native steering. Failed admission or cancellation fails only the affected turn; it does not latch an installation-wide flag or stop the Slack listener. V1 does not resubmit prompts or automatically cancel native work just because an admission acknowledgement was lost. Same-session writer checks, native busy-status waiting, ordinary cancellation and stale-output suppression remain. A request connection/body-read failure is not evidence that the owned engine exited; actual process exit and explicit shutdown still stop Pipa.
 
 ## Evidence limits
 

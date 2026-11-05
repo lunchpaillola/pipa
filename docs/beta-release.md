@@ -12,7 +12,8 @@ superseded. Publish only to npm's `beta` tag and mark the GitHub release
 ## Changes from 0.6.0-beta.4
 
 - Read preceding Slack thread discussion directly with Pipa's bot token. No Composio dependency or adapter history reader is used. New top-level requests skip the read; partial or unavailable context is identified. Historical messages are context, not new action permission.
-- Before sending a v2 request, narrowly repair a missing working folder by moving the same native conversation back to the configured starting folder when the native checks permit it. Confirm the move and notify the thread before continuing; do not replay prompts or restore missing files.
+- When OpenCode explicitly rejects a v2 prompt because its working folder is missing, queue a native move of the same conversation to the configured starting folder, await the location change, and submit that definitely rejected request once. Do not veto native active/queued work or replay uncertain requests. The short heads-up is best-effort; missing files are not restored.
+- Remove v1's installation-wide lockouts after failed admission or cancellation and its request-error shutdown path. Fail the affected turn without resubmitting prompts, adding recovery notices or disabling other threads. A lost admission acknowledgement no longer triggers automatic native cancellation. Explicit stop/restart, actual owned-process exit, normal v1 cancellation and same-thread ordering remain.
 - Keep current server ownership and start/stop/restart behavior, selected models, attachment handling, and artifact publication boundaries.
 
 Actual bot-token access and isolated native recovery require qualification before publication. Preparation alone does not approve tagging, publishing, or installing this candidate.
@@ -175,19 +176,21 @@ Preparation checks on macOS with Node 22.23.2:
 - All 532 tests passed with no failures or skips. The first full run exposed five native model-picker test fixtures missing the new direct-history response; supplying that fixture preserved their existing reply assertions. The complete suite then passed.
 - Installed-package smoke passed for the 1.19.0, 2.0.29 and 2.2.5 contract fixtures.
 - All 26 verification self-checks passed.
-- A credential-clean OpenCode 2.2.5 check confirmed same-session relocation after removing an empty test-owned folder, a confirmed applied target, and one `resume:false` prompt in the repaired session's inbox. A second session with queued work was refused recovery and kept its location and queued request. Test processes and storage were removed successfully.
+- Historical, pre-simplification check: a credential-clean OpenCode 2.2.5 check confirmed same-session relocation after removing an empty test-owned folder. That earlier implementation refused a second session with queued work; this refusal has since been removed.
+- The repeatable `node scripts/verification/slack-location-native.mjs` now exercises the shipped executor against real OpenCode 2.2.5 with persisted idle and queued-work sessions. After restarting only the disposable engine and removing each empty test folder, both cases preserve session/history/model, reject the current prompt before admission, move natively, and store/complete that current request once. Previously queued work also completes once without Pipa replay. Cleanup passed. This uses a deterministic local provider, not live Slack or an external provider.
 - The macOS native beta smoke passed all 24 applicable observations across OpenCode 1.19.0 and 2.2.5 in Socket-owned, attached and Managed modes. Startup, exact prompt/history, applicable restart and stop ownership passed; report cleanup passed. This uses a scripted local provider and fake Chat, not live Slack.
 - `npm publish --dry-run --tag beta --access public` contained 13 expected public files at `0.6.0-beta.5`, with no profile data or credentials. No package was published.
 
-The targeted native check did not execute a model task or use an external provider.
+The earlier targeted native check did not execute a model task or use an external provider;
+the recovery-simplification check above executes deterministic local model tasks.
 Live Slack bot-token access, provider-backed continuation, Linux/Windows native
 behavior, and whole-release qualification remain separate. No current production
 session was repaired or restarted.
 
-Recovery-notice delivery is turn-scoped, not durable. If the native move succeeds
-but the notice fails or its turn is cancelled, the current request is not sent;
-a later request can see a healthy moved session without receiving that original
-notice. No recovery-delivery journal or notice replay has been added.
+Recovery heads-up delivery is best-effort, not durable. Failed or stalled Slack
+notice delivery does not block the recovered request. Authorization revocation
+and caller/shutdown cancellation still stop continuation. No recovery-delivery
+journal or notice replay has been added.
 
 Once published, install this exact beta with:
 

@@ -836,19 +836,39 @@ test("rejects prompt failures and aborts active requests during shutdown", async
   await assert.rejects(stagingTurn, (error) => error instanceof PipaStoppedError);
 });
 
-test("marks the selected server fatal when a request loses its connection", async () => {
+for (const failure of ["fetch", "body"]) test(`keeps request ${failure} connection loss local and permits a later turn`, async () => {
   let fatal;
+  let failed = false;
+  let admitted = false;
+  const prompts = [];
   const executor = createOpenCodeExecutor({
     baseUrl: "http://localhost:5555",
     onFatal: (error) => fatal = error,
-    fetch: async (url) => {
+    fetch: async (url, init) => {
       const pathname = new URL(url).pathname;
-      if (pathname === "/session/status") throw new TypeError("fetch failed");
+      if (pathname === "/session/status") {
+        if (!failed) {
+          failed = true;
+          if (failure === "fetch") throw new TypeError("fetch failed");
+          return { text: async () => { throw new TypeError("body failed"); } };
+        }
+        return jsonResponse({ ses_2: { type: "idle" } });
+      }
+      if (pathname === "/session/ses_2/message") return jsonResponse(admitted
+        ? [{ info: { id: "msg_2", role: "assistant", time: { completed: 1 }, finish: "stop" }, parts: [{ type: "text", text: "second thread works" }] }]
+        : []);
+      if (pathname === "/session/ses_2/prompt_async") {
+        admitted = true;
+        prompts.push(JSON.parse(init.body).parts[0].text);
+        return new Response(null, { status: 204 });
+      }
       throw new Error(`Unexpected request: ${url}`);
     },
   });
-  await assert.rejects(executor.runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" }), /fetch failed/u);
-  assert.match(fatal.message, /became unavailable/u);
+  await assert.rejects(executor.runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" }), new RegExp(`${failure} failed`, "u"));
+  assert.equal(fatal, undefined);
+  assert.equal((await executor.runTurn({ prompt: "new request", sessionId: "ses_2", workingDirectory: "/work" })).text, "second thread works");
+  assert.deepEqual(prompts, ["new request"]);
 });
 
 test("preserves attachment validation and cleanup", async () => {

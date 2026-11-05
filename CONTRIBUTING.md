@@ -47,6 +47,13 @@ It also runs a native question tool with a scripted loopback provider. It needs
 no Slack tokens or paid-provider credentials. Captured Slack transport does not
 verify visual rendering or real file uploads; those still need a test Slack app.
 
+For missing-location recovery, run `node scripts/verification/slack-location-native.mjs`
+with the target v2 engine on PATH. It uses disposable native storage and a scripted
+local provider, preserves idle/queued session history across a test-only engine
+restart, removes only empty test-owned folders, and verifies one native completion
+of both the rejected current request and any previously queued work. An optional
+positional filename saves the JSON report; no Slack or paid-provider tokens are used.
+
 The current native v2 target to qualify is **2.2.5**, alongside historical v2 **2.0.29** and v1 pins **1.18.35 / 1.19.0**. The SDK remains pinned to `@opencode/client@2.0.29` until qualified; its version is not the native engine target. These are qualification inputs, not passing compatibility results or a release recommendation.
 
 For model-selection changes, iterate with `node --test test/state.test.mjs test/opencode.test.mjs test/models.test.mjs test/app.test.mjs test/routines.test.mjs test/cli.test.mjs`, then run both required checks above.

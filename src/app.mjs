@@ -75,7 +75,6 @@ export async function startPipa(options = {}) {
       artifactRoot: path.join(config.workingDirectory, ".pipa", "artifacts"),
       baseUrl: server.baseUrl,
       connection: server.connection,
-      onFatal: server.fail,
     });
     await executor.ready?.(config.workingDirectory);
     options.signal?.throwIfAborted();
@@ -275,8 +274,7 @@ export async function startPipa(options = {}) {
         onSession: () => undefined,
         onLocationRecovered: async () => {
           await authorize();
-          await thread.post("The old working folder is gone. I'm continuing this conversation from Pipa's starting folder. Missing project files have not been restored.");
-          await authorize();
+          void Promise.resolve().then(() => thread.post("The old working folder is no longer available.")).catch(() => undefined);
         },
         onInteraction: (interaction) => interactions.onInteraction(interactionContext, interaction),
         onPermissionReplied: interactions.onPermissionReplied,

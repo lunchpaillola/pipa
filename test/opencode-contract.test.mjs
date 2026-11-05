@@ -215,11 +215,13 @@ test("v2 background responses keep attachment context after initial admission an
   assert.equal(await readFile(legacyJournal, "utf8"), "legacy journal retained untouched");
 });
 
-test("Slack thread context and folder repair compose into one native request", async (t) => {
+for (const notice of ["delivered", "failed", "never settles"]) test(`Slack history and folder repair admit one native request when the heads-up ${notice}`, async (t) => {
   let directory = "/native/removed-project";
+  let attempts = 0;
   const current = await fixture(t, "v2", { transport: async (url, init, next) => {
     const parsed = new URL(url);
-    if (parsed.pathname === "/api/location" && parsed.searchParams.get("location[directory]") === "/native/removed-project") {
+    if (parsed.pathname.endsWith("/prompt")) attempts++;
+    if (parsed.pathname.endsWith("/prompt") && directory === "/native/removed-project") {
       return Response.json({ _tag: "LocationNotFoundError", location: { directory }, message: "Missing folder" }, { status: 404 });
     }
     if (parsed.pathname === "/api/session/ses_contract") {
@@ -248,19 +250,25 @@ test("Slack thread context and folder repair compose into one native request", a
   });
   t.after(() => app.shutdown());
   handlers.mention({ id: "slack:C1:1.000001", channel: { isDM: false }, subscribe: async () => undefined,
-    adapter: { addReaction: async () => undefined, removeReaction: async () => undefined }, post: async (payload) => posts.push(payload) },
+    adapter: { addReaction: async () => undefined, removeReaction: async () => undefined }, post: async (payload) => {
+      posts.push(payload);
+      if (payload !== "The old working folder is no longer available.") return;
+      if (notice === "failed") throw new Error("Slack post failed");
+      if (notice === "never settles") return new Promise(() => {});
+    } },
   { id: "2.000001", text: "continue review", author: { userId: "U1" }, raw: { ts: "2.000001", thread_ts: "1.000001" } });
   await waitFor(() => wire.calls.some((call) => call.path.endsWith("/prompt")));
   assert.equal(directory, runtime.workspace);
-  assert.equal(posts.filter((payload) => typeof payload === "string" && payload.includes("starting folder")).length, 1);
+  assert.equal(posts.filter(payload => payload === "The old working folder is no longer available.").length, 1);
   const prompts = wire.calls.filter((call) => call.path.endsWith("/prompt"));
   assert.equal(prompts.length, 1);
+  assert.equal(attempts, 2, "One rejected attempt and one accepted request");
   assert.match(prompts[0].body.text, /Use blue/u);
   assert.equal(prompts[0].body.text.split("continue review").length, 2);
   assert.equal(wire.calls.some((call) => call.path === "/api/session" && call.method === "POST"), false);
 });
 
-for (const notice of ["delivered", "failed", "revoked", "shutdown", "aborted onSession", "never settles"]) test(`confirmed folder recovery through real executor: notice ${notice}`, async (t) => {
+for (const notice of ["delivered", "failed", "revoked", "shutdown", "aborted onSession", "never settles"]) test(`folder recovery callback retains cancellation through real executor: ${notice}`, async (t) => {
   const old = "/native/deleted-checkout";
   let directory = old;
   const order = [];
@@ -275,7 +283,8 @@ for (const notice of ["delivered", "failed", "revoked", "shutdown", "aborted onS
     return rm(directory, options);
   } }, transport: async (url, init, next) => {
     const parsed = new URL(url);
-    if (parsed.pathname === "/api/location" && parsed.searchParams.get("location[directory]") === old) {
+    if (parsed.pathname.endsWith("/prompt")) order.push("prompt");
+    if (parsed.pathname.endsWith("/prompt") && directory === old) {
       order.push("missing");
       return Response.json({ _tag: "LocationNotFoundError", location: { directory: old }, message: "Location missing" }, { status: 404 });
     }
@@ -293,7 +302,6 @@ for (const notice of ["delivered", "failed", "revoked", "shutdown", "aborted onS
       order.push("move");
       return new Response(null, { status: 204 });
     }
-    if (parsed.pathname.endsWith("/prompt")) order.push("prompt");
     if (init.method === "PUT") order.push("instructions");
     return next(url, init);
   } });
@@ -309,7 +317,7 @@ for (const notice of ["delivered", "failed", "revoked", "shutdown", "aborted onS
     onLocationRecovered: async (metadata) => {
       assert.deepEqual(metadata, { previousDirectory: old, directory: runtime.workspace });
       assert.ok(order.indexOf("confirmed") > order.indexOf("move"));
-      assert.equal(order.includes("prompt"), false);
+      assert.equal(order.filter(step => step === "prompt").length, 1, "Only the rejected request preceded recovery");
       order.push("notice");
       if (notice === "never settles") {
         noticeStarted.resolve();
@@ -331,15 +339,14 @@ for (const notice of ["delivered", "failed", "revoked", "shutdown", "aborted onS
   }
   if (notice !== "delivered") {
     await assert.rejects(run, (failure) => failure === error);
-    assert.equal(order.includes("prompt"), false);
-    assert.equal(order.includes("instructions"), false);
+    assert.equal(wire.calls.some(call => call.path.endsWith("/prompt")), false, "No prompt was admitted");
     assert.equal(order.includes("notice"), notice !== "aborted onSession");
     return;
   }
   assert.deepEqual(await run, { pending: true, sessionId: input.sessionId });
   assert.ok(order.indexOf("notice") > order.indexOf("onSession"));
-  assert.ok(order.indexOf("prompt") > order.indexOf("notice"));
-  assert.equal(order.filter((step) => step === "prompt").length, 1);
+  assert.ok(order.lastIndexOf("prompt") > order.indexOf("notice"));
+  assert.equal(order.filter((step) => step === "prompt").length, 2);
   assert.equal(order.filter((step) => step === "move").length, 1);
   assert.equal(wire.calls.some((call) => call.path.endsWith("/model") || call.path.endsWith("/interrupt") || (call.path === "/api/session" && call.method === "POST")), false);
   const instructions = wire.calls.find((call) => call.method === "PUT").body.value;
@@ -364,7 +371,7 @@ test("aborting a pending recovery notice releases the executor without admitting
   const release = Promise.withResolvers();
   const current = await fixture(t, "v2", { transport: async (url, init, next) => {
     const parsed = new URL(url);
-    if (parsed.pathname === "/api/location" && parsed.searchParams.get("location[directory]") === old) return Response.json({ _tag: "LocationNotFoundError", location: { directory: old }, message: "Missing" }, { status: 404 });
+    if (parsed.pathname.endsWith("/prompt") && directory === old) return Response.json({ _tag: "LocationNotFoundError", location: { directory: old }, message: "Missing" }, { status: 404 });
     if (parsed.pathname === "/api/session/ses_contract") {
       const body = await (await next(url, init)).json();
       body.data.location = { directory };
@@ -384,7 +391,7 @@ test("aborting a pending recovery notice releases the executor without admitting
     await entered.promise;
     controller.abort(error);
     await assert.rejects(bounded(run, { timeoutMs: 1000, label: "aborted recovery notice" }), (failure) => failure === error);
-    assert.equal(current.wire.calls.some((call) => call.path.endsWith("/prompt") || call.method === "PUT"), false);
+    assert.equal(current.wire.calls.some((call) => call.path.endsWith("/prompt")), false);
   } finally {
     release.resolve();
     await run.catch(() => undefined);
@@ -1504,8 +1511,7 @@ for (const projection of ["stale", "completed"]) for (const abortResult of ["ack
       assert.equal(submissionError?.message, "Pipa OpenCode cancellation could not be confirmed.");
       assert.equal(outcome.error?.message, submissionError.message);
       assert.equal(aborts, 2, "Finally must retry cancellation after the pending abort rejects");
-      if (abortResult === "503") await assert.rejects(executor.ready(input.workingDirectory), /cancellation failed.*New intake is blocked/u);
-      else await executor.ready(input.workingDirectory);
+      await executor.ready(input.workingDirectory);
     }
     wire.assertComplete();
   } finally { acknowledge.resolve(); await turn.catch(() => undefined); }
@@ -1528,7 +1534,7 @@ for (const type of ["question", "permission"]) for (const failure of ["network",
     if (abort && abortSignals.length === 1 && failure === "network") throw new TypeError("private-abort-network-secret");
     return response;
   } });
-  const { document, executor, input, wire } = current;
+  const { document, executor, input, wire, runtime } = current;
   const request = { id: type === "question" ? "que_contract" : "per_contract", sessionID: input.sessionId };
   document.routes.find((route) => route.path === `/${type}`).responses[0].json = [request];
   document.routes.find((route) => route.path === "/event").responses[0].sse = `data: ${JSON.stringify({ type: `${type}.asked`, properties: request })}\n\n`;
@@ -1552,16 +1558,16 @@ for (const type of ["question", "permission"]) for (const failure of ["network",
   assert.equal(abortSignals[0].aborted, true);
   assert.notEqual(abortSignals[0], abortSignals[1]);
   assert.equal(abortSignals[1].aborted, false, "Cleanup must not reuse the cancelled local signal");
-  if (cleanupFails) {
-    const calls = wire.calls.length;
-    await assert.rejects(executor.ready(input.workingDirectory), /cancellation failed.*New intake is blocked/u);
-    await assert.rejects(executor.runTurn(input), /cancellation failed.*New intake is blocked/u);
-    assert.equal(wire.calls.length, calls, "Blocked intake must not reach native admission");
-  } else {
-    await executor.ready(input.workingDirectory);
-    assertTurnOutcome(await executor.runTurn(input), document.continuation);
+  await executor.ready(input.workingDirectory);
+  assert.equal(wire.calls.filter((call) => call.path.endsWith("/prompt_async")).length, 1, "The failed turn must not be resubmitted");
+  const other = await loadWireFixture("v1", runtime);
+  for (const route of other.routes.filter((route) => route.path.startsWith("/session/ses_contract/"))) {
+    route.path = route.path.replace("ses_contract", "ses_independent");
+    document.routes.push(route);
   }
-  assert.equal(wire.calls.filter((call) => call.path.endsWith("/prompt_async")).length, cleanupFails ? 1 : 2);
+  assertTurnOutcome(await executor.runTurn({ ...input, sessionId: "ses_independent" }), { ...document.expected, sessionId: "ses_independent" });
+  assertTurnOutcome(await executor.runTurn(input), document.continuation);
+  assert.equal(wire.calls.filter((call) => call.path.endsWith("/prompt_async")).length, 3);
   wire.assertComplete();
 });
 
@@ -1633,17 +1639,27 @@ for (const late of [false, true]) test(`U4 v1 cancellation drains child requests
   wire.assertComplete();
 });
 
-test("U4 v1 uncertain admission blocks replay even after native abort", async (t) => {
-  const { executor, input, wire } = await fixture(t, "v1", { transport: async (url, init, next) => {
+for (const failure of ["network", "body"]) test(`v1 lost admission ${failure} reports failure without replay or global lockout`, async (t) => {
+  const { executor, input, wire, runtime, document } = await fixture(t, "v1", { transport: async (url, init, next) => {
     const response = await next(url, init);
-    if (new URL(url).pathname.endsWith("/prompt_async")) throw new TypeError("lost acknowledgement after admission");
+    if (new URL(url).pathname === "/session/ses_contract/prompt_async") {
+      if (failure === "network") throw new TypeError("lost acknowledgement after admission");
+      return { status: 204, text: async () => { throw new TypeError("lost acknowledgement after admission"); } };
+    }
     return response;
   } });
-  await assert.rejects(executor.runTurn(input), /admission remains uncertain/u);
-  assert.equal(wire.calls.filter((call) => call.path.endsWith("/abort")).length, 1);
-  await assert.rejects(executor.ready(input.workingDirectory), /blocked/u);
-  await assert.rejects(executor.runTurn(input), /blocked/u);
+  const other = await loadWireFixture("v1", runtime);
+  for (const route of other.routes.filter((route) => route.path.startsWith("/session/ses_contract/"))) {
+    route.path = route.path.replace("ses_contract", "ses_independent");
+    document.routes.push(route);
+  }
+  await assert.rejects(executor.runTurn(input), /lost acknowledgement after admission/u);
+  assert.equal(wire.calls.filter((call) => call.path.endsWith("/abort")).length, 0, "Lost acknowledgement alone must not trigger native cancellation");
+  await executor.ready(input.workingDirectory);
   assert.equal(wire.calls.filter((call) => call.path.endsWith("/prompt_async")).length, 1);
+  assertTurnOutcome(await executor.runTurn({ ...input, sessionId: "ses_independent" }), { ...document.expected, sessionId: "ses_independent" });
+  assert.equal(wire.calls.filter((call) => call.path === "/session/ses_contract/prompt_async").length, 1);
+  assert.equal(wire.calls.filter((call) => call.path === "/session/ses_independent/prompt_async").length, 1);
   wire.assertComplete();
 });
 
