@@ -27,6 +27,12 @@ Pipa connects Slack to OpenCode. It should not invent execution failures for beh
 - **State, routine and process validation** (`state.mjs`, `routines.mjs`, `restart.mjs`, `bin/pipa.mjs`): protect persisted mappings, exact destinations, schedules, single-instance locks and owned restart handoffs. Removing them can lose continuity or target the wrong process/destination.
 - **Permission/question translation and native-client fallback** (`opencode-v2.mjs`): validate Slack decisions before translating them, preserve editable controls when native submission fails, and avoid pretending Slack can answer unsupported rich forms.
 
+## Narrow missing-folder repair
+
+Existing v2 session resolution checks its actual location through OpenCode before sending the current request. A matching native `LocationNotFoundError` can trigger one native move back to the configured starting folder. Native running/inbox reads and an applied-location check bound that attempt; they are not a lock against other native clients. The Slack thread receives a factual location-change notice before execution continues. Missing source files are not restored, the model is not changed, and healthy session moves remain accepted.
+
+An accepted but unapplied move is not reported as recovery. Current requests are never automatically replayed after prompt submission or transport uncertainty. Recovery is separate from native execution-error text, reconnect, missed-response catch-up, and process ownership. V1 receives no new location-repair policy.
+
 ## Deliberately separate legacy behavior
 
 V1 still uses interrupt-and-replace and blocks intake after uncertain admission/cancellation. It does not have v2's independent native steering semantics. Removing those guards without replacing the v1 attribution contract can report another turn's output, so this PR does not mechanically delete them. That is remaining Pipa policy, not a claim that all extra behavior has been removed.

@@ -53,10 +53,10 @@ pipa start
 
 ### Opt-in 0.6 beta
 
-`0.6.0-beta.4` is being prepared for controlled testing, not stable release. Once published, opt in with:
+`0.6.0-beta.5` is being prepared for controlled testing, not stable release. Once published, opt in with:
 
 ```sh
-npm install --global @usepipa/pipa@0.6.0-beta.4
+npm install --global @usepipa/pipa@0.6.0-beta.5
 ```
 
 Normal installs use npm's `latest` tag; later betas use `@beta`. This updates Pipa, not OpenCode. Before upgrading, stop Pipa and back up its profile. Keep your current OpenCode version initially. Do not rerun `pipa init` or start a second listener. Read the [beta release notes](https://github.com/lunchpaillola/pipa/blob/main/docs/beta-release.md) for limits and rollback steps.
@@ -100,6 +100,10 @@ pipa start
 Keep `pipa start` running. Invite Pipa to an allowed channel and mention it. Replies in that thread continue the same session without another mention. Different threads work independently.
 
 On OpenCode v2, replies steer ongoing work, and background results can return to the thread. V1 interrupts the current turn when a new message arrives. Replies missed during a disconnect or restart are not recovered. After restart, send another message in the thread to resume background forwarding. Failed Slack deliveries are not replayed.
+
+When you reply inside an existing Slack thread, Pipa reads preceding messages directly from Slack using its bot token, then sends that discussion plus your current request to OpenCode. No Composio connection is needed. New top-level mentions do not fetch history. Reads are bounded to ten pages, 24 KiB of retained context, and 15 seconds; Pipa reports incomplete or unavailable history. Old messages are quoted context, not fresh permission to act. Historical file contents and linked pages are not automatically downloaded. Repeated snapshots may overlap with the native conversation's existing history.
+
+On v2, Pipa checks the saved conversation's working location before sending a new request. If that folder disappeared and no running or queued work is visible, it can move the same conversation back to the configured starting folder. It confirms the move and tells the Slack thread before continuing. It does not restore missing files, clear work, change models, or automatically resubmit a prompt. Unconfirmed or unsafe recovery stops the current request. Native state reads do not lock other clients. Startup, stop, and restart behavior are unchanged.
 
 Startup waits for OpenCode and Slack to be ready, with no default overall timeout. Ctrl+C stops startup and processes Pipa owns, not attached servers. See [OpenCode compatibility](docs/opencode-compatibility.md) for startup, session, and upgrade details.
 
