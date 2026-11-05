@@ -5,7 +5,7 @@ import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { canonicalWorkingDirectory, createManifest, createModelSetting, createSessionStore, loadConfig, pipaPaths, saveConfig, slackCommandNames } from "./state.mjs";
 import { createModelPicker } from "./models.mjs";
-import { formQuestion, textFormAnswer } from "./slack-forms.mjs";
+import { formQuestion, textAnswer } from "./slack-forms.mjs";
 import { safeError } from "./errors.mjs";
 import { checkOpenCodeConnection, createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, parseOpenCodeVersion, PipaRestartingError, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
 import { assertRoutineDestinationAllowed, createRoutineScheduler, loadRoutineState } from "./routines.mjs";
@@ -85,11 +85,10 @@ export async function startPipa(options = {}) {
   }
   const runner = createConversationRunner({ sessionStore, abortTurn: executor.abortTurn,
     interruptPrevious: () => !executor.capabilities?.backgroundResponses, runTurn: async (input) => {
-    const { preparePrompt, ...turn } = input;
-    const prompt = preparePrompt ? await preparePrompt(input.signal) : input.prompt;
-    const currentConfig = await withTimeout(loadCurrentConfig(), undefined, "", input.signal);
+    const { prepareTurn, ...turn } = input;
+    const prepared = await prepareTurn(input.signal);
     input.signal.throwIfAborted();
-    return executor.runTurn({ ...turn, prompt, defaultModel: currentConfig.defaultModel });
+    return executor.runTurn({ ...turn, ...prepared });
   } });
   let accepting = true;
   const interactions = createPendingInteractions(config.allowedSlackUserIds);
@@ -236,6 +235,7 @@ export async function startPipa(options = {}) {
       const current = await withTimeout(loadCurrentConfig(), undefined, "", signal);
       if (!isAuthorized(thread, message, current) || shouldIgnore(thread, message, current)
         || (current.mentionOnly && !subscribe && !message.isMention)) throw new Error("Slack destination or requester is no longer allowed.");
+      return current;
     };
     if (subscribe) await thread.subscribe();
     if (attachments.some(({ size }) => size !== undefined && (!Number.isSafeInteger(size) || size < 0 || size > MAX_ATTACHMENT_BYTES))) {
@@ -251,20 +251,23 @@ export async function startPipa(options = {}) {
     try {
       const interactionContext = { thread };
       const result = await runner.enqueue(thread.id, {
-        prompt,
-        ...(existingThread ? { preparePrompt: async (signal) => {
+        prepareTurn: async (signal) => {
+          if (!existingThread) {
+            const current = await withTimeout(loadCurrentConfig(), undefined, "", signal);
+            return { prompt, defaultModel: current.defaultModel };
+          }
           await authorize(signal);
           const history = await loadSlackThreadContext({ channelId: thread.id.split(":")[1], threadTs, currentTs,
             token: config.slackBotToken, fetchImpl: options.slackFetch ?? fetch, signal });
-          await authorize(signal);
-          return `${history}\n\nCurrent request:\n${prompt}`;
-        } } : {}),
+          const current = await authorize(signal);
+          return { prompt: `${history}\n\nCurrent request:\n${prompt}`, defaultModel: current.defaultModel };
+        },
         attachments,
         workingDirectory: config.workingDirectory,
         contextEnvironment: slackContext(thread, message),
         onSession: () => undefined,
-        onLocationRecovered: async () => {
-          await authorize();
+        beforeLocationRetry: async (_metadata, signal) => {
+          await authorize(signal);
           void Promise.resolve().then(() => thread.post("The old working folder is no longer available.")).catch(() => undefined);
         },
         onInteraction: (interaction) => interactions.onInteraction(interactionContext, interaction),
@@ -608,17 +611,15 @@ export function createPendingInteractions(allowedUserIds = []) {
     if (question.unsupported || question.completed || question.url || !(question.custom || question.numbered || !question.options?.length)) return;
     const answer = question.required === undefined ? event.values?.answer?.trim() : event.values?.answer ?? "";
     if (!answer && question.required !== false) return { action: "errors", errors: { answer: "Enter an answer." } };
-    // Custom answers intentionally replace selections rather than combine with them.
-    if (entry.type === "form") {
-      try { entry.formAnswer[question.field.key] = textFormAnswer(question, answer); }
-      catch (error) { return { action: "errors", errors: { answer: error.message } }; }
-    }
-    if (question.numbered && entry.type === "question") {
-      try {
-        const value = textFormAnswer({ ...question, field: { type: question.multiple ? "multiselect" : "string" } }, answer);
-        entry.answers[entry.questionIndex] = (question.multiple ? value : [value]).map(value => question.options.find(option => (typeof option === "string" ? option : option.value ?? option.label) === value) ?? value);
-      } catch (error) { return { action: "errors", errors: { answer: error.message } }; }
-    } else entry.answers[entry.questionIndex] = [answer];
+    try {
+      const value = textAnswer(question, answer);
+      if (entry.type === "form") entry.formAnswer[question.field.key] = value;
+      else {
+        const values = question.multiple ? value : [value];
+        entry.answers[entry.questionIndex] = question.numbered
+          ? values.map(value => question.options.find(option => (typeof option === "string" ? option : option.value ?? option.label) === value) ?? value) : values;
+      }
+    } catch (error) { return { action: "errors", errors: { answer: error.message } }; }
     await advance(entry, event.user);
   }
 
@@ -881,10 +882,8 @@ export function createConversationRunner({ sessionStore, runTurn, abortTurn = as
     latest.set(conversationKey, turn);
     unsettled.add(turn);
     turn.done = execute(conversationKey, turn, previous, input, reason);
-    void turn.done.then(
-      () => { unsettled.delete(turn); if (latest.get(conversationKey) === turn) latest.delete(conversationKey); },
-      () => { unsettled.delete(turn); if (latest.get(conversationKey) === turn) latest.delete(conversationKey); },
-    );
+    const settled = () => { unsettled.delete(turn); if (latest.get(conversationKey) === turn) latest.delete(conversationKey); };
+    void turn.done.then(settled, settled);
     return turn.done;
   }
 

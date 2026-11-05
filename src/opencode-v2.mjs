@@ -90,13 +90,6 @@ export function createV2Adapter(options) {
     const key = `${kind}:${request.sessionID}:${request.id}`;
     if (!observer.onInteraction || observer.interactions.has(key) || !await belongs(observer, request.sessionID)) return;
     if (observer.interactions.has(key) || signal.aborted || revision !== observer.interactionRevision) return;
-    const fields = request.fields;
-    const question = kind === "form" && Array.isArray(fields) && fields.length
-      && fields.every((field) => field && typeof field.key === "string" && ["string", "multiselect"].includes(field.type)
-        && !field.hidden && (field.when === undefined || Array.isArray(field.when) && !field.when.length) && !Object.hasOwn(field, "default")
-        && (field.type !== "multiselect" || Array.isArray(field.options)) && Array.isArray(field.options ?? [])
-        && (field.options ?? []).every(option => option && typeof option.label === "string" && typeof option.value === "string"));
-    const type = kind === "permission" ? "permission" : question ? "question" : "form";
     let tool;
     if (kind === "permission" && request.source?.type === "tool") {
       try {
@@ -106,12 +99,7 @@ export function createV2Adapter(options) {
       } catch (error) { if (error._tag !== "MessageNotFoundError") throw error; }
     }
     if (observer.interactions.has(key) || signal.aborted || revision !== observer.interactionRevision) return;
-    const normalized = question ? { ...request, questions: fields.map((field) => ({
-      header: field.title || request.title, question: field.description || field.title || request.title,
-      multiple: field.type === "multiselect", custom: field.custom ?? !field.options?.length,
-      required: field.required ?? false,
-      options: field.options,
-    })) } : tool ? { ...request, tool } : request;
+    const normalized = tool ? { ...request, tool } : request;
     const entry = { kind, request, settled: Promise.withResolvers() };
     observer.interactions.set(key, entry);
     const submitDecision = async (decision) => {
@@ -131,15 +119,6 @@ export function createV2Adapter(options) {
             await client.session.form.cancel(native, { signal });
           } else if (decision?.type === "answer" && decision.answer && typeof decision.answer === "object" && !Array.isArray(decision.answer)) {
             await client.session.form.reply({ ...native, answer: decision.answer }, { signal });
-          } else if (question && decision?.type === "answer") {
-            if (!Array.isArray(decision.answers) || decision.answers.length !== fields.length) throw new Error("Invalid OpenCode question answers.");
-            const answer = Object.fromEntries(fields.flatMap((field, index) => {
-              const values = decision.answers[index];
-              if (values === null && !field.required) return [];
-              if (!Array.isArray(values) || !values.every((value) => typeof value === "string") || (field.type === "string" && values.length !== 1)) throw new Error("Invalid OpenCode question answer.");
-              return [[field.key, field.type === "multiselect" ? values : values[0]]];
-            }));
-            await client.session.form.reply({ ...native, answer }, { signal });
           } else throw new Error("Invalid OpenCode form answer.");
         } catch (error) {
           signal.throwIfAborted();
@@ -167,7 +146,7 @@ export function createV2Adapter(options) {
     };
     const handler = Promise.resolve().then(() => {
       signal.throwIfAborted();
-      return observer.onInteraction({ type, request: normalized, sessionId: request.sessionID, signal, submit, settled: entry.settled.promise });
+      return observer.onInteraction({ type: kind, request: normalized, sessionId: request.sessionID, signal, submit, settled: entry.settled.promise });
     })
       .then(async (decision) => {
         if (!entry.accepted && !entry.external && !signal.aborted && !["cancelled", "stopped"].includes(decision?.type)) await submit(decision);
@@ -442,7 +421,7 @@ export function createV2Adapter(options) {
             if (!session || typeof session.location?.directory !== "string" || !session.location.directory) throw new Error("OpenCode session location is unavailable.");
             if (session.location.directory === error.location.directory) await delay(options.pollIntervalMs ?? 100, undefined, { signal });
           } while (session.location.directory === error.location.directory);
-          await input.onLocationRecovered?.({ previousDirectory: error.location.directory, directory: session.location.directory });
+          await input.beforeLocationRetry?.({ previousDirectory: error.location.directory, directory: session.location.directory }, signal);
           signal.throwIfAborted();
           // This typed prompt rejection precedes admission; transport-uncertain requests are never replayed.
           await client.session.prompt(prompt, { signal });

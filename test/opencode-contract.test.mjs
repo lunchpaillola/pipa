@@ -314,7 +314,8 @@ for (const notice of ["delivered", "failed", "revoked", "shutdown", "aborted onS
     defaultModel: { providerID: "different", modelID: "not-selected" },
     attachments: [{ name: "notes.txt", mimeType: "text/plain", fetchData: async () => bytes }],
     onSession: async (id) => { assert.equal(id, input.sessionId); order.push("onSession"); if (notice === "aborted onSession") controller.abort(error); },
-    onLocationRecovered: async (metadata) => {
+    beforeLocationRetry: async (metadata, signal) => {
+      assert.ok(signal instanceof AbortSignal);
       assert.deepEqual(metadata, { previousDirectory: old, directory: runtime.workspace });
       assert.ok(order.indexOf("confirmed") > order.indexOf("move"));
       assert.equal(order.filter(step => step === "prompt").length, 1, "Only the rejected request preceded recovery");
@@ -361,41 +362,6 @@ for (const notice of ["delivered", "failed", "revoked", "shutdown", "aborted onS
   assert.equal(result.text, "Done.");
   assert.equal(result.files[0].data.toString(), "contained output");
   assert.equal(result.text.includes(artifactDirectory), false);
-});
-
-test("aborting a pending recovery notice releases the executor without admitting a prompt", async (t) => {
-  const old = "/native/deleted-checkout";
-  let directory = old;
-  const controller = new AbortController();
-  const entered = Promise.withResolvers();
-  const release = Promise.withResolvers();
-  const current = await fixture(t, "v2", { transport: async (url, init, next) => {
-    const parsed = new URL(url);
-    if (parsed.pathname.endsWith("/prompt") && directory === old) return Response.json({ _tag: "LocationNotFoundError", location: { directory: old }, message: "Missing" }, { status: 404 });
-    if (parsed.pathname === "/api/session/ses_contract") {
-      const body = await (await next(url, init)).json();
-      body.data.location = { directory };
-      body.data.model = { providerID: "fixture", id: "retained" };
-      return Response.json(body);
-    }
-    if (parsed.pathname.endsWith("/move")) {
-      directory = JSON.parse(init.body).directory;
-      return new Response(null, { status: 204 });
-    }
-    return next(url, init);
-  } });
-  const error = new Error("Cancelled while posting recovery notice");
-  const run = current.executor.runTurn({ ...current.input, signal: controller.signal,
-    onLocationRecovered: async () => { entered.resolve(); await release.promise; } });
-  try {
-    await entered.promise;
-    controller.abort(error);
-    await assert.rejects(bounded(run, { timeoutMs: 1000, label: "aborted recovery notice" }), (failure) => failure === error);
-    assert.equal(current.wire.calls.some((call) => call.path.endsWith("/prompt")), false);
-  } finally {
-    release.resolve();
-    await run.catch(() => undefined);
-  }
 });
 
 test("v1 baseline: exact prompt, trusted context and persisted-session continuation", async (t) => {
@@ -880,11 +846,11 @@ test("v2 native questions and child permissions expose acceptance without duplic
   await runTurnContract({ executor, input: { ...input, onInteraction: async (interaction) => {
     seen.push([interaction.type, interaction.sessionId]);
     assert.equal(typeof interaction.submit, "function");
-    const decision = interaction.type === "question" ? { type: "answer", answers: [["Blue"]] } : { type: "reply", reply: "once" };
+    const decision = interaction.type === "form" ? { type: "answer", answer: { q0: "Blue" } } : { type: "reply", reply: "once" };
     await interaction.submit(decision);
     return decision;
   } }, expected: document.expected });
-  assert.deepEqual(seen.sort(), [["permission", "ses_child"], ["question", "ses_contract"]]);
+  assert.deepEqual(seen.sort(), [["form", "ses_contract"], ["permission", "ses_child"]]);
   assert.equal(replies.length, 2);
   wire.assertComplete();
 });
@@ -1201,11 +1167,11 @@ test("U3 v2 lost keyed-form reply reads native answered state before making the 
   let reconciled = false;
   const result = await current.executor.runTurn({ ...current.input, onInteraction: async (interaction) => {
     try {
-      await interaction.submit({ type: "answer", answers: [["Blue"], ["Fast"], ["name"]] });
+      await interaction.submit({ type: "answer", answer: { q0: "Blue", q1: ["Fast"], q2: "name" } });
       await interaction.settled;
-      await assert.rejects(interaction.submit({ type: "answer", answers: [["Red"], ["Small"], ["other"]] }), /settled/u);
+      await assert.rejects(interaction.submit({ type: "answer", answer: { q0: "Red", q1: ["Small"], q2: "other" } }), /settled/u);
       reconciled = true;
-      return { type: "answer", answers: [["Blue"], ["Fast"], ["name"]] };
+      return { type: "answer", answer: { q0: "Blue", q1: ["Fast"], q2: "name" } };
     } finally { done.resolve(); }
   } });
   assertTurnOutcome(result, current.document.expected);
@@ -1248,7 +1214,7 @@ test("U3 v2 reconnect duplicates produce one callback and reload cancellation ma
   const completed = messages.responses.at(-1);
   messages.responses[messages.responses.length - 1] = { json: { data: [completed.json.data[0]], cursor: { previous: null, next: null } } };
   const seen = [];
-  const turn = current.executor.runTurn({ ...current.input, onInteraction: async (interaction) => { seen.push(interaction); await interaction.settled; return { type: "answer", answers: [["Blue"], ["Fast"], ["name"]] }; } });
+  const turn = current.executor.runTurn({ ...current.input, onInteraction: async (interaction) => { seen.push(interaction); await interaction.settled; return { type: "answer", answer: { q0: "Blue", q1: ["Fast"], q2: "name" } }; } });
   await waitFor(() => seen.length === 1);
   frames.close();
   await waitFor(() => streams === 2);

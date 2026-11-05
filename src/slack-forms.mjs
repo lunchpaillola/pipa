@@ -47,11 +47,11 @@ export function formQuestion(entry) {
   return { header: entry.request.title || "OpenCode form", question: "Ready to submit using the defaults for omitted fields.", completed: true, answer: { ...effective } };
 }
 
-export function textFormAnswer(question, text) {
-  const field = question.field;
-  if (["number", "integer"].includes(field.type)) {
+export function textAnswer(question, text) {
+  const type = question.field?.type;
+  if (["number", "integer"].includes(type)) {
     const value = text.trim() === "" ? NaN : Number(text);
-    if (!Number.isFinite(value) || field.type === "integer" && !Number.isInteger(value)) throw new Error(field.type === "integer" ? "Enter a whole number." : "Enter a finite number.");
+    if (!Number.isFinite(value) || type === "integer" && !Number.isInteger(value)) throw new Error(type === "integer" ? "Enter a whole number." : "Enter a finite number.");
     return value;
   }
   if (question.numbered) {

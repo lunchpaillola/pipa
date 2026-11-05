@@ -9,6 +9,12 @@ import { SocketModeClient } from "@slack/socket-mode";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { Chat } from "chat";
 import { checkSlackAppToken, checkSlackToken, createConversationRunner, createPendingInteractions, createPipaSlackAdapter, initializePipa, postResult, slackDestinationId, startPipa as startPipaRuntime } from "../src/app.mjs";
+import { PipaRestartingError, PipaStoppedError, startSocketOpenCodeServer } from "../src/opencode.mjs";
+import { createRuntimeFixture } from "./helpers/runtime-fixture.mjs";
+import { createRoutineScheduler, normalizeRoutine } from "../src/routines.mjs";
+import { createSessionStore, pipaPaths, writePrivateJson } from "../src/state.mjs";
+
+const startPipa = (options) => startPipaRuntime({ routinesEnabled: false, ...(options.config && !options.paths ? { loadCurrentConfig: async () => options.config } : {}), ...options });
 
 function slackForm(t, fields, submit = async () => {}, context = {}, interaction = {}) {
   const controls = createPendingInteractions(["U1"]);
@@ -329,13 +335,6 @@ test("Slack form callbacks retain responder, thread, revocation and external-set
   await f.click("dismiss", { user: { userId: "U2" } });
   assert.deepEqual(f.decisions, []);
 });
-import { PipaRestartingError, PipaStoppedError, startSocketOpenCodeServer } from "../src/opencode.mjs";
-import { createRuntimeFixture } from "./helpers/runtime-fixture.mjs";
-import { createRoutineScheduler, normalizeRoutine } from "../src/routines.mjs";
-import { createSessionStore, pipaPaths, writePrivateJson } from "../src/state.mjs";
-
-const startPipa = (options) => startPipaRuntime({ routinesEnabled: false, ...(options.config && !options.paths ? { loadCurrentConfig: async () => options.config } : {}), ...options });
-
 test("Slack thread context paginates prior discussion and preserves the current request once", async (t) => {
   const calls = [];
   const reads = [];
@@ -393,7 +392,7 @@ test("Slack thread context paginates prior discussion and preserves the current 
   assert.doesNotMatch(input.prompt, /CURRENT MUST NOT REPEAT|future message|never-download|xoxb-/u);
   assert.deepEqual(input.attachments, [attachment]);
   assert.equal(input.sessionId, "ses_existing");
-  assert.equal(Object.hasOwn(input, "preparePrompt"), false);
+  assert.equal(Object.hasOwn(input, "prepareTurn"), false);
   assert.deepEqual(posts, [{ markdown: "done" }]);
 });
 
@@ -427,7 +426,7 @@ async function threadContextApp(t, options = {}) {
 test("folder recovery posts a short best-effort heads-up without exposing paths", async (t) => {
   let continued = false;
   const fixture = await threadContextApp(t, { runTurn: async (input) => {
-    await input.onLocationRecovered({ previousDirectory: "/private/missing-project", directory: "/private/start" });
+    await input.beforeLocationRetry({ previousDirectory: "/private/missing-project", directory: "/private/start" }, input.signal);
     continued = true;
     return { text: "done", sessionId: "ses_existing" };
   } });
@@ -446,7 +445,7 @@ for (const failure of ["post failed", "never settles"]) test(`folder recovery co
     if (failure === "post failed") throw new Error("Notice failed");
     return new Promise(() => {});
   }, runTurn: async (input) => {
-    await input.onLocationRecovered({ previousDirectory: "/old", directory: "/start" });
+    await input.beforeLocationRetry({ previousDirectory: "/old", directory: "/start" }, input.signal);
     continued = true;
     return { text: "done", sessionId: "ses_existing" };
   } });
@@ -462,7 +461,7 @@ for (const failure of ["authorization revoked", "stopped"]) test(`folder recover
   const fixture = await threadContextApp(t, { runTurn: async input => {
     if (failure === "authorization revoked") fixture.config.allowedSlackUserIds = ["U2"];
     else fixture.app.stop();
-    await input.onLocationRecovered({ previousDirectory: "/old", directory: "/start" });
+    await input.beforeLocationRetry({ previousDirectory: "/old", directory: "/start" }, input.signal);
     continued = true;
     return { text: "must not deliver", sessionId: "ses_existing" };
   } });
@@ -470,6 +469,32 @@ for (const failure of ["authorization revoked", "stopped"]) test(`folder recover
   await waitFor(() => fixture.finished.length === 1);
   assert.equal(continued, false);
   assert.equal(fixture.posts.some(payload => payload?.markdown === "must not deliver"), false);
+});
+
+test("shutdown cancels pending folder-retry authorization without posting a late notice", async t => {
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let recovering = false;
+  const fixture = await threadContextApp(t, { loadCurrentConfig: async () => {
+    if (recovering) { entered.resolve(); await release.promise; }
+    return {};
+  }, runTurn: async input => {
+    recovering = true;
+    await input.beforeLocationRetry({ previousDirectory: "/old", directory: "/start" }, input.signal);
+    return { text: "must not deliver", sessionId: "ses_existing" };
+  } });
+  fixture.send();
+  await entered.promise;
+  let timeout;
+  try {
+    await Promise.race([fixture.app.shutdown(), new Promise((_, reject) => {
+      timeout = setTimeout(() => reject(new Error("Shutdown waited for recovery authorization")), 500);
+    })]);
+    release.resolve();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(fixture.posts, []);
+    assert.equal(fixture.finished.length, 1);
+  } finally { clearTimeout(timeout); release.resolve(); }
 });
 
 test("Slack thread context skips top-level events even when Chat assigns a thread ID", async (t) => {
@@ -523,8 +548,7 @@ for (const failure of ["missing scope", "rate limited", "transport", "invalid JS
 
 test("Slack thread context retains collected history when a later page fails", async (t) => {
   let pages = 0;
-  const fixture = await threadContextApp(t, { post: async () => { throw new Error("Slack notice delivery failed"); },
-    slackFetch: async () => ++pages === 1 ? Response.json({ ok: true, messages: [{ ts: "1.000001", user: "U2", text: "collected root" }], response_metadata: { next_cursor: "next" } }) : new Response("", { status: 429 }) });
+  const fixture = await threadContextApp(t, { slackFetch: async () => ++pages === 1 ? Response.json({ ok: true, messages: [{ ts: "1.000001", user: "U2", text: "collected root" }], response_metadata: { next_cursor: "next" } }) : new Response("", { status: 429 }) });
   fixture.send();
   await waitFor(() => fixture.calls.length === 1);
   assert.equal(pages, 2);
@@ -562,33 +586,22 @@ test("Slack thread context counts Unicode and metadata bytes while retaining roo
 });
 
 test("Slack thread context uses one overall fifteen-second deadline and no retry", async (t) => {
+  mockHistoryDeadline(t);
   const entered = Promise.withResolvers();
-  const started = Date.now();
   const fixture = await threadContextApp(t, { slackFetch: async (_url, { signal }) => {
     entered.resolve();
     await new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
   } });
   fixture.send();
   await entered.promise;
-  await new Promise((resolve) => setTimeout(resolve, 15_100));
-  await waitFor(() => fixture.calls.length === 1);
-  assert.ok(Date.now() - started < 17_000);
+  t.mock.timers.tick(14_999);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fixture.calls.length, 0);
+  t.mock.timers.tick(1);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fixture.calls.length, 1);
   assert.match(fixture.calls[0].prompt, /unavailable \(time limit\)/u);
   assert.equal(fixture.reads.length, 1);
-});
-
-test("Slack thread context chooses the latest default model after preparing history", async (t) => {
-  const entered = Promise.withResolvers();
-  const release = Promise.withResolvers();
-  const fixture = await threadContextApp(t, { config: { defaultModel: { providerID: "test", modelID: "old" } },
-    loadCurrentConfig: async () => ({ ...fixture.config }),
-    slackFetch: async () => { entered.resolve(); await release.promise; return Response.json({ ok: true, messages: [] }); } });
-  fixture.send();
-  await entered.promise;
-  fixture.config.defaultModel = { providerID: "test", modelID: "new" };
-  release.resolve();
-  await waitFor(() => fixture.finished.length === 1);
-  assert.deepEqual(fixture.calls[0].defaultModel, fixture.config.defaultModel);
 });
 
 test("Slack thread failure delivery respects a newly enabled mention-only gate", async (t) => {
@@ -662,15 +675,14 @@ test("Slack thread context multipage deadline includes a slow first page and sta
   assert.match(fixture.calls[0].prompt, /collected before deadline/u);
 });
 
-for (const phase of ["before history", "after history", "before admission"]) test(`Slack thread authorization cancellation settles a stalled config read ${phase}`, async (t) => {
+for (const phase of ["before history", "after history"]) test(`Slack thread authorization cancellation settles a stalled config read ${phase}`, async (t) => {
   const stalled = Promise.withResolvers();
-  let configReads = 0;
-  const stalledRead = { "before history": 1, "after history": 2, "before admission": 3 }[phase];
+  let historyRead = false;
   const fixture = await threadContextApp(t, { background: true, loadCurrentConfig: async () => {
-    if (++configReads < stalledRead) return {};
+    if ((phase === "after history") !== historyRead) return {};
     stalled.resolve();
     return new Promise(() => undefined);
-  } });
+  }, slackFetch: async () => { historyRead = true; return Response.json({ ok: true, messages: [] }); } });
   fixture.send();
   await stalled.promise;
   let timeout;
@@ -680,7 +692,6 @@ for (const phase of ["before history", "after history", "before admission"]) tes
     })]);
     assert.equal(fixture.calls.length, 0);
     assert.deepEqual(fixture.posts, []);
-    assert.equal(configReads, stalledRead);
   } finally {
     clearTimeout(timeout);
   }
@@ -738,16 +749,15 @@ for (const reason of [new PipaStoppedError(), new PipaRestartingError()]) test(`
   assert.deepEqual(fixture.posts, []);
 });
 
-for (const phase of ["before history", "after history", "before admission"]) test(`Slack thread config waits without an arbitrary deadline ${phase}`, async (t) => {
+for (const phase of ["before history", "after history"]) test(`Slack thread config waits without an arbitrary deadline ${phase}`, async (t) => {
   mockHistoryDeadline(t);
   const entered = Promise.withResolvers();
   const release = Promise.withResolvers();
-  let reads = 0;
-  const stalledRead = { "before history": 1, "after history": 2, "before admission": 3 }[phase];
+  let historyRead = false;
   const fixture = await threadContextApp(t, { loadCurrentConfig: async () => {
-    if (++reads === stalledRead) { entered.resolve(); await release.promise; }
+    if ((phase === "after history") === historyRead) { entered.resolve(); await release.promise; }
     return { botName: "Pipa", workingDirectory: "/work" };
-  } });
+  }, slackFetch: async () => { historyRead = true; return Response.json({ ok: true, messages: [] }); } });
   fixture.send();
   await entered.promise;
   try {
@@ -760,7 +770,6 @@ for (const phase of ["before history", "after history", "before admission"]) tes
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(fixture.finished.length, 1);
     assert.equal(fixture.calls.length, 1);
-    assert.ok(reads <= 4, "Only preparation, model selection and delivery need config reads");
     assert.deepEqual(fixture.posts, [{ markdown: "done" }]);
   } finally {
     release.resolve();

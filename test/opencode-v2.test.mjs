@@ -124,7 +124,7 @@ test("a rejected missing-location prompt waits for the native move and retries o
   } });
   const prepared = await f.adapter.resolveSession("ses_one", target, new AbortController());
   assert.deepEqual(prepared, { sessionId: "ses_one", defaultEligible: false });
-  await f.adapter.execute(f.input("ses_one", { ...prepared, workingDirectory: target, onResponse: async () => {}, onLocationRecovered: async metadata => notices.push(metadata) }));
+  await f.adapter.execute(f.input("ses_one", { ...prepared, workingDirectory: target, onResponse: async () => {}, beforeLocationRetry: async metadata => notices.push(metadata) }));
   assert.deepEqual(notices, [{ previousDirectory: old, directory: target }]);
   assert.equal(f.requests.filter((r) => r.path.endsWith("/move")).length, 1);
   const prompts = f.requests.filter((r) => r.path.endsWith("/prompt"));
@@ -511,7 +511,7 @@ test("stable context migration is one-time, scoped, and never deletes pipa.slack
   assert.equal(f.requests.filter((r) => r.method === "DELETE").length, 1);
 });
 
-test("questions preserve options, multiselect and custom answers after admission", async (t) => {
+test("native forms preserve fields and keyed answers after admission", async (t) => {
   const f = await fixture(t);
   const interactions = [];
   await f.adapter.execute(f.input("ses_one", { onResponse: async () => {}, onInteraction: async (interaction) => {
@@ -525,11 +525,9 @@ test("questions preserve options, multiselect and custom answers after admission
   f.forms.push(form);
   f.globalEvent("form.created", { form });
   await until(() => interactions.length === 1);
-  assert.equal(interactions[0].type, "question");
-  assert.equal(interactions[0].request.questions[1].multiple, true);
-  assert.equal(interactions[0].request.questions[1].custom, true);
-  assert.equal(interactions[0].request.questions[0].options[0].value, "blue_value");
-  await interactions[0].submit({ type: "answer", answers: [["blue_value"], ["red_value", "custom text"]] });
+  assert.equal(interactions[0].type, "form");
+  assert.deepEqual(interactions[0].request, form);
+  await interactions[0].submit({ type: "answer", answer: { q0: "blue_value", q1: ["red_value", "custom text"] } });
   assert.deepEqual(f.requests.find((r) => r.path.endsWith("/frm_choices/reply")).body, { answer: { q0: "blue_value", q1: ["red_value", "custom text"] } });
 });
 
@@ -601,9 +599,34 @@ test("simple forms use field shapes rather than a closed list of metadata kinds 
     ] });
     await f.adapter.followSession(f.input("ses_one", { onInteraction: async (interaction) => { interactions.push(interaction); return { type: "cancelled" }; } }));
     await until(() => interactions.length === 1);
-    assert.equal(interactions[0].type, "question");
-    await interactions[0].submit({ type: "answer", answers: [["Pipa"], ["blue"]] });
+    assert.equal(interactions[0].type, "form");
+    await interactions[0].submit({ type: "answer", answer: { project: "Pipa", colors: ["blue"] } });
     assert.deepEqual(f.requests.find((request) => request.path.endsWith("/frm_plugin/reply")).body, { answer: { project: "Pipa", colors: ["blue"] } });
+  }
+});
+
+test("simple native forms with duplicate or empty keys stay dismissible without collecting answers", async (t) => {
+  for (const key of ["name", ""]) {
+    const f = await fixture(t);
+    const controls = createPendingInteractions(["U1"]);
+    t.after(() => controls.close());
+    const posted = [];
+    const thread = { id: "slack:C1:1.0", adapter: { webClient: { chat: {
+      postMessage: async message => { posted.push(message); return { ts: "2.0" }; },
+      update: async () => {}, delete: async () => {},
+    } } } };
+    f.forms.push({ id: "frm_malformed", sessionID: "ses_one", title: "Project", fields: [
+      { key: "name", type: "string", required: true }, { key, type: "string", required: true },
+    ] });
+    await f.adapter.followSession(f.input("ses_one", { onInteraction: interaction => controls.onInteraction({ thread }, interaction) }));
+    await until(() => posted.length === 1);
+    assert.match(JSON.stringify(posted[0]), /unsupported or malformed/u);
+    const actions = posted[0].blocks.flatMap(block => block.elements ?? []);
+    assert.equal(actions.length, 1);
+    const dismiss = actions[0];
+    await controls.onAction({ actionId: dismiss.action_id, value: dismiss.value, threadId: thread.id, user: { userId: "U1" } });
+    assert.ok(f.requests.some(request => request.method === "DELETE" && request.path.endsWith("/frm_malformed")));
+    assert.equal(f.requests.some(request => request.path.endsWith("/frm_malformed/reply")), false);
   }
 });
 
@@ -647,14 +670,9 @@ test("Slack preserves duplicate-label choices, custom text, empty answers and op
     await until(() => updated.length === 1);
     const expected = mode === "skip" ? {} : { answer: mode === "choice" ? "account-b" : mode === "custom" ? "Default" : mode === "empty" ? "" : [] };
     assert.deepEqual(f.requests.find(request => request.path.endsWith("/frm_answers/reply"))?.body, { answer: expected });
-    if (mode === "choice") {
-      assert.match(JSON.stringify(updated[0]), /Default/u);
-      assert.doesNotMatch(JSON.stringify(updated[0]), /account-b/u);
-    }
-    if (["empty", "skip", "empty-multiselect"].includes(mode)) {
-      assert.equal(updated[0].text, "Optional answers left blank.");
-      assert.equal(updated[0].blocks[1].text.text, "Optional answers left blank.");
-    }
+    assert.equal(updated[0].text, "Form submitted.");
+    assert.equal(updated[0].blocks[1].text.text, "Form submitted.");
+    assert.doesNotMatch(JSON.stringify(updated[0]), /account-b/u);
     });
   }
 });
@@ -674,10 +692,10 @@ test("native form validation rejection allows correcting the same pending form",
   await f.adapter.followSession(f.input("ses_one", { onInteraction: async (interaction) => { interactions.push(interaction); return { type: "cancelled" }; } }));
   await until(() => interactions.length === 1);
   const interaction = interactions[0];
-  assert.equal(interaction.type, "question");
-  await assert.rejects(interaction.submit({ type: "answer", answers: [["not an email"]] }), { _tag: "FormInvalidAnswerError" });
+  assert.equal(interaction.type, "form");
+  await assert.rejects(interaction.submit({ type: "answer", answer: { email: "not an email" } }), { _tag: "FormInvalidAnswerError" });
   assert.equal(f.forms.length, 1, "native rejection must leave the form pending");
-  await interaction.submit({ type: "answer", answers: [["person@example.com"]] });
+  await interaction.submit({ type: "answer", answer: { email: "person@example.com" } });
   assert.equal(attempts, 2);
   assert.deepEqual(f.requests.filter((request) => request.path.endsWith("/frm_validated/reply")).map((request) => request.body), [
     { answer: { email: "not an email" } }, { answer: { email: "person@example.com" } },
@@ -904,7 +922,7 @@ test("failed descendant kinds stay editable while successful root and sibling ki
   assert.equal(snapshots.some((item) => item.sessionId === "ses_child"), false);
   fail = false;
   await interactions.find((item) => item.request.id === "per_ses_child").submit({ type: "reply", reply: "once" });
-  await interactions.find((item) => item.request.id === "frm_ses_one").submit({ type: "answer", answers: [["yes"]] });
+  await interactions.find((item) => item.request.id === "frm_ses_one").submit({ type: "answer", answer: { answer: "yes" } });
   await assert.rejects(interactions.find((item) => item.request.id === "per_ses_one").submit({ type: "reply", reply: "once" }), /already settled/u);
 });
 

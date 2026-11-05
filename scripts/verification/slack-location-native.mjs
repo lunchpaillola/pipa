@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { mkdir, rmdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { OpenCode } from "@opencode/client";
 import { createOpenCodeExecutor } from "../../src/opencode.mjs";
 import { bounded, createRuntimeFixture } from "../../test/helpers/runtime-fixture.mjs";
 import { createProvider, providerConfig } from "./opencode-provider.mjs";
+import { startNativeServer } from "./native-server.mjs";
 
 const runtime = await createRuntimeFixture({ timeoutMs: 120_000, cleanupTimeoutMs: 10_000 });
 const report = { realNativeRecovery: true, liveSlack: false, cases: [] };
@@ -13,27 +13,19 @@ try {
   const provider = await createProvider(runtime);
   await writeFile(runtime.env.OPENCODE_CONFIG, JSON.stringify(providerConfig(provider.url)));
   const requests = [];
-  const headers = { authorization: `Basic ${Buffer.from("opencode:isolated-location").toString("base64")}` };
   let server, client;
   async function start() {
-  server = runtime.spawn("opencode", ["serve", "--hostname", "127.0.0.1", "--port", "0", "--log-level", "error"], {
-    env: { ...runtime.env, OPENCODE_PASSWORD: "isolated-location", OPENCODE_DISABLE_DEFAULT_PLUGINS: "1", OPENCODE_DISABLE_EXTERNAL_SKILLS: "1", OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "1", BUN_JSC_maxRegExpStackSize: "536870912" },
-  });
-  const baseUrl = await bounded(new Promise((resolve, reject) => {
-    let output = "";
-    server.child.stdout.on("data", chunk => { output += chunk; const match = output.match(/https?:\/\/(?:127\.0\.0\.1|localhost):\d+/u); if (match) resolve(match[0]); });
-    server.exited.then(() => reject(new Error("Native server exited during startup")), reject);
-  }), { timeoutMs: 30_000, signal: runtime.signal });
-  client = OpenCode.make({ baseUrl, headers });
-  const info = await client.server.info();
-  report.engine = info.version;
-  executor = createOpenCodeExecutor({ baseUrl, connection: { major: 2, version: info.version, headers }, environment: runtime.env, artifactRoot: runtime.artifactRoot,
-    fetch: async (url, init) => {
-      const response = await fetch(url, init);
-      requests.push({ path: new URL(url).pathname, method: init?.method ?? "GET", status: response.status, ...(init?.body ? { body: JSON.parse(init.body) } : {}) });
-      return response;
-    },
-  });
+    const native = await startNativeServer(runtime);
+    server = native.server;
+    client = native.client;
+    report.engine = native.version;
+    executor = createOpenCodeExecutor({ baseUrl: native.baseUrl, connection: { major: 2, version: native.version, headers: native.headers }, environment: runtime.env, artifactRoot: runtime.artifactRoot,
+      fetch: async (url, init) => {
+        const response = await fetch(url, init);
+        requests.push({ path: new URL(url).pathname, method: init?.method ?? "GET", status: response.status, ...(init?.body ? { body: JSON.parse(init.body) } : {}) });
+        return response;
+      },
+    });
   }
   await start();
   for (const mode of ["idle", "queued"]) {
@@ -54,7 +46,7 @@ try {
     await start();
     const responses = [], notices = [];
     const result = await executor.runTurn({ prompt: current, sessionId: session.id, workingDirectory: runtime.workspace, signal: runtime.signal,
-      onLocationRecovered: async metadata => notices.push(metadata), onResponse: async response => responses.push(response.text),
+      beforeLocationRetry: async metadata => notices.push(metadata), onResponse: async response => responses.push(response.text),
     });
     assert.deepEqual(result, { pending: true, sessionId: session.id });
     await runtime.waitFor(() => responses.includes(`DONE_${current}`), { timeoutMs: 30_000, label: "recovered current request completes" });
@@ -65,6 +57,7 @@ try {
     assert.equal(userTexts.filter(text => text === current).length, 1);
     if (mode === "queued") assert.equal(userTexts.filter(text => text === queued).length, 1);
     assert.equal(responses.filter(text => text === `DONE_${current}`).length, 1);
+    if (mode === "queued") assert.equal(responses.filter(text => text === `DONE_${queued}`).length, 1);
     const attempts = requests.filter(request => request.path.endsWith("/prompt") && request.body?.text === current);
     assert.equal(attempts.length, 2);
     assert.equal(attempts[0].status, 404);

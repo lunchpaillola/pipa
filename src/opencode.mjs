@@ -126,7 +126,7 @@ export function createOpenCodeExecutor(options = {}) {
       await adapter.ready?.(workingDirectory);
     })();
     await readiness;
-    await adapter.ready?.(workingDirectory);
+    if (stopReason) throw stopReason;
   }
 
   async function prepareArtifacts(sessionId, workingDirectory, persistent = false) {
@@ -182,7 +182,7 @@ export function createOpenCodeExecutor(options = {}) {
     }
   }
 
-  async function runTurn({ prompt, sessionId, model, defaultModel, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onLocationRecovered, onInteraction, onPermissionReplied, onPermissionsReconciled, onResponse, onError }) {
+  async function runTurn({ prompt, sessionId, model, defaultModel, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, beforeLocationRetry, onInteraction, onPermissionReplied, onPermissionsReconciled, onResponse, onError }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     if (stopReason) throw stopReason;
     const legacySession = options.connection?.major === 1 || capabilities?.backgroundResponses === false;
@@ -218,7 +218,7 @@ export function createOpenCodeExecutor(options = {}) {
 
         const text = await adapter.execute({ ...prepared, model: selectedModel, defaultModel: newThreadModel, workingDirectory, controller, prompt, files,
           instructions: turnInstructions(contextEnvironment, artifactDirectory),
-          onLocationRecovered: (metadata) => abortable(Promise.resolve(onLocationRecovered?.(metadata)), controller.signal),
+          beforeLocationRetry: (metadata, signal) => abortable(Promise.resolve(beforeLocationRetry?.(metadata, signal)), signal),
           onInteraction, onPermissionReplied, onPermissionsReconciled,
           ...(capabilities.backgroundResponses && onResponse ? {
             onResponse: async (text, messageId, followSignal) => onResponse(await response(text, selectedSessionId, artifactDirectory, slackTurn), followSignal),
@@ -571,7 +571,6 @@ function externalServer(baseUrl) {
   const wait = new Promise((resolve) => {
     resolveWait = resolve;
   });
-  void wait.catch(() => undefined);
   return {
     baseUrl,
     owned: false,

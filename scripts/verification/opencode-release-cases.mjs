@@ -455,6 +455,9 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
   cell.evidence.nonce = nonce;
   const promptFor = (id) => `MATRIX_${id}_${nonce}`;
   const textFor = (id) => `RESULT_${id}_${nonce}`;
+  const answerYes = (interaction) => interaction.type === "form"
+    ? { type: "answer", answer: { [interaction.request.fields[0].key]: "Yes" } }
+    : { type: "answer", answers: [["Yes"]] };
   const runCli = (...args) => command(runtime, process.execPath, [cli, ...args]);
   const stopProfile = async (home, urls, pids) => {
     const lockFile = state.pipaPaths(home).lock;
@@ -790,9 +793,9 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
         selected = interaction;
         calls.push(interaction.request);
         // Submission acknowledgement is the additive production seam from KTD5.
-        if (typeof interaction.submit !== "function") return { type: "answer", answers: [["Yes"]] };
-        await assert.rejects(interaction.submit({ type: "answer", answers: [[]] }));
-        return { type: "answer", answers: [["Yes"]] };
+        if (typeof interaction.submit !== "function") return answerYes(interaction);
+        await assert.rejects(interaction.submit(interaction.type === "form" ? { type: "answer", answer: {} } : { type: "answer", answers: [[]] }));
+        return answerYes(interaction);
       } }, { tool: { names: ["question", "form"], arguments: (_, tool) => tool.name === "question" ? { questions: [{ header: "Retry", question: "Pick an answer", options: [{ label: "Yes", description: "Continue" }] }] } : { title: "Retry", fields: [{ key: "q0", type: "string", options: [{ value: "Yes", label: "Yes" }], required: true }] } } });
       assertTurnOutcome(result, { sessionId: result.sessionId, text: textFor("question-retry") });
       assert.equal(calls.length, 1);
@@ -809,7 +812,7 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
       let parent;
       const result = await turn("delegate", { onSession: (id) => { parent = id; }, onInteraction: async (interaction) => {
         interactions.push({ type: interaction.type, session: interaction.sessionId });
-        return interaction.type === "question" ? { type: "answer", answers: [["Yes"]] } : { type: "reply", reply: "once" };
+        return interaction.type === "permission" ? { type: "reply", reply: "once" } : answerYes(interaction);
       } }, { allowMissingTool: true, tool: { names: ["task", "subagent"], arguments: (_, tool) => tool.name === "task" ? { description: "Run synthetic foreground child", prompt: childPrompt, subagent_type: "matrix-fixture" } : { description: "Run synthetic foreground child", prompt: childPrompt, agent: "matrix-fixture" } } });
       const missing = provider.receipts.find((receipt) => [promptFor("delegate"), childPrompt].includes(receipt.prompt) && receipt.missingTool);
       if (missing) return { status: "BLOCKED", observed: `Actual ${missing.prompt === childPrompt ? "child" : "parent"} native catalog lacks ${missing.missingTool.join("/")}; advertised tools: ${missing.tools.map((tool) => tool.name).join(", ")}` };
@@ -817,7 +820,7 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
       assert.ok(provider.receipts.some((receipt) => receipt.prompt === childPrompt), "Actual task tool never started child inference");
       const parentResult = provider.receipts.find((receipt) => receipt.prompt === promptFor("delegate") && receipt.toolResults.length);
       assert.ok(JSON.stringify(parentResult?.toolResults).includes(textFor("child")), "Child nonce did not return through real task tool");
-      assert.ok(interactions.some((item) => item.type === "question" && item.session !== parent), "Child question was not routed through parent executor");
+      assert.ok(interactions.some((item) => ["question", "form"].includes(item.type) && item.session !== parent), "Child question was not routed through parent executor");
       assert.ok(interactions.some((item) => item.type === "permission" && item.session !== parent), "Child protected tool permission was not routed");
       cell.evidence.childInteractions = interactions;
     },
@@ -990,7 +993,7 @@ throw Error('Native file-command completion deadline exceeded');
       await executor.switchModel({ sessionId: first.sessionId, model: { providerID: "other", id: "matrix" }, workingDirectory: runtime.workspace });
       await turn("model-other", { sessionId: first.sessionId });
       assert.equal(provider.receipts.find((receipt) => receipt.prompt === promptFor("model-other")).provider, "other");
-      const running = turn("model-inflight", { sessionId: first.sessionId, onInteraction: () => ({ type: "answer", answers: [["Yes"]] }) }, {
+      const running = turn("model-inflight", { sessionId: first.sessionId, onInteraction: answerYes }, {
         hold: true, holdOnce: true, tool: { names: ["question"], arguments: () => ({ questions: [{ header: "Timing", question: "Continue?", options: [{ label: "Yes", description: "Continue" }] }] }) },
       });
       // An already-issued request stays on the old provider; the next tool-loop
