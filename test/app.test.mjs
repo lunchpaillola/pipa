@@ -160,6 +160,22 @@ test("Slack unknown and malformed forms remain visible and cancellable", async t
   }
 });
 
+test("Slack forms validate later fields before offering the first answer", async t => {
+  for (const field of [null, { key: "later", type: "future" }, { key: "first", type: "string" },
+    { key: "later", type: "string", options: [null] }, { key: "later", type: "multiselect" },
+    { key: "later", type: "external", url: "javascript:alert(1)" },
+    { key: "later", type: "external", url: "not a URL" },
+    { key: "later", type: "string", when: [{ key: "later", op: "eq", value: "x" }] }]) {
+    const f = slackForm(t, [{ key: "first", type: "string", required: true }, field]);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.match(JSON.stringify(f.card()), /unsupported or malformed/u);
+    assert.ok(f.actions().every(action => action.action_id?.startsWith("pipa_dismiss_")));
+    assert.deepEqual(f.decisions, []);
+    await f.click("dismiss");
+    assert.equal((await f.result).type, "stop");
+  }
+});
+
 test("Slack forms preserve overflow choice values with an editable numbered fallback", async t => {
   const options = Array.from({ length: 105 }, (_, index) => ({ label: `Choice ${index + 1}`, value: `actual-${index}` }));
   const f = slackForm(t, [{ key: "many", type: "multiselect", required: true, options }]);

@@ -2,7 +2,6 @@ export function formQuestion(entry) {
   const fields = entry.request.fields;
   const unsupported = { header: entry.request.title || "OpenCode form", unsupported: true, question: "Slack cannot answer this unsupported or malformed field. You can dismiss this form." };
   if (!Array.isArray(fields) || !fields.length) return unsupported;
-  const effective = Object.create(null);
   const earlier = new Set();
   for (let index = 0; index < fields.length; index++) {
     const field = fields[index];
@@ -10,11 +9,16 @@ export function formQuestion(entry) {
       || !["string", "number", "integer", "boolean", "multiselect", "external"].includes(field.type)
       || field.when !== undefined && (!Array.isArray(field.when) || field.when.some(condition => !condition || !earlier.has(condition.key) || !["eq", "neq"].includes(condition.op) || !["string", "number", "boolean"].includes(typeof condition.value)))
       || field.options !== undefined && (!Array.isArray(field.options) || field.options.some(option => !option || typeof option.label !== "string" || typeof option.value !== "string"))
-      || field.type === "multiselect" && !Array.isArray(field.options)) {
+      || field.type === "multiselect" && !Array.isArray(field.options)
+      || field.type === "external" && (!URL.canParse(field.url) || !["http:", "https:"].includes(new URL(field.url).protocol))) {
       entry.questionIndex = index;
       return unsupported;
     }
     earlier.add(field.key);
+  }
+  const effective = Object.create(null);
+  for (let index = 0; index < fields.length; index++) {
+    const field = fields[index];
     const active = (field.when ?? []).every(condition => {
       if (!Object.hasOwn(effective, condition.key)) return false;
       const value = effective[condition.key];
@@ -29,14 +33,7 @@ export function formQuestion(entry) {
     else if (Object.hasOwn(field, "default")) effective[field.key] = field.default;
     if (index < entry.questionIndex || field.hidden && (Object.hasOwn(field, "default") || !field.required)) continue;
     entry.questionIndex = index;
-    let url;
-    if (field.type === "external") {
-      try {
-        const parsed = new URL(field.url);
-        if (!["http:", "https:"].includes(parsed.protocol)) return unsupported;
-        url = parsed.href;
-      } catch { return unsupported; }
-    }
+    const url = field.type === "external" ? new URL(field.url).href : undefined;
     const options = field.type === "boolean" ? [{ label: "Yes", value: true }, { label: "No", value: false }] : field.options;
     return {
       field, url, header: field.title || entry.request.title || "OpenCode form",
