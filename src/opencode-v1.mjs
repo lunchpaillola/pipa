@@ -107,8 +107,8 @@ export function createV1Adapter({ request, baseUrl, fetchImpl, headers, pollInte
             if (statusCode === 401 || error.name === "ProviderAuthError") {
               const expiredKey = statusCode === 401 && typeof error.data?.message === "string" && /\bAPI key (?:has )?expired\b/iu.test(error.data.message);
               throw new Error(expiredKey
-                ? `OpenCode ${provider} API key has expired. Replace that provider's API key in OpenCode, or choose another provider with your installation's model command, then start a new thread.`
-                : `OpenCode ${provider} authentication failed${http}. Reconnect that provider in OpenCode, or choose another provider with your installation's model command, then start a new thread.`);
+                ? `OpenCode ${provider} API key has expired. Choose another provider with your installation's model command, then start a new thread. Ask your Pipa operator to reconnect the unavailable provider.`
+                : `OpenCode ${provider} authentication failed${http}. Choose another provider with your installation's model command, then start a new thread. Ask your Pipa operator to reconnect the unavailable provider.`);
             }
             throw new Error(`OpenCode ${provider} ${http ? `failed${http}` : "failed to complete the turn"}.`);
           }

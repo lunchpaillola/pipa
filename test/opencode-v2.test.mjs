@@ -764,7 +764,7 @@ test("native form validation rejection allows correcting the same pending form",
   assert.equal(interactions.length, 1, "correction must reuse the existing interaction");
 });
 
-test("richer or partially supported forms still require a native client", async (t) => {
+test("richer forms accept keyed native answers and cancellation", async (t) => {
   for (const field of [
     { type: "number" }, { type: "integer" }, { type: "boolean" }, { type: "external", url: "https://example.com/connect" },
     { type: "string", hidden: true }, { type: "string", when: [{ key: "q0", op: "eq", value: "allow" }] },
@@ -777,9 +777,18 @@ test("richer or partially supported forms still require a native client", async 
     await f.adapter.followSession(f.input("ses_one", { onInteraction: async (interaction) => { interactions.push(interaction); return { type: "cancelled" }; } }));
     await until(() => interactions.length === 1);
     assert.equal(interactions[0].type, "form");
-    await assert.rejects(interactions[0].submit({ type: "answer", answers: [["allow"], ["anything"]] }), /requires an OpenCode client/u);
-    assert.equal(f.requests.some((request) => request.path.endsWith("/frm_rich/reply")), false);
+    const answer = { q0: "allow", q1: field.type === "boolean" ? false : field.type === "external" ? true : ["number", "integer"].includes(field.type) ? 0 : "anything" };
+    await interactions[0].submit({ type: "answer", answer });
+    assert.deepEqual(f.requests.find(request => request.path.endsWith("/frm_rich/reply")).body, { answer });
   }
+  const f = await fixture(t);
+  const interactions = [];
+  f.forms.push({ id: "frm_cancel", sessionID: "ses_one", title: "Unknown", fields: [{ key: "x", type: "future" }] });
+  await f.adapter.followSession(f.input("ses_one", { onInteraction: async interaction => { interactions.push(interaction); return { type: "cancelled" }; } }));
+  await until(() => interactions.length === 1);
+  await interactions[0].submit({ type: "stop" });
+  assert.equal(f.forms.length, 0);
+  assert.ok(f.requests.some(request => request.method === "DELETE" && request.path.endsWith("/frm_cancel")));
 });
 
 test("child permissions, native settlement and reconnect reconciliation share one live source", async (t) => {

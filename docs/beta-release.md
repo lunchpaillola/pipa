@@ -29,15 +29,27 @@ Actual bot-token access and isolated native recovery require qualification befor
 - Closing the model picker cancels pending discovery and prevents a late update. V1 retains a 30-second discovery limit, starting only after readiness; v2 has no Pipa-added discovery deadline. Cached search and Save do not rediscover the catalog.
 - Explicitly selected routine prompt files may live outside the configured working directory, including symlinked files. Regular-file, identity, size and concurrent-change checks remain.
 - OpenCode v2 web-search setup can be answered in Slack: Allow, Disable and Choose another provider, followed by the provider picker when needed.
-- Simple visible text and multiselect forms use Slack question controls regardless of their metadata kind or field names. Unsupported shapes still require an OpenCode client; native validation and session/workspace authorization remain in place.
+- Simple visible text and multiselect forms use Slack question controls regardless of their metadata kind or field names. Other pending session forms use Slack alternatives rather than an OpenCode-client redirect; native validation and session authorization remain in place.
 - Large model-search results stay within Slack's response-size limit. Models omitted from the initial results remain searchable.
 
 - Slack choices preserve native option values even when labels repeat; typed custom answers are no longer interpreted as option labels. Optional text fields accept an empty string, optional multiselects accept an empty selection, and Skip omits the field from the native answer. Native validation can still reject an answer that violates field constraints. Automated Slack-to-native HTTP fixtures cover these cases; a live Slack form smoke has not run.
 - An empty model picker explains the terminal provider-connection command and directs attached-server users to their operator.
 
-Unsupported numeric, boolean, hidden, conditional and external-action forms still
-have a dead-end OpenCode-client notice. This is an unresolved Slack UX gap, not an
-acceptable end-user workaround. See the [redirect audit and renderer research](research/slack-forms-and-opencode-redirects.md).
+Numeric, boolean, hidden/default, conditional and external-action session forms
+are part of the Slack completion path. Native validation failures leave an
+editable response, and dismissing a form uses native cancellation. Provider
+connection from Slack remains separate in [issue #68](https://github.com/lunchpaillola/pipa/issues/68).
+The [redirect audit](research/slack-forms-and-opencode-redirects.md) records the
+earlier behavior; its unsupported-form disposition is superseded by this change.
+
+The native form check on OpenCode 2.2.5/macOS passed 13 scenarios and checked 35
+rendered payloads, including all six field types, source-shaped web-search setup
+and provider lists up to 2,000 options, oversized links/text, multiline answers,
+defaults/conditions, rejection/retry, cancellation and actual question-tool
+execution resumption. The local scripted provider used no external credentials.
+Slack transport and detail-file uploads were captured, not sent to live Slack;
+these results do not qualify live rendering, provider authentication or every
+future plugin form. Reproduce with `scripts/verification/slack-forms-native.mjs`.
 
 ## Retained changes from 0.6.0-beta.1
 

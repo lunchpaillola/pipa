@@ -181,9 +181,9 @@ In an allowed channel, type your app's command followed by `model`: `/chopper mo
 
 The choice applies to new threads without restarting Pipa. Existing threads keep their model across replies and restarts. New routines save the current choice; existing routines keep theirs. Routines with no saved model use OpenCode's default. With no selection, new threads also use OpenCode's default. Changing this setting does not change subagents or external clients.
 
-To use a different model, start a new thread. Changing an existing v2 thread's model still requires OpenCode.
+To use a different model from Slack, save your choice and start a new thread. The picker does not change existing threads.
 
-The picker shows up to 100 matches; narrow your search for more. A listed model may still lack credentials or quota. Saving does not test it. Providers such as `opencode` and `openai` use separate credentials. Reconnect failed providers in OpenCode. Pipa never silently switches models.
+The picker shows up to 100 matches; narrow your search for more. A listed model may still lack credentials or quota. Saving does not test it. Providers such as `opencode` and `openai` use separate credentials. If a provider fails, choose an available model and start a new thread, or ask your Pipa operator to reconnect it. [Connecting providers from Slack](https://github.com/lunchpaillola/pipa/issues/68) is a separate follow-up. Pipa never silently switches models.
 
 **Multiple Slack apps:** give each a distinct command. Slack sends a shared `/pipa` command to the most recently installed app. Register that alias with only one app, and check the app name in the picker before saving.
 

@@ -38,6 +38,15 @@ Keep the no-secret PR lane separate from opt-in real Slack/provider execution.
 See [testing](docs/pipa-testing.md) and [compatibility/rollback](docs/opencode-compatibility.md).
 No supported minimum or release qualification is implied by a subset of native passes.
 
+For session-form changes, run `node scripts/verification/slack-forms-native.mjs`
+with the target v2 `opencode` on PATH. An optional positional filename saves the
+JSON report. This starts a disposable native server with isolated HOME/XDG and
+database storage, drives real forms through Pipa's Slack callbacks, and asserts
+the native answers, cancellation, rejection/retry and Slack payload-size limits.
+It also runs a native question tool with a scripted loopback provider. It needs
+no Slack tokens or paid-provider credentials. Captured Slack transport does not
+verify visual rendering or real file uploads; those still need a test Slack app.
+
 The current native v2 target to qualify is **2.2.5**, alongside historical v2 **2.0.29** and v1 pins **1.18.35 / 1.19.0**. The SDK remains pinned to `@opencode/client@2.0.29` until qualified; its version is not the native engine target. These are qualification inputs, not passing compatibility results or a release recommendation.
 
 For model-selection changes, iterate with `node --test test/state.test.mjs test/opencode.test.mjs test/models.test.mjs test/app.test.mjs test/routines.test.mjs test/cli.test.mjs`, then run both required checks above.

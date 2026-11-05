@@ -766,9 +766,9 @@ test("waits for an active retry despite a terminal assistant message", async () 
 });
 
 for (const [error, expected] of [
-  [{ name: "APIError", data: { statusCode: 401, message: "This API key has expired. private-upstream-secret", responseBody: "private-response-secret" } }, /provider "opencode" API key has expired\. Replace that provider's API key/u],
-  [{ name: "APIError", data: { statusCode: 401, message: "Invalid API key private-upstream-secret" } }, /provider "opencode" authentication failed \(HTTP 401\)\. Reconnect that provider/u],
-  [{ name: "ProviderAuthError", data: { providerID: "opencode", message: "private-upstream-secret" } }, /provider "opencode" authentication failed\. Reconnect that provider/u],
+  [{ name: "APIError", data: { statusCode: 401, message: "This API key has expired. private-upstream-secret", responseBody: "private-response-secret" } }, /provider "opencode" API key has expired\. Choose another provider/u],
+  [{ name: "APIError", data: { statusCode: 401, message: "Invalid API key private-upstream-secret" } }, /provider "opencode" authentication failed \(HTTP 401\)\. Choose another provider/u],
+  [{ name: "ProviderAuthError", data: { providerID: "opencode", message: "private-upstream-secret" } }, /provider "opencode" authentication failed\. Choose another provider/u],
   [{ name: "APIError", data: { statusCode: 429, message: "private-upstream-secret" } }, /provider "opencode" failed \(HTTP 429\)/u],
   [{ name: "UnknownError", data: { message: "private-upstream-secret" } }, /provider "opencode" failed to complete the turn/u],
 ]) test(`reports safe, provider-specific ${error.name} ${error.data.statusCode ?? ""} failures instead of hiding the cause`, async () => {
@@ -789,7 +789,8 @@ for (const [error, expected] of [
   await assert.rejects(executor.runTurn({ prompt: "hello", sessionId: "ses_1", workingDirectory: "/work" }), (failure) => {
     assert.match(failure.message, expected);
     assert.doesNotMatch(failure.message, /private-|responseBody|responseHeaders/u);
-    if (error.data.statusCode === 401 || error.name === "ProviderAuthError") assert.match(failure.message, /choose another provider.*model command/u);
+    if (error.data.statusCode === 401 || error.name === "ProviderAuthError") assert.match(failure.message, /Choose another provider.*model command/u);
+    assert.doesNotMatch(failure.message, /(?:replace|reconnect).*in OpenCode|open (?:an? )?OpenCode/iu);
     if (!error.data.message.includes("expired")) assert.doesNotMatch(failure.message, /expired/u);
     return true;
   });

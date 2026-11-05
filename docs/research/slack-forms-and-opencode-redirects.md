@@ -1,5 +1,12 @@
 # Slack forms and OpenCode redirects
 
+**Historical audit.** The November 5 Slack-form changes supersede the unsupported
+session-form and Pipa-authored OpenCode-client redirect dispositions below.
+Current behavior is documented in [compatibility](../opencode-compatibility.md).
+Provider connection from Slack is tracked separately in
+[issue #68](https://github.com/lunchpaillola/pipa/issues/68); native upstream error
+messages are still passed through rather than rewritten by Pipa.
+
 Audit date: 2026-11-04. Scope: executable strings in `src/` and `bin/`, the README,
 and current compatibility/release documentation after PR #64. Historical plans and
 test fixtures describe old contracts, not additional live redirects.

@@ -1329,6 +1329,33 @@ test("U3 real Slack controls + v2: rejected keyed answer stays editable, correct
   current.wire.assertComplete();
 });
 
+test("typed Slack form submission retains native rejection and corrects the same card", async t => {
+  const complete = Promise.withResolvers();
+  const form = { ...nativeExamples.question, fields: [{ key: "count", type: "integer", required: true, minimum: 1 }] };
+  const current = await nativeInteractions(t, { forms: [form], onPrompt: () => complete.promise });
+  current.document.routes.find(route => route.path.endsWith("frm_native/reply")).responses.unshift({ status: 400, json: { _tag: "FormInvalidAnswerError", id: "frm_native", message: "Must be at least 1" } });
+  const controls = createPendingInteractions(["U1"]);
+  const posted = [], updated = [];
+  const thread = { id: "slack:C1:1.0", adapter: { webClient: { chat: {
+    postMessage: async value => { posted.push(value); return { ts: "2.0" }; }, update: async value => updated.push(value), delete: async () => {},
+  } } } };
+  const turn = current.executor.runTurn({ ...current.input, onInteraction: interaction => controls.onInteraction({ thread }, interaction) });
+  await waitFor(() => posted.length === 1);
+  for (const answer of ["0", "2"]) {
+    const action = (updated.at(-1) ?? posted[0]).blocks.flatMap(block => block.elements ?? []).find(action => action.action_id.startsWith("pipa_custom_"));
+    let modal;
+    await controls.onAction({ threadId: thread.id, user: { userId: "U1" }, actionId: action.action_id, value: action.value, openModal: async value => { modal = value; } });
+    await controls.onCustomAnswer({ privateMetadata: modal.privateMetadata, relatedThread: thread, user: { userId: "U1" }, values: { answer } });
+    if (answer === "0") assert.match(JSON.stringify(updated.at(-1)), /retry/u);
+  }
+  complete.resolve();
+  assertTurnOutcome(await turn, current.document.expected);
+  assert.deepEqual(current.calls.map(call => call.body), [{ answer: { count: 0 } }, { answer: { count: 2 } }]);
+  assert.equal(posted.length, 1);
+  assert.equal(updated.at(-1).text, "Form submitted.");
+  current.wire.assertComplete();
+});
+
 for (const decision of ["once", "always", "reject"]) test(`U3 v2 permission ${decision}: legacy callbacks encode decision once`, async (t) => {
   const done = Promise.withResolvers();
   const current = await nativeInteractions(t, { permissions: [nativeExamples.permission], onPrompt: () => done.promise, onReply: () => done.resolve() });
@@ -1402,7 +1429,7 @@ for (const lost of ["accepted", "pending"]) test(`U3 v2 lost reply reconciles ${
   current.wire.assertComplete();
 });
 
-test("U3 v2 richer forms stay native-only; external settlement releases notices, foreign children stay invisible", async (t) => {
+test("U3 v2 richer forms expose Slack controls; external settlement releases cards, foreign children stay invisible", async (t) => {
   const forms = [...nativeExamples.rich, ...["ses_unrelated", "ses_other_tree"].map((sessionID, index) => ({ ...nativeExamples.question, sessionID, id: `frm_foreign_${index}` }))];
   const current = await nativeInteractions(t, { forms });
   const messages = current.document.routes.find((route) => route.path.endsWith("/message"));
@@ -1417,8 +1444,8 @@ test("U3 v2 richer forms stay native-only; external settlement releases notices,
   const turn = current.executor.runTurn({ ...current.input, onInteraction: (interaction) => { seen.push(interaction.type); return controls.onInteraction({ thread }, interaction); } });
   for (const [index, form] of nativeExamples.rich.entries()) {
     await waitFor(() => posted.length === index + 1, { label: `rich form ${index} posted` });
-    assert.match(JSON.stringify(posted.at(-1)), /requires an OpenCode client/iu);
-    assert.equal(posted.at(-1).blocks.some((block) => block.type === "actions"), false);
+    assert.doesNotMatch(JSON.stringify(posted.at(-1)), /requires an OpenCode client/iu);
+    assert.ok(posted.at(-1).blocks.some(block => block.elements?.some(action => action.action_id?.startsWith("pipa_dismiss_"))));
     current.pendingForms.splice(current.pendingForms.findIndex((item) => item.id === form.id), 1);
     current.emit({ type: "form.cancelled", data: { sessionID: form.sessionID, id: form.id } });
     await waitFor(() => deleted.length === index + 1, { label: `rich form ${index} settled` });

@@ -9,6 +9,277 @@ import { SocketModeClient } from "@slack/socket-mode";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { Chat } from "chat";
 import { checkSlackAppToken, checkSlackToken, createConversationRunner, createPendingInteractions, createPipaSlackAdapter, initializePipa, postResult, slackDestinationId, startPipa as startPipaRuntime } from "../src/app.mjs";
+
+function slackForm(t, fields, submit = async () => {}, context = {}, interaction = {}) {
+  const controls = createPendingInteractions(["U1"]);
+  t.after(() => controls.close());
+  let card;
+  const decisions = [];
+  const uploads = [];
+  const thread = { id: "slack:C1:1.0", post: async value => { uploads.push(value); }, adapter: { webClient: { chat: {
+    postMessage: async value => { card = value; return { ts: "2.0" }; },
+    update: async value => { card = value; }, delete: async () => {},
+  } } } };
+  const result = controls.onInteraction({ thread, ...context }, { type: "form", request: { id: "frm_test", title: "Setup", fields }, signal: new AbortController().signal,
+    submit: async value => { decisions.push(value); await submit(value); }, ...interaction });
+  const actions = () => card.blocks.flatMap(block => block.elements ?? []);
+  const click = async (prefix, extra = {}) => {
+    const action = actions().find(action => action.action_id?.startsWith(`pipa_${prefix}_`));
+    assert.ok(action, `Missing ${prefix}: ${JSON.stringify(card)}`);
+    await controls.onAction({ actionId: action.action_id, value: action.value, threadId: thread.id, user: { userId: "U1" }, ...extra });
+  };
+  const text = async value => {
+    let modal;
+    await click("custom", { openModal: async value => { modal = value; } });
+    return controls.onCustomAnswer({ privateMetadata: modal.privateMetadata, relatedThread: thread, user: { userId: "U1" }, values: { answer: value } });
+  };
+  return { result, decisions, uploads, click, text, actions, controls, thread, card: () => card };
+}
+
+test("oversized native form details stay accessible without exceeding Slack limits", async t => {
+  const url = `https://example.com/action?state=${"x".repeat(3100)}`;
+  const title = "Long title ".repeat(20);
+  const description = "Full instructions ".repeat(200);
+  const f = slackForm(t, [{ key: "external", type: "external", title, description, url }]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.uploads.length, 1);
+  const details = f.uploads[0].files[0].data.toString();
+  for (const value of [title, description, url]) assert.ok(details.includes(value));
+  assert.ok(f.card().blocks.length <= 50);
+  for (const block of f.card().blocks) {
+    if (block.type === "header") assert.ok(block.text.text.length <= 150);
+    if (block.type === "section") assert.ok(block.text.text.length <= 3000);
+  }
+  assert.ok(!f.actions().some(action => action.url?.length > 3000));
+  await f.click("finished");
+  assert.deepEqual((await f.result).answer, { external: true });
+});
+
+test("large native choice lists use an attached numbered fallback with all values reachable", async t => {
+  const options = Array.from({ length: 2000 }, (_, index) => ({ label: `Choice ${index + 1} ${"x".repeat(60)}`, value: `native-${index}` }));
+  const f = slackForm(t, [{ key: "many", type: "string", options, required: true }]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(f.card().blocks.length <= 50);
+  assert.equal(f.uploads.length, 1);
+  assert.match(f.uploads[0].files[0].data.toString(), /2000\. Choice 2000/u);
+  await f.text("2000");
+  assert.deepEqual((await f.result).answer, { many: "native-1999" });
+});
+
+test("native string forms allow multiline answers in Slack", async t => {
+  const f = slackForm(t, [{ key: "body", type: "string", required: true, default: "" }]);
+  await new Promise(resolve => setImmediate(resolve));
+  let modal;
+  await f.click("custom", { openModal: async value => { modal = value; } });
+  assert.equal(modal.children[0].multiline, true);
+  await f.controls.onCustomAnswer({ privateMetadata: modal.privateMetadata, relatedThread: f.thread, user: { userId: "U1" }, values: { answer: "first\nsecond" } });
+  assert.deepEqual((await f.result).answer, { body: "first\nsecond" });
+});
+
+test("failed form-detail uploads can be retried from the same Slack card", async t => {
+  const f = slackForm(t, [{ key: "external", type: "external", url: `https://example.com/?state=${"x".repeat(3100)}` }]);
+  const upload = f.thread.post;
+  let attempts = 0;
+  f.thread.post = async value => {
+    if (++attempts === 1) throw new Error("upload unavailable");
+    return upload(value);
+  };
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(JSON.stringify(f.card()), /could not be attached/u);
+  assert.deepEqual(f.decisions, []);
+  await f.click("details");
+  assert.equal(f.uploads.length, 1);
+  assert.doesNotMatch(JSON.stringify(f.card()), /could not be attached/u);
+  await f.click("finished");
+  assert.deepEqual((await f.result).answer, { external: true });
+  assert.equal(attempts, 2);
+});
+
+test("revoked authorization during form-detail upload prevents posting the Slack card", async t => {
+  let allowed = true;
+  const f = slackForm(t, [{ key: "external", type: "external", url: `https://example.com/?state=${"x".repeat(3100)}` }], undefined,
+    { authorize: async () => { if (!allowed) throw new Error("revoked"); } });
+  const upload = f.thread.post;
+  f.thread.post = async value => { await upload(value); allowed = false; };
+  await assert.rejects(f.result, /revoked/u);
+  assert.equal(f.card(), undefined);
+  assert.deepEqual(f.decisions, []);
+});
+
+test("Slack native forms submit typed values, keep hidden defaults out of cards and honor conditions", async t => {
+  const f = slackForm(t, [
+    { key: "secret", type: "string", hidden: true, default: "not-posted" },
+    { key: "number", type: "number", required: true },
+    { key: "integer", type: "integer", required: true },
+    { key: "enabled", type: "boolean", required: true },
+    { key: "inactive", type: "string", when: [{ key: "enabled", op: "eq", value: true }] },
+    { key: "empty", type: "string", required: false, when: [{ key: "secret", op: "eq", value: "not-posted" }] },
+    { key: "hiddenRequired", type: "string", hidden: true, required: true },
+  ]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotMatch(JSON.stringify(f.card()), /not-posted/u);
+  assert.ok((await f.text("Infinity"))?.errors);
+  await f.text("0");
+  assert.ok((await f.text("1.5"))?.errors);
+  await f.text("2");
+  const select = f.actions().find(action => action.type === "radio_buttons");
+  assert.ok(select);
+  await f.click("select", { value: select.options[1].value });
+  await f.click("submit");
+  await f.text("");
+  await f.text("editable");
+  const decision = await f.result;
+  assert.deepEqual(decision.answer, { secret: "not-posted", number: 0, integer: 2, enabled: false, empty: "", hiddenRequired: "editable" });
+  assert.doesNotMatch(JSON.stringify(f.card()), /not-posted/u);
+});
+
+test("Slack external forms require explicit acknowledgment and rejection remains editable", async t => {
+  let attempts = 0;
+  const f = slackForm(t, [{ key: "connect", type: "external", url: "https://example.com/connect" }], async () => {
+    if (++attempts === 1) throw new Error("native rejected");
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.decisions.length, 0);
+  assert.match(JSON.stringify(f.card()), /https:\/\/example.com\/connect/u);
+  await f.click("external");
+  assert.equal(f.decisions.length, 0, "opening the URL must not acknowledge completion");
+  await f.click("finished");
+  assert.equal(f.decisions.length, 1);
+  assert.match(JSON.stringify(f.card()), /retry/u);
+  await f.click("finished");
+  assert.deepEqual((await f.result).answer, { connect: true });
+});
+
+test("Slack unknown and malformed forms remain visible and cancellable", async t => {
+  for (const field of [{ key: "x", type: "future" }, { key: "x", type: "external", url: "javascript:alert(1)" }, null]) {
+    const f = slackForm(t, [field]);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.match(JSON.stringify(f.card()), /cannot|unsupported|Unsupported/u);
+    await f.click("dismiss");
+    assert.equal((await f.result).type, "stop");
+  }
+});
+
+test("Slack forms preserve overflow choice values with an editable numbered fallback", async t => {
+  const options = Array.from({ length: 105 }, (_, index) => ({ label: `Choice ${index + 1}`, value: `actual-${index}` }));
+  const f = slackForm(t, [{ key: "many", type: "multiselect", required: true, options }]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(JSON.stringify(f.card()), /Choice 105/u);
+  await f.text("1, 105");
+  assert.deepEqual((await f.result).answer, { many: ["actual-0", "actual-104"] });
+});
+
+test("Slack forms distinguish defaults from optional omission and explicit empty selections", async t => {
+  const f = slackForm(t, [
+    { key: "defaultFalse", type: "boolean", required: true, hidden: true, default: false },
+    { key: "defaultZero", type: "integer", required: true, hidden: true, default: 0 },
+    { key: "defaultEmpty", type: "string", hidden: true, default: "" },
+    { key: "omitted", type: "string", required: false },
+    { key: "unansweredEq", type: "string", required: true, when: [{ key: "omitted", op: "eq", value: "x" }] },
+    { key: "unansweredNeq", type: "string", required: true, when: [{ key: "omitted", op: "neq", value: "x" }] },
+    { key: "choices", type: "multiselect", options: [{ label: "A", value: "a" }] },
+  ]);
+  await new Promise(resolve => setImmediate(resolve));
+  await f.click("skip");
+  const selector = f.actions().find(action => action.type === "checkboxes");
+  const block = f.card().blocks.find(block => block.elements?.includes(selector));
+  await f.click("submit", { raw: { state: { values: { [block.block_id]: { [selector.action_id]: { selected_options: [] } } } } } });
+  assert.deepEqual((await f.result).answer, { defaultFalse: false, defaultZero: 0, defaultEmpty: "", choices: [] });
+});
+
+test("Slack form conditions AND earlier multiselect membership and inactive fields cannot be answered", async t => {
+  const f = slackForm(t, [
+    { key: "choices", type: "multiselect", hidden: true, default: ["a"], options: [{ label: "A", value: "a" }] },
+    { key: "active", type: "string", required: true, when: [{ key: "choices", op: "eq", value: "a" }, { key: "choices", op: "neq", value: "b" }] },
+    { key: "inactive", type: "string", required: true, default: "must-not-submit", when: [{ key: "choices", op: "eq", value: "b" }] },
+    { key: "cascade", type: "string", required: true, when: [{ key: "inactive", op: "neq", value: "x" }] },
+  ]);
+  await new Promise(resolve => setImmediate(resolve));
+  await f.text("answer");
+  assert.deepEqual((await f.result).answer, { choices: ["a"], active: "answer" });
+});
+
+test("Slack forms explicitly submit hidden defaults or use a visible field's default", async t => {
+  const defaults = slackForm(t, [{ key: "enabled", type: "boolean", required: true, hidden: true, default: false }]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(defaults.decisions, [], "even an all-hidden form needs explicit submission");
+  await defaults.click("submit");
+  assert.deepEqual((await defaults.result).answer, { enabled: false });
+  const visible = slackForm(t, [{ key: "count", type: "integer", required: true, default: 0 }]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(visible.actions().some(action => action.text?.text === "Use default"));
+  await visible.click("skip");
+  assert.deepEqual((await visible.result).answer, { count: 0 });
+});
+
+test("Slack forms use native selects for 11–100 choices and numbered fallback for long labels", async t => {
+  for (const count of [11, 100]) for (const type of ["string", "multiselect"]) {
+    const options = Array.from({ length: count }, (_, index) => ({ label: `Choice ${index}`, value: `native-${index}` }));
+    const f = slackForm(t, [{ key: "pick", type, required: true, options }]);
+    await new Promise(resolve => setImmediate(resolve));
+    const selector = f.actions().find(action => action.type === (type === "string" ? "static_select" : "multi_static_select"));
+    assert.equal(selector.options.length, count);
+    const block = f.card().blocks.find(block => block.elements?.includes(selector));
+    await f.click("submit", { raw: { state: { values: { [block.block_id]: { [selector.action_id]: type === "string" ? { selected_option: selector.options.at(-1) } : { selected_options: [selector.options.at(-1)] } } } } } });
+    assert.deepEqual((await f.result).answer, { pick: type === "string" ? `native-${count - 1}` : [`native-${count - 1}`] });
+  }
+  for (const input of ["1", "text:1"]) {
+    const f = slackForm(t, [{ key: "pick", type: "string", custom: true, options: [{ label: "Long label ".repeat(10), value: "opaque" }] }]);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.match(JSON.stringify(f.card()), /Long label/u);
+    await f.text(input);
+    assert.deepEqual((await f.result).answer, { pick: input === "1" ? "opaque" : "1" });
+  }
+});
+
+test("legacy question overflow preserves opaque values and displayed labels", async t => {
+  const options = Array.from({ length: 105 }, (_, index) => ({ label: `Choice ${index + 1}`, value: `actual-${index}` }));
+  const f = slackForm(t, [], undefined, {}, { type: "question", request: { id: "q", questions: [{ header: "Choose", multiple: true, custom: false, required: true, options }] } });
+  await new Promise(resolve => setImmediate(resolve));
+  await f.text("1, 105");
+  assert.deepEqual((await f.result).answers, [["actual-0", "actual-104"]]);
+  assert.match(JSON.stringify(f.card()), /Choice 105/u);
+  assert.doesNotMatch(JSON.stringify(f.card()), /actual-104/u);
+});
+
+test("legacy numbered answers preserve label-only option identity", async t => {
+  const options = [{ label: "A".repeat(76) }, { label: "B" }];
+  const f = slackForm(t, [], undefined, {}, { type: "question", request: { questions: [{ header: "Choose", multiple: true, custom: false, required: true, options }] } });
+  await new Promise(resolve => setImmediate(resolve));
+  await f.text("2, 1");
+  assert.deepEqual((await f.result).answers, [["B", "A".repeat(76)]]);
+});
+
+test("oversized native form titles remain valid when submitted or dismissed", async t => {
+  for (const dismiss of [false, true]) {
+    const fields = [{ key: "value", type: "integer", required: true }];
+    const f = slackForm(t, fields, undefined, {}, { request: { id: "frm_long", title: "Form title ".repeat(20), fields } });
+    await new Promise(resolve => setImmediate(resolve));
+    if (dismiss) await f.click("dismiss");
+    else await f.text("1");
+    await f.result;
+    for (const block of f.card().blocks) if (block.type === "header") assert.ok(block.text.text.length <= 150);
+  }
+});
+
+test("Slack form callbacks retain responder, thread, revocation and external-settlement checks", async t => {
+  let allowed = ["U1"];
+  const settled = Promise.withResolvers();
+  const f = slackForm(t, [{ key: "n", type: "integer", required: true }], undefined, { loadAllowedUserIds: async () => allowed }, { settled: settled.promise });
+  await new Promise(resolve => setImmediate(resolve));
+  await f.click("dismiss", { user: { userId: "U2" } });
+  await f.click("dismiss", { threadId: "slack:C2:1.0" });
+  let modal;
+  await f.click("custom", { openModal: async value => { modal = value; } });
+  allowed = ["U2"];
+  await f.controls.onCustomAnswer({ privateMetadata: modal.privateMetadata, relatedThread: f.thread, user: { userId: "U1" }, values: { answer: "0" } });
+  await f.click("dismiss");
+  assert.deepEqual(f.decisions, []);
+  settled.resolve();
+  assert.equal((await f.result).type, "cancelled");
+  await f.click("dismiss", { user: { userId: "U2" } });
+  assert.deepEqual(f.decisions, []);
+});
 import { PipaRestartingError, PipaStoppedError, startSocketOpenCodeServer } from "../src/opencode.mjs";
 import { createRuntimeFixture } from "./helpers/runtime-fixture.mjs";
 import { createRoutineScheduler, normalizeRoutine } from "../src/routines.mjs";

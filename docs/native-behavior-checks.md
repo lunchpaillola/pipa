@@ -25,7 +25,7 @@ Pipa connects Slack to OpenCode. It should not invent execution failures for beh
 - **Startup readiness probes and explicit harness deadlines** (`opencode.mjs`): remain separate from native execution requests, alongside caller cancellation and owned-process shutdown. Slack acknowledgment/UI-expiry timers and legacy v1 discovery limits are unchanged.
 - **Observer readiness, cancellation and duplicate-delivery handling** (`opencode-v2.mjs`, `app.mjs`): avoid admitting work without an attached result path, posting after shutdown or replaying already-sent chunks. They are integration lifecycle checks, not native execution deadlines.
 - **State, routine and process validation** (`state.mjs`, `routines.mjs`, `restart.mjs`, `bin/pipa.mjs`): protect persisted mappings, exact destinations, schedules, single-instance locks and owned restart handoffs. Removing them can lose continuity or target the wrong process/destination.
-- **Permission/question translation and native-client fallback** (`opencode-v2.mjs`): validate Slack decisions before translating them, preserve editable controls when native submission fails, and avoid pretending Slack can answer unsupported rich forms.
+- **Permission and form translation** (`opencode-v2.mjs`, `app.mjs`): keep pending session forms in Slack, preserve typed native answers and explicit external-action acknowledgments, and leave controls editable when native submission fails. Slack authorization and native session ancestry still govern who can answer; opening an OpenCode client is not a fallback.
 
 ## Narrow missing-folder repair
 

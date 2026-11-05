@@ -92,7 +92,10 @@ export function createV2Adapter(options) {
     if (observer.interactions.has(key) || signal.aborted || revision !== observer.interactionRevision) return;
     const fields = request.fields;
     const question = kind === "form" && Array.isArray(fields) && fields.length
-      && fields.every((field) => ["string", "multiselect"].includes(field.type) && !field.hidden && !field.when?.length);
+      && fields.every((field) => field && typeof field.key === "string" && ["string", "multiselect"].includes(field.type)
+        && !field.hidden && (field.when === undefined || Array.isArray(field.when) && !field.when.length) && !Object.hasOwn(field, "default")
+        && (field.type !== "multiselect" || Array.isArray(field.options)) && Array.isArray(field.options ?? [])
+        && (field.options ?? []).every(option => option && typeof option.label === "string" && typeof option.value === "string"));
     const type = kind === "permission" ? "permission" : question ? "question" : "form";
     let tool;
     if (kind === "permission" && request.source?.type === "tool") {
@@ -114,7 +117,6 @@ export function createV2Adapter(options) {
     const submitDecision = async (decision) => {
       if (entry.accepted) return;
       if (entry.external) throw new Error("OpenCode request is already settled.");
-      if (type === "form") throw new Error("This form requires an OpenCode client response.");
       signal.throwIfAborted();
       entry.submitting = true;
       const native = { sessionID: request.sessionID, ...(kind === "form" ? { formID: request.id } : { requestID: request.id }) };
@@ -127,6 +129,8 @@ export function createV2Adapter(options) {
             await client.permission.reply({ ...native, decision: value }, { signal });
           } else if (["reject", "stop"].includes(decision?.type)) {
             await client.session.form.cancel(native, { signal });
+          } else if (decision?.type === "answer" && decision.answer && typeof decision.answer === "object" && !Array.isArray(decision.answer)) {
+            await client.session.form.reply({ ...native, answer: decision.answer }, { signal });
           } else if (question && decision?.type === "answer") {
             if (!Array.isArray(decision.answers) || decision.answers.length !== fields.length) throw new Error("Invalid OpenCode question answers.");
             const answer = Object.fromEntries(fields.flatMap((field, index) => {
@@ -136,7 +140,7 @@ export function createV2Adapter(options) {
               return [[field.key, field.type === "multiselect" ? values : values[0]]];
             }));
             await client.session.form.reply({ ...native, answer }, { signal });
-          } else throw new Error("This form requires an OpenCode client response.");
+          } else throw new Error("Invalid OpenCode form answer.");
         } catch (error) {
           signal.throwIfAborted();
           if (["Transport", "MalformedResponse"].includes(error.reason)
