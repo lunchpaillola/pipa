@@ -95,6 +95,39 @@ test("failed form-detail uploads can be retried from the same Slack card", async
   assert.equal(attempts, 2);
 });
 
+test("failed form-detail warnings clear when advancing to a question without details", async t => {
+  const f = slackForm(t, [
+    { key: "external", type: "external", url: `https://example.com/?state=${"x".repeat(3100)}` },
+    { key: "name", type: "string", required: true },
+  ]);
+  f.thread.post = async () => { throw new Error("upload unavailable"); };
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(JSON.stringify(f.card()), /could not be attached/u);
+  await f.click("finished");
+  assert.doesNotMatch(JSON.stringify(f.card()), /could not be attached|Show full details/u);
+  await f.text("Ada");
+  assert.deepEqual((await f.result).answer, { external: true, name: "Ada" });
+});
+
+test("failed form-detail warnings clear when rejected submission returns to attached details", async t => {
+  const url = `https://example.com/?state=${"x".repeat(3100)}`;
+  const f = slackForm(t, [
+    { key: "first", type: "external", url },
+    { key: "second", type: "external", url },
+  ], async decision => { if (decision.type === "answer") throw new Error("native rejected"); });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.uploads.length, 1);
+  f.thread.post = async () => { throw new Error("upload unavailable"); };
+  await f.click("finished");
+  assert.match(JSON.stringify(f.card()), /could not be attached/u);
+  await f.click("finished");
+  assert.match(JSON.stringify(f.card()), /retry/u);
+  assert.doesNotMatch(JSON.stringify(f.card()), /could not be attached|Show full details/u);
+  assert.equal(f.uploads.length, 1);
+  await f.click("dismiss");
+  assert.equal((await f.result).type, "stop");
+});
+
 test("revoked authorization during form-detail upload prevents posting the Slack card", async t => {
   let allowed = true;
   const f = slackForm(t, [{ key: "external", type: "external", url: `https://example.com/?state=${"x".repeat(3100)}` }], undefined,

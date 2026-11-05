@@ -699,7 +699,7 @@ async function postInteraction(thread, entry) {
   const attached = new Set();
   const attachDetails = async () => {
     const question = currentQuestion(entry);
-    if (!question.details || attached.has(entry.questionIndex)) return;
+    if (!question.details || attached.has(entry.questionIndex)) { entry.detailsError = undefined; return; }
     await entry.authorize?.();
     try {
       await thread.post({ markdown: "Full form details. Use the controls in this thread to answer or dismiss.", files: [{ filename: "form-details.txt", data: Buffer.from(question.details) }] });
