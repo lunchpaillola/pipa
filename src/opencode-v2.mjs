@@ -419,16 +419,24 @@ export function createV2Adapter(options) {
             if (session.location?.directory !== directory) {
               await client.location.get({ location: session.location }, { signal });
             } else {
-              signal.throwIfAborted();
-              try {
-                await client.session.move({ sessionID: session.id, directory: target.directory, delivery: "queue" }, { signal });
-                session = await lookup(sessionId, signal);
-                if (session?.location?.directory !== target.directory) throw new Error("Move not applied.");
-              } catch {
-                signal.throwIfAborted();
-                throw new Error("Pipa could not confirm the working-folder move. The current request was not sent; the move may still apply later.");
+              let missing = false;
+              try { await client.location.get({ location: { directory } }, { signal }); }
+              catch (error) {
+                if (error._tag !== "LocationNotFoundError" || error.location?.directory !== directory) throw error;
+                missing = true;
               }
-              locationRecovered = { previousDirectory: directory, directory: target.directory };
+              if (missing) {
+                signal.throwIfAborted();
+                try {
+                  await client.session.move({ sessionID: session.id, directory: target.directory, delivery: "queue" }, { signal });
+                  session = await lookup(sessionId, signal);
+                  if (session?.location?.directory !== target.directory) throw new Error("Move not applied.");
+                } catch {
+                  signal.throwIfAborted();
+                  throw new Error("Pipa could not confirm the working-folder move. The current request was not sent; the move may still apply later.");
+                }
+                locationRecovered = { previousDirectory: directory, directory: target.directory };
+              }
             }
           }
         }

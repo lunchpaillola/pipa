@@ -215,7 +215,7 @@ export function createOpenCodeExecutor(options = {}) {
         activeSessions.set(selectedSessionId, { controller, workingDirectory, resolved: true });
         await onSession?.(selectedSessionId);
         if (controller.signal.aborted) throw controller.signal.reason;
-        if (prepared.locationRecovered) await onLocationRecovered?.(prepared.locationRecovered);
+        if (prepared.locationRecovered) await abortable(Promise.resolve(onLocationRecovered?.(prepared.locationRecovered)), controller.signal);
         controller.signal.throwIfAborted();
         const newThreadModel = !selectedModel && (prepared.defaultEligible ?? !prepared.threadModel) ? normalizeModel(defaultModel) : null;
 

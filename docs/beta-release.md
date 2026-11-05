@@ -172,6 +172,11 @@ Live Slack bot-token access, provider-backed continuation, Linux/Windows native
 behavior, and whole-release qualification remain separate. No current production
 session was repaired or restarted.
 
+Recovery-notice delivery is turn-scoped, not durable. If the native move succeeds
+but the notice fails or its turn is cancelled, the current request is not sent;
+a later request can see a healthy moved session without receiving that original
+notice. No recovery-delivery journal or notice replay has been added.
+
 Once published, install this exact beta with:
 
 ```sh

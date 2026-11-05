@@ -85,9 +85,11 @@ export async function startPipa(options = {}) {
   }
   const runner = createConversationRunner({ sessionStore, abortTurn: executor.abortTurn,
     interruptPrevious: () => !executor.capabilities?.backgroundResponses, runTurn: async (input) => {
-    const currentConfig = await loadCurrentConfig();
     const { preparePrompt, ...turn } = input;
     const prompt = preparePrompt ? await preparePrompt(input.signal) : input.prompt;
+    if (preparePrompt) input.signal.throwIfAborted();
+    const currentConfig = await withTimeout(loadCurrentConfig(), preparePrompt ? 15_000 : undefined,
+      "Pipa configuration read timed out.", preparePrompt ? input.signal : undefined);
     if (preparePrompt) input.signal.throwIfAborted();
     return executor.runTurn({ ...turn, prompt, defaultModel: currentConfig.defaultModel });
   } });
@@ -230,11 +232,14 @@ export async function startPipa(options = {}) {
     const currentTs = message.raw?.ts ?? message.id;
     const threadTs = message.raw?.thread_ts;
     const existingThread = Boolean(threadTs && currentTs && threadTs !== currentTs);
+    let authorizationUnknown = false;
     const authorize = async (signal) => {
       signal?.throwIfAborted();
       if (!accepting) throw new PipaStoppedError();
-      const current = await loadCurrentConfig();
+      authorizationUnknown = true;
+      const current = await withTimeout(loadCurrentConfig(), 15_000, "Slack authorization could not be verified.", signal);
       signal?.throwIfAborted();
+      authorizationUnknown = false;
       if (!isAuthorized(thread, message, current) || shouldIgnore(thread, message, current)
         || (current.mentionOnly && !subscribe && !message.isMention)) throw new Error("Slack destination or requester is no longer allowed.");
     };
@@ -282,7 +287,12 @@ export async function startPipa(options = {}) {
           return postResult(thread, result, signal);
         },
         deliverFailure: async (error) => {
-          if (existingThread && !isAuthorized(thread, message, await loadCurrentConfig())) return;
+          if (existingThread) {
+            if (authorizationUnknown) return;
+            const current = await withTimeout(loadCurrentConfig(), 15_000, "Slack authorization could not be verified.");
+            if (!isAuthorized(thread, message, current) || shouldIgnore(thread, message, current)
+              || (current.mentionOnly && !subscribe && !message.isMention)) return;
+          }
           return thread.post(error instanceof PipaRestartingError
           ? `${config.botName} is restarting. I'll post here when it's ready.`
           : error instanceof PipaStoppedError
@@ -783,6 +793,7 @@ function displayName(value) {
 
 export function createConversationRunner({ sessionStore, runTurn, abortTurn = async () => undefined, interruptPrevious = () => true }) {
   const latest = new Map();
+  const unsettled = new Set();
   let closed = false;
   let closeReason;
   let closing = Promise.resolve();
@@ -799,10 +810,11 @@ export function createConversationRunner({ sessionStore, runTurn, abortTurn = as
       sessionId: previous?.sessionId ?? sessionStore.get(conversationKey),
     };
     latest.set(conversationKey, turn);
+    unsettled.add(turn);
     turn.done = execute(conversationKey, turn, previous, input, reason);
     void turn.done.then(
-      () => { if (latest.get(conversationKey) === turn) latest.delete(conversationKey); },
-      () => { if (latest.get(conversationKey) === turn) latest.delete(conversationKey); },
+      () => { unsettled.delete(turn); if (latest.get(conversationKey) === turn) latest.delete(conversationKey); },
+      () => { unsettled.delete(turn); if (latest.get(conversationKey) === turn) latest.delete(conversationKey); },
     );
     return turn.done;
   }
@@ -865,15 +877,15 @@ export function createConversationRunner({ sessionStore, runTurn, abortTurn = as
       closed = true;
       closeReason ??= reason;
       const aborts = [];
+      for (const turn of unsettled) turn.controller.abort(closeReason);
       for (const turn of latest.values()) {
-        turn.controller.abort(closeReason);
         if (turn.sessionId && interruptPrevious()) aborts.push(Promise.resolve(abortTurn(turn.sessionId, closeReason)).catch(() => undefined));
       }
       closing = Promise.allSettled(aborts);
     },
     async drain() {
       await closing;
-      while (latest.size) await Promise.allSettled([...latest.values()].map((turn) => turn.done));
+      while (unsettled.size) await Promise.allSettled([...unsettled].map((turn) => turn.done));
     },
   };
 }
@@ -892,7 +904,7 @@ async function loadSlackThreadContext({ channelId, threadTs, currentTs, token, f
   let bytes = 0;
   let limitation = "";
   for (let page = 0; page < 10; page++) {
-    await authorize(signal);
+    await authorize(historySignal);
     const url = new URL("https://slack.com/api/conversations.replies");
     url.search = new URLSearchParams({ channel: channelId, ts: threadTs, latest: currentTs, inclusive: "false", limit: "100", ...(cursor ? { cursor } : {}) });
     let result;
@@ -911,7 +923,7 @@ async function loadSlackThreadContext({ channelId, threadTs, currentTs, token, f
       limitation = deadline.aborted ? "time limit" : "Slack history unavailable";
       break;
     }
-    await authorize(signal);
+    await authorize(historySignal);
     for (const message of result.messages) {
       const time = timestamp(message.ts);
       if (time === null || time >= before || seen.has(message.ts)) continue;

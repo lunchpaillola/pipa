@@ -153,6 +153,31 @@ for (const refusal of ["running", "queued", "active read failed", "inbox read fa
   assert.equal(f.requests.some((r) => r.method !== "GET" && !r.path.endsWith("/move")), false);
 });
 
+for (const outcome of ["restored", "unrelated error"]) test(`original folder re-probe before repair: ${outcome}`, async (t) => {
+  const old = "/native/deleted", target = "/native/start";
+  let probes = 0;
+  const f = await fixture(t, { onRequest: ({ url, json }) => {
+    if (url.pathname === "/api/location" && url.searchParams.get("location[directory]") === old) {
+      if (++probes === 1) json({ _tag: "LocationNotFoundError", location: { directory: old }, message: "Location missing" }, 404);
+      else if (outcome === "restored") json({ directory: old });
+      else json({ _tag: "MessageNotFoundError", message: "Unrelated second probe failure" }, 503);
+      return true;
+    }
+    if (url.pathname === "/api/session/active") { json({ data: {} }); return true; }
+    if (url.pathname.endsWith("/inbox")) { json({ data: [] }); return true; }
+  } });
+  f.sessions.set("ses_one", { location: { directory: old } });
+  const resolution = f.adapter.resolveSession("ses_one", target, new AbortController());
+  if (outcome === "restored") {
+    const prepared = await resolution;
+    assert.deepEqual(prepared, { sessionId: "ses_one", defaultEligible: false });
+    await f.adapter.execute(f.input("ses_one", { ...prepared, onResponse: async () => {} }));
+  } else await assert.rejects(resolution, /UnexpectedStatus: 503/u);
+  assert.equal(probes, 2);
+  assert.equal(f.requests.some((r) => r.path.endsWith("/move")), false);
+  assert.equal(f.requests.filter((r) => r.path.endsWith("/prompt")).length, outcome === "restored" ? 1 : 0);
+});
+
 for (const changeAt of [1, 2]) for (const healthy of [true, false, null]) test(`concurrent native move at re-read ${changeAt} is never overwritten (${healthy === null ? "ambiguous" : healthy ? "healthy" : "missing"})`, async (t) => {
   const old = "/native/deleted", updated = "/native/other";
   let reads = 0;
@@ -172,6 +197,44 @@ for (const changeAt of [1, 2]) for (const healthy of [true, false, null]) test(`
   if (healthy) assert.deepEqual(await resolution, { sessionId: "ses_one", defaultEligible: false });
   else await assert.rejects(resolution, healthy === null ? /invalid session location/u : /Location missing/u);
   assert.equal(probes.filter((directory) => directory === updated).length, healthy === null ? 0 : 1);
+  assert.equal(f.requests.some((r) => r.method !== "GET"), false);
+});
+
+for (const reprobe of ["restored", "untyped error", "different missing location"]) test(`missing-location repair rechecks the original folder: ${reprobe}`, async (t) => {
+  const old = "/native/restored", target = "/native/start";
+  let probes = 0;
+  const f = await fixture(t, { onRequest: ({ url, json }) => {
+    if (url.pathname === "/api/session/ses_one") { json({ data: { id: "ses_one", location: { directory: old }, model: { providerID: "native", id: "kept" } } }); return true; }
+    if (url.pathname === "/api/location") {
+      if (url.searchParams.get("location[directory]") !== old) json({ directory: target });
+      else if (++probes === 1) json({ _tag: "LocationNotFoundError", location: { directory: old }, message: "Missing" }, 404);
+      else if (reprobe === "restored") json({ directory: old });
+      else json({ _tag: reprobe === "untyped error" ? "MessageNotFoundError" : "LocationNotFoundError", location: { directory: "/unrelated" }, message: "Reprobe failed" }, 404);
+      return true;
+    }
+    if (url.pathname === "/api/session/active") { json({ data: {} }); return true; }
+    if (url.pathname.endsWith("/inbox")) { json({ data: [] }); return true; }
+  } });
+  const resolution = f.adapter.resolveSession("ses_one", target, new AbortController());
+  if (reprobe === "restored") assert.deepEqual(await resolution, { sessionId: "ses_one", defaultEligible: false });
+  else await assert.rejects(resolution, /Reprobe failed/u);
+  assert.equal(probes, 2);
+  assert.equal(f.requests.some((r) => r.method !== "GET"), false);
+});
+
+for (const malformed of ["activity", "inbox"]) test(`missing-location repair refuses malformed successful ${malformed}`, async (t) => {
+  const old = "/native/deleted";
+  const f = await fixture(t, { onRequest: ({ url, json }) => {
+    if (url.pathname === "/api/session/ses_one") { json({ data: { id: "ses_one", location: { directory: old }, model: { providerID: "native", id: "kept" } } }); return true; }
+    if (url.pathname === "/api/location") {
+      if (url.searchParams.get("location[directory]") === old) json({ _tag: "LocationNotFoundError", location: { directory: old }, message: "Missing" }, 404);
+      else json({ directory: "/native/start" });
+      return true;
+    }
+    if (url.pathname === "/api/session/active") { json({ data: malformed === "activity" ? [] : {} }); return true; }
+    if (url.pathname.endsWith("/inbox")) { json({ data: malformed === "inbox" ? {} : [] }); return true; }
+  } });
+  await assert.rejects(f.adapter.resolveSession("ses_one", "/native/start", new AbortController()));
   assert.equal(f.requests.some((r) => r.method !== "GET"), false);
 });
 

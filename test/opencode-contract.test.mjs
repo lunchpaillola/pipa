@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { access, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -260,12 +260,20 @@ test("Slack thread context and folder repair compose into one native request", a
   assert.equal(wire.calls.some((call) => call.path === "/api/session" && call.method === "POST"), false);
 });
 
-for (const notice of ["delivered", "failed", "revoked", "shutdown", "aborted onSession"]) test(`confirmed folder recovery through real executor: notice ${notice}`, async (t) => {
+for (const notice of ["delivered", "failed", "revoked", "shutdown", "aborted onSession", "never settles"]) test(`confirmed folder recovery through real executor: notice ${notice}`, async (t) => {
   const old = "/native/deleted-checkout";
   let directory = old;
   const order = [];
   const controller = new AbortController();
-  const current = await fixture(t, "v2", { transport: async (url, init, next) => {
+  const noticeStarted = Promise.withResolvers();
+  const removed = [];
+  const current = await fixture(t, "v2", { executorOptions: { rm: async (directory, options) => {
+    if (notice === "never settles") {
+      assert.equal(await readFile(path.join(directory, "1-notes.txt"), "utf8"), "current file retained");
+      removed.push(directory);
+    }
+    return rm(directory, options);
+  } }, transport: async (url, init, next) => {
     const parsed = new URL(url);
     if (parsed.pathname === "/api/location" && parsed.searchParams.get("location[directory]") === old) {
       order.push("missing");
@@ -303,6 +311,10 @@ for (const notice of ["delivered", "failed", "revoked", "shutdown", "aborted onS
       assert.ok(order.indexOf("confirmed") > order.indexOf("move"));
       assert.equal(order.includes("prompt"), false);
       order.push("notice");
+      if (notice === "never settles") {
+        noticeStarted.resolve();
+        return new Promise(() => {});
+      }
       await Promise.resolve();
       if (notice === "failed") throw error;
       if (notice === "revoked") controller.abort(error);
@@ -310,6 +322,13 @@ for (const notice of ["delivered", "failed", "revoked", "shutdown", "aborted onS
     },
     onResponse: async (response) => responses.push(response),
   });
+  if (notice === "never settles") {
+    await bounded(noticeStarted.promise);
+    controller.abort(error);
+    await assert.rejects(bounded(run, { timeoutMs: 1000, label: "aborted recovery notice releases turn" }), (failure) => failure === error);
+    assert.equal(removed.length, 1);
+    await assert.rejects(access(removed[0]), { code: "ENOENT" });
+  }
   if (notice !== "delivered") {
     await assert.rejects(run, (failure) => failure === error);
     assert.equal(order.includes("prompt"), false);
@@ -335,6 +354,41 @@ for (const notice of ["delivered", "failed", "revoked", "shutdown", "aborted onS
   assert.equal(result.text, "Done.");
   assert.equal(result.files[0].data.toString(), "contained output");
   assert.equal(result.text.includes(artifactDirectory), false);
+});
+
+test("aborting a pending recovery notice releases the executor without admitting a prompt", async (t) => {
+  const old = "/native/deleted-checkout";
+  let directory = old;
+  const controller = new AbortController();
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const current = await fixture(t, "v2", { transport: async (url, init, next) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === "/api/location" && parsed.searchParams.get("location[directory]") === old) return Response.json({ _tag: "LocationNotFoundError", location: { directory: old }, message: "Missing" }, { status: 404 });
+    if (parsed.pathname === "/api/session/ses_contract") {
+      const body = await (await next(url, init)).json();
+      body.data.location = { directory };
+      body.data.model = { providerID: "fixture", id: "retained" };
+      return Response.json(body);
+    }
+    if (parsed.pathname.endsWith("/move")) {
+      directory = JSON.parse(init.body).directory;
+      return new Response(null, { status: 204 });
+    }
+    return next(url, init);
+  } });
+  const error = new Error("Cancelled while posting recovery notice");
+  const run = current.executor.runTurn({ ...current.input, signal: controller.signal,
+    onLocationRecovered: async () => { entered.resolve(); await release.promise; } });
+  try {
+    await entered.promise;
+    controller.abort(error);
+    await assert.rejects(bounded(run, { timeoutMs: 1000, label: "aborted recovery notice" }), (failure) => failure === error);
+    assert.equal(current.wire.calls.some((call) => call.path.endsWith("/prompt") || call.method === "PUT"), false);
+  } finally {
+    release.resolve();
+    await run.catch(() => undefined);
+  }
 });
 
 test("v1 baseline: exact prompt, trusted context and persisted-session continuation", async (t) => {

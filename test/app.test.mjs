@@ -89,18 +89,19 @@ async function threadContextApp(t, options = {}) {
     post: async (payload) => { posts.push(payload); return options.post?.(payload); } };
   const app = await startPipa({ config, checkSlackToken: async () => ({ ok: true }),
     loadCurrentConfig: options.loadCurrentConfig ?? (async () => config),
-    sessionStore: { keys: () => [], get: () => "ses_existing", set: async () => undefined },
+    sessionStore: options.sessionStore ?? { keys: () => [], get: () => "ses_existing", set: async () => undefined },
     slackFetch: async (url, input) => {
       reads.push({ url: new URL(url), input });
       return options.slackFetch ? options.slackFetch(url, input) : Response.json({ ok: true, messages: [] });
     },
     executor: { capabilities: { backgroundResponses: options.background === true },
+      abortTurn: options.abortTurn,
       runTurn: async (input) => { calls.push(input); return options.runTurn ? options.runTurn(input) : { text: "done", sessionId: "ses_existing" }; }, stopAll() {} },
     chat: { onNewMention: (fn) => { handlers.mention = fn; }, onSubscribedMessage: (fn) => { handlers.reply = fn; }, initialize: async () => undefined, shutdown: async () => undefined } });
   t.after(() => app.shutdown());
   const send = (id = "4.000001", overrides = {}, destination = thread) => handlers.mention(destination,
     { id, text: "<@U1> current request", author: { userId: "U1" }, raw: { thread_ts: "1.000001", ts: id }, ...overrides });
-  return { app, config, thread, calls, reads, posts, finished, send };
+  return { app, config, thread, calls, reads, posts, finished, send, reply: handlers.reply };
 }
 
 test("confirmed folder recovery is announced before the request continues without exposing paths", async (t) => {
@@ -153,6 +154,22 @@ test("Slack thread context skips top-level events even when Chat assigns a threa
     assert.equal(input.prompt, "current request\n\nFull links:\nhttps://example.com/current");
     assert.deepEqual(input.attachments, [attachment]);
   }
+});
+
+test("Slack thread context loads the saved default model after pending history preparation", async (t) => {
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let current = { defaultModel: { providerID: "provider", modelID: "old" } };
+  const fixture = await threadContextApp(t, { loadCurrentConfig: async () => current,
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+    slackFetch: async () => { entered.resolve(); await release.promise; return Response.json({ ok: true, messages: [] }); } });
+  fixture.send();
+  await entered.promise;
+  current = { defaultModel: { providerID: "provider", modelID: "fresh" } };
+  release.resolve();
+  await waitFor(() => fixture.finished.length === 1);
+  assert.deepEqual(fixture.calls[0].defaultModel, current.defaultModel);
+  assert.equal(fixture.calls[0].sessionId, null, "A newly created session must receive the fresh fallback");
 });
 
 for (const failure of ["missing scope", "rate limited", "transport", "invalid JSON"]) test(`Slack thread context falls back safely when ${failure}`, async (t) => {
@@ -227,6 +244,232 @@ test("Slack thread context uses one overall fifteen-second deadline and no retry
   assert.equal(fixture.reads.length, 1);
 });
 
+test("Slack thread context chooses the latest default model after preparing history", async (t) => {
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const fixture = await threadContextApp(t, { config: { defaultModel: { providerID: "test", modelID: "old" } },
+    loadCurrentConfig: async () => ({ ...fixture.config }),
+    slackFetch: async () => { entered.resolve(); await release.promise; return Response.json({ ok: true, messages: [] }); } });
+  fixture.send();
+  await entered.promise;
+  fixture.config.defaultModel = { providerID: "test", modelID: "new" };
+  release.resolve();
+  await waitFor(() => fixture.finished.length === 1);
+  assert.deepEqual(fixture.calls[0].defaultModel, fixture.config.defaultModel);
+});
+
+test("Slack thread failure delivery respects a newly enabled mention-only gate", async (t) => {
+  const fixture = await threadContextApp(t, { slackFetch: async () => {
+    fixture.config.mentionOnly = true;
+    return Response.json({ ok: true, messages: [] });
+  } });
+  fixture.reply(fixture.thread, { id: "4.000001", text: "current request", isMention: false,
+    author: { userId: "U1" }, raw: { ts: "4.000001", thread_ts: "1.000001" } });
+  await waitFor(() => fixture.finished.length === 1);
+  assert.equal(fixture.calls.length, 0);
+  assert.deepEqual(fixture.posts, []);
+});
+
+function mockHistoryDeadline(t) {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  // Node's native AbortSignal.timeout does not use the mocked JS timers.
+  t.mock.method(AbortSignal, "timeout", (ms) => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new DOMException("Timed out", "TimeoutError")), ms);
+    return controller.signal;
+  });
+}
+
+test("Slack thread context shares the deadline across slow pages", async (t) => {
+  mockHistoryDeadline(t);
+  const secondPage = Promise.withResolvers();
+  let pages = 0;
+  const fixture = await threadContextApp(t, { slackFetch: async () => {
+    pages++;
+    if (pages === 1) return new Promise((resolve) => setTimeout(() => resolve(Response.json({ ok: true,
+      messages: [{ ts: "1.000001", text: "collected root" }], response_metadata: { next_cursor: "next" } })), 8_000));
+    secondPage.resolve();
+    return new Promise((resolve) => setTimeout(() => resolve(Response.json({ ok: true,
+      messages: [{ ts: "2.000001", text: "too late" }] })), 8_000));
+  } });
+  fixture.send();
+  await new Promise((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(8_000);
+  await secondPage.promise;
+  t.mock.timers.tick(7_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.calls.length, 1);
+  assert.match(fixture.calls[0].prompt, /partial \(time limit\)/u);
+  assert.match(fixture.calls[0].prompt, /collected root/u);
+  assert.doesNotMatch(fixture.calls[0].prompt, /too late/u);
+  assert.equal(pages, 2);
+});
+
+test("Slack thread context multipage deadline includes a slow first page and stalled second page", async (t) => {
+  mockHistoryDeadline(t);
+  const secondPage = Promise.withResolvers();
+  const fixture = await threadContextApp(t, { slackFetch: async (_url, { signal }) => {
+    if (fixture.reads.length === 1) return new Promise((resolve) => setTimeout(() => resolve(Response.json({ ok: true,
+      messages: [{ ts: "1.000001", text: "collected before deadline" }], response_metadata: { next_cursor: "next" } })), 12_000));
+    secondPage.resolve();
+    return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+  } });
+  fixture.send();
+  await new Promise((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(12_000);
+  await secondPage.promise;
+  t.mock.timers.tick(2_999);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.calls.length, 0, "Do not finish before the overall fifteen-second deadline");
+  t.mock.timers.tick(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.calls.length, 1, "A second page must not receive a fresh fifteen-second budget");
+  assert.equal(fixture.reads.length, 2);
+  assert.match(fixture.calls[0].prompt, /partial \(time limit\)/u);
+  assert.match(fixture.calls[0].prompt, /collected before deadline/u);
+});
+
+test("Slack thread authorization config reads share the history deadline and do not retry failure authorization", async (t) => {
+  mockHistoryDeadline(t);
+  const stalled = Promise.withResolvers();
+  let configReads = 0;
+  const fixture = await threadContextApp(t, { loadCurrentConfig: async () => {
+    if (++configReads === 1) return {};
+    stalled.resolve();
+    return new Promise(() => undefined);
+  }, slackFetch: async () => new Promise((resolve) => setTimeout(() => resolve(Response.json({ ok: true, messages: [] })), 12_000)) });
+  fixture.send();
+  await new Promise((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(12_000);
+  await stalled.promise;
+  t.mock.timers.tick(2_999);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.finished.length, 0);
+  t.mock.timers.tick(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.finished.length, 1);
+  assert.equal(configReads, 2, "Unknown authorization must not start another stalled read in failure delivery");
+  assert.equal(fixture.calls.length, 0);
+  assert.deepEqual(fixture.posts, []);
+});
+
+for (const phase of ["before history", "after history", "before admission"]) test(`Slack thread authorization cancellation settles a stalled config read ${phase}`, async (t) => {
+  const stalled = Promise.withResolvers();
+  let configReads = 0;
+  const stalledRead = { "before history": 1, "after history": 2, "before admission": 3 }[phase];
+  const fixture = await threadContextApp(t, { background: true, loadCurrentConfig: async () => {
+    if (++configReads < stalledRead) return {};
+    stalled.resolve();
+    return new Promise(() => undefined);
+  } });
+  fixture.send();
+  await stalled.promise;
+  let timeout;
+  try {
+    await Promise.race([fixture.app.shutdown(), new Promise((_, reject) => {
+      timeout = setTimeout(() => reject(new Error("Shutdown waited for stalled authorization")), 500);
+    })]);
+    assert.equal(fixture.calls.length, 0);
+    assert.deepEqual(fixture.posts, []);
+    assert.equal(configReads, stalledRead);
+  } finally {
+    clearTimeout(timeout);
+  }
+});
+
+test("Slack thread failure delivery bounds its own config read and suppresses unknown authorization", async (t) => {
+  mockHistoryDeadline(t);
+  const stalled = Promise.withResolvers();
+  let configReads = 0;
+  const fixture = await threadContextApp(t, { loadCurrentConfig: async () => {
+    if (++configReads <= 4) return {};
+    stalled.resolve();
+    return new Promise(() => undefined);
+  }, runTurn: async () => { throw new Error("request failed xoxb-must-not-leak"); } });
+  fixture.send();
+  await stalled.promise;
+  t.mock.timers.tick(15_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.finished.length, 1);
+  assert.equal(configReads, 5);
+  assert.deepEqual(fixture.posts, []);
+});
+
+for (const reason of [new PipaStoppedError(), new PipaRestartingError()]) test(`Slack thread context keeps an authorized ${reason.constructor.name} notice`, async (t) => {
+  const entered = Promise.withResolvers();
+  const fixture = await threadContextApp(t, { slackFetch: async (_url, { signal }) => {
+    entered.resolve();
+    return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+  } });
+  fixture.send();
+  await entered.promise;
+  fixture.app.stop(reason);
+  await waitFor(() => fixture.finished.length === 1);
+  assert.equal(fixture.calls.length, 0);
+  assert.equal(fixture.posts.length, 1);
+  assert.match(fixture.posts[0], reason instanceof PipaRestartingError ? /is restarting/u : /was stopped/u);
+});
+
+for (const phase of ["before first read", "after page", "final admission"]) test(`Slack thread authorization fails closed on a stalled config read ${phase}`, async (t) => {
+  mockHistoryDeadline(t);
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let reads = 0;
+  const stalledRead = { "before first read": 1, "after page": 2, "final admission": 3 }[phase];
+  const fixture = await threadContextApp(t, { loadCurrentConfig: async () => {
+    if (++reads === stalledRead) { entered.resolve(); await release.promise; }
+    return { botName: "Pipa", workingDirectory: "/work" };
+  } });
+  fixture.send();
+  await entered.promise;
+  try {
+    t.mock.timers.tick(15_000);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(fixture.finished.length, 1, "Authorization must settle without waiting for config IO");
+    assert.equal(fixture.calls.length, 0);
+    assert.equal(fixture.reads.length, phase === "before first read" ? 0 : 1);
+    assert.equal(fixture.posts.some((post) => post?.markdown), false);
+  } finally {
+    release.resolve();
+  }
+});
+
+test("closing a native-steering runner aborts every inflight local turn and drains them", async () => {
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const signals = [];
+  const aborts = [];
+  const runner = createConversationRunner({ interruptPrevious: () => false,
+    sessionStore: { get: () => null, set: async () => undefined },
+    abortTurn: async (...args) => aborts.push(args),
+    runTurn: async ({ signal, onSession }) => {
+      signals.push(signal);
+      await onSession("ses_native");
+      entered.resolve();
+      await Promise.race([release.promise, new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }))]);
+      await release.promise;
+      signal.throwIfAborted();
+    } });
+  const first = runner.enqueue("A", {}).catch(() => undefined);
+  await entered.promise;
+  const queued = runner.enqueue("A", {}).catch(() => undefined);
+  runner.close();
+  let drained = false;
+  const draining = runner.drain().then(() => { drained = true; });
+  try {
+    assert.equal(signals[0].aborted, true);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(drained, false);
+    assert.deepEqual(aborts, []);
+  } finally {
+    // Also release the old implementation so a failing regression cannot hang cleanup.
+    release.resolve();
+  }
+  await Promise.all([first, queued, draining]);
+  assert.equal(signals.length, 1);
+  assert.equal(drained, true);
+});
+
 test("Slack thread context rejects denied traffic before reading and rechecks authorization before admission", async (t) => {
   const entered = Promise.withResolvers();
   const release = Promise.withResolvers();
@@ -276,6 +519,27 @@ test("Slack thread context rechecks authorization after posting a limitation not
   assert.match(fixture.posts[0], /discussion is unavailable/u);
 });
 
+test("Slack thread context suppresses queued subscribed failure after mention-only is enabled", async (t) => {
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const fixture = await threadContextApp(t, { background: true, slackFetch: async () => {
+    entered.resolve();
+    await release.promise;
+    return Response.json({ ok: true, messages: [] });
+  } });
+  fixture.send();
+  await entered.promise;
+  fixture.reply(fixture.thread, { id: "5.000001", text: "unmentioned queued request", author: { userId: "U1" },
+    raw: { ts: "5.000001", thread_ts: "1.000001" } });
+  await new Promise((resolve) => setImmediate(resolve));
+  fixture.config.mentionOnly = true;
+  release.resolve();
+  await waitFor(() => fixture.finished.length === 2);
+  assert.equal(fixture.calls.length, 1);
+  assert.equal(fixture.reads.length, 1);
+  assert.deepEqual(fixture.posts, [{ markdown: "done" }]);
+});
+
 test("Slack thread context uses message ID when the raw timestamp is absent", async (t) => {
   const fixture = await threadContextApp(t);
   fixture.send("4.000001", { raw: { thread_ts: "1.000001" } });
@@ -310,6 +574,36 @@ for (const mode of ["shutdown", "replacement", "native steering"]) test(`Slack t
   await waitFor(() => fixture.calls.length === (mode === "replacement" ? 2 : 3));
   assert.match(fixture.calls.at(-1).prompt, /newer request$/u);
   assert.equal(fixture.calls.filter((input) => input.prompt.endsWith("current request")).length, mode === "replacement" ? 0 : 1);
+});
+
+test("Slack thread context shutdown aborts earlier native-steering preparation with a newer turn queued", async (t) => {
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let historySignal;
+  const fixture = await threadContextApp(t, { background: true,
+    abortTurn: () => assert.fail("V2 shutdown must not interrupt native sessions"),
+    slackFetch: async (_url, { signal }) => {
+      historySignal = signal;
+      entered.resolve();
+      await Promise.race([release.promise, new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }))]);
+      return Response.json({ ok: true, messages: [] });
+    } });
+  fixture.send();
+  await entered.promise;
+  fixture.send("5.000001");
+  await new Promise((resolve) => setImmediate(resolve));
+  let timeout;
+  try {
+    await Promise.race([fixture.app.shutdown(), new Promise((_, reject) => {
+      timeout = setTimeout(() => reject(new Error("Shutdown waited for history instead of cancelling it")), 500);
+    })]);
+    assert.equal(historySignal.aborted, true);
+    assert.equal(fixture.calls.length, 0);
+    assert.equal(fixture.reads.length, 1);
+  } finally {
+    clearTimeout(timeout);
+    release.resolve();
+  }
 });
 
 test("invalid display names still fail before Slack or OpenCode startup", async () => {
