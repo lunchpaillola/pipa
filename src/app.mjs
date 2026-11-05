@@ -879,6 +879,8 @@ export function createConversationRunner({ sessionStore, runTurn, abortTurn = as
 }
 
 async function loadSlackThreadContext({ channelId, threadTs, currentTs, token, fetchImpl, signal, authorize }) {
+  const contextBytes = 24 * 1024;
+  const framingReserveBytes = 1024;
   const deadline = AbortSignal.timeout(15_000);
   const historySignal = AbortSignal.any([signal, deadline]);
   const timestamp = (value) => typeof value === "string" && /^\d+\.\d{1,6}$/u.test(value)
@@ -928,12 +930,11 @@ async function loadSlackThreadContext({ channelId, threadTs, currentTs, token, f
         timestamp: message.ts, text: message.text ?? "", links: [...links],
         attachments: (message.files ?? []).map((file) => file.name ?? file.title).filter((name) => typeof name === "string") })}\n`;
       const size = Buffer.byteLength(line);
-      // Reserve space for the quoted-context framing and limitation metadata.
-      if (size > 24 * 1024 - 1024) { limitation = "byte limit"; continue; }
+      if (size > contextBytes - framingReserveBytes) { limitation = "byte limit"; continue; }
       records.push({ ts: message.ts, time, line, size });
       bytes += size;
       records.sort((a, b) => a.time < b.time ? -1 : a.time > b.time ? 1 : 0);
-      while (bytes > 24 * 1024 - 1024) {
+      while (bytes > contextBytes - framingReserveBytes) {
         const index = records[0].ts === threadTs && records.length > 1 ? 1 : 0;
         bytes -= records.splice(index, 1)[0].size;
         limitation = "byte limit";
