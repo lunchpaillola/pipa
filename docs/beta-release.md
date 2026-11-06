@@ -1,15 +1,25 @@
-# Pipa 0.6.0-beta.4 (beta channel)
+# Pipa 0.6.0-beta.5 (beta channel)
 
 Preparation notes for an opt-in beta. This document does not mean the version has
 been published. Normal npm installs must continue to receive stable `0.5.6`
 unless the owner separately approves a stable release.
 
-The next release increments published beta `0.6.0-beta.3` to `0.6.0-beta.4`.
+This candidate increments `0.6.0-beta.4` to `0.6.0-beta.5`.
 Earlier preparation versions `0.6.2` and `0.6.3` were never published and are
 superseded. Publish only to npm's `beta` tag and mark the GitHub release
 **Pre-release**. Do not move `latest` or treat the version as stable qualification.
 
-## Changes from 0.6.0-beta.3
+## Changes from 0.6.0-beta.4
+
+- Read preceding Slack thread discussion directly with Pipa's bot token. No Composio dependency or adapter history reader is used. New top-level requests skip the read; partial or unavailable context is identified. Historical messages are context, not new action permission.
+- Config reads have no Pipa-added deadline and remain cancellable. History access is checked before reading and after preparation, not around every page. History limitations stay in the prompt without a separate Slack warning; cancelled turns finish silently. The replacement's restart-ready notification remains.
+- When OpenCode explicitly rejects a v2 prompt because its working folder is missing, queue a native move of the same conversation to the configured starting folder, await the location change, and submit that definitely rejected request once. Do not veto native active/queued work or replay uncertain requests. The short heads-up is best-effort; missing files are not restored.
+- Remove v1's installation-wide lockouts after failed admission or cancellation and its request-error shutdown path. Fail the affected turn without resubmitting prompts, adding recovery notices or disabling other threads. A lost admission acknowledgement no longer triggers automatic native cancellation. Explicit stop/restart, actual owned-process exit, normal v1 cancellation and same-thread ordering remain.
+- Keep current server ownership and start/stop/restart behavior, selected models, attachment handling, and artifact publication boundaries.
+
+Actual bot-token access and isolated native recovery require qualification before publication. Preparation alone does not approve tagging, publishing, or installing this candidate.
+
+## Retained changes from 0.6.0-beta.3
 
 - Restore the restart instructions that preserve the Slack channel/thread for the replacement process's ready notification. Instructions retain the correct Pipa host/profile and durable status check; the restart worker and native background-response behavior are unchanged.
 - Regression coverage includes threaded and channel-only Slack requests, non-Slack fallback, remote attached-host guidance and isolated profile-home instructions. Live Slack restart delivery has not been rerun.
@@ -21,15 +31,27 @@ superseded. Publish only to npm's `beta` tag and mark the GitHub release
 - Closing the model picker cancels pending discovery and prevents a late update. V1 retains a 30-second discovery limit, starting only after readiness; v2 has no Pipa-added discovery deadline. Cached search and Save do not rediscover the catalog.
 - Explicitly selected routine prompt files may live outside the configured working directory, including symlinked files. Regular-file, identity, size and concurrent-change checks remain.
 - OpenCode v2 web-search setup can be answered in Slack: Allow, Disable and Choose another provider, followed by the provider picker when needed.
-- Simple visible text and multiselect forms use Slack question controls regardless of their metadata kind or field names. Unsupported shapes still require an OpenCode client; native validation and session/workspace authorization remain in place.
+- Simple visible text and multiselect forms use Slack question controls regardless of their metadata kind or field names. Other pending session forms use Slack alternatives rather than an OpenCode-client redirect; native validation and session authorization remain in place.
 - Large model-search results stay within Slack's response-size limit. Models omitted from the initial results remain searchable.
 
 - Slack choices preserve native option values even when labels repeat; typed custom answers are no longer interpreted as option labels. Optional text fields accept an empty string, optional multiselects accept an empty selection, and Skip omits the field from the native answer. Native validation can still reject an answer that violates field constraints. Automated Slack-to-native HTTP fixtures cover these cases; a live Slack form smoke has not run.
 - An empty model picker explains the terminal provider-connection command and directs attached-server users to their operator.
 
-Unsupported numeric, boolean, hidden, conditional and external-action forms still
-have a dead-end OpenCode-client notice. This is an unresolved Slack UX gap, not an
-acceptable end-user workaround. See the [redirect audit and renderer research](research/slack-forms-and-opencode-redirects.md).
+Numeric, boolean, hidden/default, conditional and external-action session forms
+are part of the Slack completion path. Native validation failures leave an
+editable response, and dismissing a form uses native cancellation. Provider
+connection from Slack remains separate in [issue #68](https://github.com/lunchpaillola/pipa/issues/68).
+The [redirect audit](research/slack-forms-and-opencode-redirects.md) records the
+earlier behavior; its unsupported-form disposition is superseded by this change.
+
+The native form check on OpenCode 2.2.5/macOS passed 13 scenarios and checked 35
+rendered payloads, including all six field types, source-shaped web-search setup
+and provider lists up to 2,000 options, oversized links/text, multiline answers,
+defaults/conditions, rejection/retry, cancellation and actual question-tool
+execution resumption. The local scripted provider used no external credentials.
+Slack transport and detail-file uploads were captured, not sent to live Slack;
+these results do not qualify live rendering, provider authentication or every
+future plugin form. Reproduce with `scripts/verification/slack-forms-native.mjs`.
 
 ## Retained changes from 0.6.0-beta.1
 
@@ -124,7 +146,7 @@ contract fixtures and beta publish dry-run (13 expected public files). The
 release Git tag was confirmed absent. No runtime code changed in the version
 correction; no package or GitHub release has been published.
 
-### Current 0.6.0-beta.4 preparation
+### Historical 0.6.0-beta.4 preparation
 
 On November 4, 2026, npm `beta` was `0.6.0-beta.3`, `latest` was `0.5.6`,
 and `0.6.0-beta.4` and its Git tag were unused. PR #66 contains the restart fix
@@ -143,10 +165,38 @@ This host did not rerun Linux or Windows native smoke. The historical Windows
 cleanup failure remains unresolved. External restart worker-PID observation is
 excluded by the beta smoke contract. Full release qualification remains false.
 
+### Current 0.6.0-beta.5 preparation
+
+On November 5, 2026, the registry reported `beta` as `0.6.0-beta.4` and
+`latest` as `0.5.6`. The `0.6.0-beta.5` registry entry returned not found, and
+the matching Git tag was absent. Recheck both immediately before publication.
+This candidate does not change the running installation or either npm tag.
+
+Preparation checks on macOS with Node 22.23.2:
+
+- All 532 tests passed with no failures or skips. The first full run exposed five native model-picker test fixtures missing the new direct-history response; supplying that fixture preserved their existing reply assertions. The complete suite then passed.
+- Installed-package smoke passed for the 1.19.0, 2.0.29 and 2.2.5 contract fixtures.
+- All 26 verification self-checks passed.
+- Historical, pre-simplification check: a credential-clean OpenCode 2.2.5 check confirmed same-session relocation after removing an empty test-owned folder. That earlier implementation refused a second session with queued work; this refusal has since been removed.
+- The repeatable `node scripts/verification/slack-location-native.mjs` now exercises the shipped executor against real OpenCode 2.2.5 with persisted idle and queued-work sessions. After restarting only the disposable engine and removing each empty test folder, both cases preserve session/history/model, reject the current prompt before admission, move natively, and store/complete that current request once. Previously queued work also completes once without Pipa replay. Cleanup passed. This uses a deterministic local provider, not live Slack or an external provider.
+- The macOS native beta smoke passed all 24 applicable observations across OpenCode 1.19.0 and 2.2.5 in Socket-owned, attached and Managed modes. Startup, exact prompt/history, applicable restart and stop ownership passed; report cleanup passed. This uses a scripted local provider and fake Chat, not live Slack.
+- `npm publish --dry-run --tag beta --access public` contained 13 expected public files at `0.6.0-beta.5`, with no profile data or credentials. No package was published.
+
+The earlier targeted native check did not execute a model task or use an external provider;
+the recovery-simplification check above executes deterministic local model tasks.
+Live Slack bot-token access, provider-backed continuation, Linux/Windows native
+behavior, and whole-release qualification remain separate. No current production
+session was repaired or restarted.
+
+Recovery heads-up delivery is best-effort, not durable. Failed or stalled Slack
+notice delivery does not block the recovered request. Authorization revocation
+and caller/shutdown cancellation still stop continuation. No recovery-delivery
+journal or notice replay has been added.
+
 Once published, install this exact beta with:
 
 ```sh
-npm install --global @usepipa/pipa@0.6.0-beta.4
+npm install --global @usepipa/pipa@0.6.0-beta.5
 ```
 
 For an existing daily installation, schedule a separate maintenance window:
@@ -163,16 +213,16 @@ needs a separate matched-snapshot backup/rollback plan; see
 
 ## Publisher checklist
 
-PR #66 contains the restart fix and this release preparation. The release
-metadata update changes no routine model-selection behavior: a saved routine
-model is passed explicitly; an unset model is left to OpenCode's native default.
+This candidate adds thread context and missing-folder recovery on top of PR #66's
+restart fix. Routine model selection is unchanged: a saved routine model is
+passed explicitly; an unset model is left to OpenCode's native default.
 The agent may merge after owner approval and passing CI; the owner tags and publishes to npm. Release tagging and GitHub
 prerelease creation must target the actual merged commit, never the unmerged
 feature head. Installation remains a separate cutover.
 
 1. Recheck PR feedback and required CI for the exact beta commit. Run the [controlled-beta checks](../CONTRIBUTING.md#controlled-beta), including the installed-package smoke and publish dry-run. Record limitations separately from passing checks.
-2. Immediately before publication, run `npm view @usepipa/pipa dist-tags versions --json`. Confirm `0.6.0-beta.4` is still unused. At preparation on November 4, 2026, `beta` was `0.6.0-beta.3` and `latest` was `0.5.6`. Stop if the registry changed unexpectedly.
-3. After PR #66 is merged and required CI passes, check out the actual merged commit in a clean release checkout, verify both package files say `0.6.0-beta.4`, and rerun the package checks/dry-run there. Tag that merged commit `v0.6.0-beta.4`; never tag the old feature head by mistake. Create its GitHub release as **Pre-release**, not latest, using these changes and limits as the notes. Tagging and GitHub release creation do not publish to npm.
+2. Immediately before publication, run `npm view @usepipa/pipa dist-tags versions --json`. Confirm `0.6.0-beta.5` is still unused and record the current `beta` and `latest` tags. Stop if the registry changed unexpectedly.
+3. After this candidate PR is merged and required CI passes, check out the actual merged commit in a clean release checkout, verify both package files say `0.6.0-beta.5`, and rerun the package checks/dry-run there. Tag that merged commit `v0.6.0-beta.5`; never tag the unmerged feature head. Create its GitHub release as **Pre-release**, not latest, using these changes and limits as the notes. Tagging and GitHub release creation do not publish to npm.
 4. The owner publishes from that release checkout:
 
 ```sh
@@ -180,5 +230,5 @@ npm publish --tag beta --access public
 npm view @usepipa/pipa dist-tags --json
 ```
 
-5. Verify `beta` is `0.6.0-beta.4` and `latest` matches the value recorded before publishing. Verify the published version and matching GitHub prerelease. Do not mark it stable/latest.
+5. Verify `beta` is `0.6.0-beta.5` and `latest` matches the value recorded before publishing. Verify the published version and matching GitHub prerelease. Do not mark it stable/latest.
 6. Arrange the daily-installation cutover separately. Later beta fixes need a new unused version; do not overwrite a published version.

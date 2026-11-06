@@ -25,11 +25,17 @@ Pipa connects Slack to OpenCode. It should not invent execution failures for beh
 - **Startup readiness probes and explicit harness deadlines** (`opencode.mjs`): remain separate from native execution requests, alongside caller cancellation and owned-process shutdown. Slack acknowledgment/UI-expiry timers and legacy v1 discovery limits are unchanged.
 - **Observer readiness, cancellation and duplicate-delivery handling** (`opencode-v2.mjs`, `app.mjs`): avoid admitting work without an attached result path, posting after shutdown or replaying already-sent chunks. They are integration lifecycle checks, not native execution deadlines.
 - **State, routine and process validation** (`state.mjs`, `routines.mjs`, `restart.mjs`, `bin/pipa.mjs`): protect persisted mappings, exact destinations, schedules, single-instance locks and owned restart handoffs. Removing them can lose continuity or target the wrong process/destination.
-- **Permission/question translation and native-client fallback** (`opencode-v2.mjs`): validate Slack decisions before translating them, preserve editable controls when native submission fails, and avoid pretending Slack can answer unsupported rich forms.
+- **Permission and form translation** (`opencode-v2.mjs`, `app.mjs`): keep pending session forms in Slack, preserve typed native answers and explicit external-action acknowledgments, and leave controls editable when native submission fails. Slack authorization and native session ancestry still govern who can answer; opening an OpenCode client is not a fallback.
+
+## Narrow missing-folder repair
+
+V2 submits the current request normally. Only a prompt-time `LocationNotFoundError` matching the same session's current directory triggers one native queued move to the configured starting folder. Pipa waits for the native location to change, with caller/shutdown cancellation, then submits the definitely rejected request once using the same message ID and payload. It does not inspect or veto active or queued work. Normal folder switches remain valid, history and model identity are retained, and missing source files are not restored.
+
+The short heads-up, “The old working folder is no longer available,” is best-effort: a failed or stalled Slack post does not gate continuation. Slack authorization is still checked before the recovered request continues. A pending native move is awaited, not treated as immediate failure. Native move failure, unrelated errors, retry rejection and transport uncertainty do not start another recovery attempt. V1 receives no new location-repair policy. Recovery remains separate from reconnect, response catch-up and process ownership.
 
 ## Deliberately separate legacy behavior
 
-V1 still uses interrupt-and-replace and blocks intake after uncertain admission/cancellation. It does not have v2's independent native steering semantics. Removing those guards without replacing the v1 attribution contract can report another turn's output, so this PR does not mechanically delete them. That is remaining Pipa policy, not a claim that all extra behavior has been removed.
+V1 still uses interrupt-and-replace, not v2's independent native steering. Failed admission or cancellation fails only the affected turn; it does not latch an installation-wide flag or stop the Slack listener. V1 does not resubmit prompts or automatically cancel native work just because an admission acknowledgement was lost. Same-session writer checks, native busy-status waiting, ordinary cancellation and stale-output suppression remain. A request connection/body-read failure is not evidence that the owned engine exited; actual process exit and explicit shutdown still stop Pipa.
 
 ## Evidence limits
 

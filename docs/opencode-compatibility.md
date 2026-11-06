@@ -78,11 +78,19 @@ This includes both web-search setup and the follow-on provider picker; choosing
 Allow, Choose another provider, or Disable remains an explicit user decision.
 Native validation still applies, and rejected submissions leave controls editable.
 
-Numeric (`number`/`integer`), boolean, hidden, conditional, and external fields
-require an OpenCode client. A mixed form is not partially rendered. Pipa displays
-a notice and reconciles external settlement rather than inventing answers.
-Existing Slack control size limits are unchanged. Forms must still belong to the
-observed session or a linked child in the configured workspace.
+Other session forms stay in Slack too: numeric values use text entry, booleans
+use explicit choices, and external actions show their actual link plus completion
+acknowledgment. Native field keys, typed values, defaults, optional omission and
+conditional fields are preserved. Hidden defaults are not posted as answers in
+the channel. Slack rendering limits require alternate controls rather than a
+redirect to an OpenCode client. Native validation remains authoritative, and
+rejected answers remain editable. Forms must belong to the observed session or
+a native descendant; global authentication forms are a separate integration.
+When a question, choice list or external link exceeds Slack's message limits,
+Pipa attaches the full display text as `form-details.txt` and retains answer and
+dismissal controls in the thread. Oversized links are copied from that file
+rather than placed in an invalid button. Failed attachments have an explicit
+retry control; opening a link never acknowledges completion by itself.
 
 #### Form coverage and upstream changes
 
@@ -102,8 +110,10 @@ OpenCode upgrade, inspect `packages/schema/src/form.ts` for field/answer changes
 and the `Form.Service` producers for new shapes and ownership. Exercise those
 shapes through the native adapter and Slack submission tests in
 `test/opencode-v2.test.mjs`; adding a kind name alone is not a compatibility fix.
-The tests cover unknown/absent metadata and preserve the richer-form boundary,
-not every possible plugin or future form type.
+The tests cover unknown/absent metadata and the current native field types,
+not every possible plugin or future protocol change. An unrecognized form must
+remain visible and dismissible in Slack rather than claim acceptance or send
+the user to another client.
 
 Owned servers preflight the selected `opencode` executable and check the serving
 identity agrees. Attached servers are identified from HTTP, independently of

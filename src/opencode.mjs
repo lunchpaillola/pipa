@@ -126,8 +126,7 @@ export function createOpenCodeExecutor(options = {}) {
       await adapter.ready?.(workingDirectory);
     })();
     await readiness;
-    // Legacy v1 can reject subsequent work after uncertain admission or cancellation.
-    await adapter.ready?.(workingDirectory);
+    if (stopReason) throw stopReason;
   }
 
   async function prepareArtifacts(sessionId, workingDirectory, persistent = false) {
@@ -150,7 +149,7 @@ export function createOpenCodeExecutor(options = {}) {
     return { text: parsed.text, sessionId, ...(files.length ? { files } : {}) };
   }
 
-  async function request(pathname, init, workingDirectory, controller, acceptedStatuses = [200], reportFatal = true) {
+  async function request(pathname, init, workingDirectory, controller, acceptedStatuses = [200]) {
     const url = serverUrl(baseUrl, pathname, workingDirectory);
     let response;
     try {
@@ -165,7 +164,6 @@ export function createOpenCodeExecutor(options = {}) {
       });
     } catch (error) {
       if (controller.signal.aborted) throw controller.signal.reason;
-      if (reportFatal && isNetworkError(error)) options.onFatal?.(new Error("OpenCode server became unavailable."));
       throw error;
     }
     let text;
@@ -173,7 +171,6 @@ export function createOpenCodeExecutor(options = {}) {
       text = await response.text();
     } catch (error) {
       if (controller.signal.aborted) throw controller.signal.reason;
-      if (reportFatal && isNetworkError(error)) options.onFatal?.(new Error("OpenCode server became unavailable."));
       throw error;
     }
     if (!acceptedStatuses.includes(response.status)) throw new OpenCodeRequestError(response.status);
@@ -185,7 +182,7 @@ export function createOpenCodeExecutor(options = {}) {
     }
   }
 
-  async function runTurn({ prompt, sessionId, model, defaultModel, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled, onResponse, onError }) {
+  async function runTurn({ prompt, sessionId, model, defaultModel, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, beforeLocationRetry, onInteraction, onPermissionReplied, onPermissionsReconciled, onResponse, onError }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     if (stopReason) throw stopReason;
     const legacySession = options.connection?.major === 1 || capabilities?.backgroundResponses === false;
@@ -214,13 +211,15 @@ export function createOpenCodeExecutor(options = {}) {
         if (!capabilities.backgroundResponses && activeSessions.has(selectedSessionId) && activeSessions.get(selectedSessionId).controller !== controller) throw new Error("OpenCode attribution conflict: the session already has an active writer.");
         activeSessions.set(selectedSessionId, { controller, workingDirectory, resolved: true });
         await onSession?.(selectedSessionId);
-        if (controller.signal.aborted) throw controller.signal.reason;
+        controller.signal.throwIfAborted();
         const newThreadModel = !selectedModel && (prepared.defaultEligible ?? !prepared.threadModel) ? normalizeModel(defaultModel) : null;
 
         if (slackTurn) artifactDirectory = await prepareArtifacts(selectedSessionId, workingDirectory, capabilities.backgroundResponses && !!onResponse);
 
         const text = await adapter.execute({ ...prepared, model: selectedModel, defaultModel: newThreadModel, workingDirectory, controller, prompt, files,
-          instructions: turnInstructions(contextEnvironment, artifactDirectory), onInteraction, onPermissionReplied, onPermissionsReconciled,
+          instructions: turnInstructions(contextEnvironment, artifactDirectory),
+          beforeLocationRetry: (metadata, signal) => abortable(Promise.resolve(beforeLocationRetry?.(metadata, signal)), signal),
+          onInteraction, onPermissionReplied, onPermissionsReconciled,
           ...(capabilities.backgroundResponses && onResponse ? {
             onResponse: async (text, messageId, followSignal) => onResponse(await response(text, selectedSessionId, artifactDirectory, slackTurn), followSignal),
             onError,
@@ -550,19 +549,14 @@ function sanitizeFilename(value, fallback = "artifact") {
 
 function ownedServer(baseUrl, child, exit, platform) {
   let stopping = false;
-  let rejectFailure;
-  const failure = new Promise((_, reject) => rejectFailure = reject);
-  const wait = Promise.race([exit.then((code) => {
+  const wait = exit.then((code) => {
     if (!stopping) throw new Error(`OpenCode server exited unexpectedly with code ${code}.`);
-  }), failure]);
+  });
   void wait.catch(() => undefined);
   return {
     baseUrl,
     owned: true,
     wait: () => wait,
-    fail(error) {
-      if (!stopping) rejectFailure(error);
-    },
     stop(signal = "SIGTERM") {
       if (stopping) return;
       stopping = true;
@@ -573,20 +567,14 @@ function ownedServer(baseUrl, child, exit, platform) {
 
 function externalServer(baseUrl) {
   let resolveWait;
-  let rejectWait;
   let stopped = false;
-  const wait = new Promise((resolve, reject) => {
+  const wait = new Promise((resolve) => {
     resolveWait = resolve;
-    rejectWait = reject;
   });
-  void wait.catch(() => undefined);
   return {
     baseUrl,
     owned: false,
     wait: () => wait,
-    fail(error) {
-      if (!stopped) rejectWait(error);
-    },
     stop() {
       if (stopped) return;
       stopped = true;

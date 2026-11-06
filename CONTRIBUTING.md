@@ -38,6 +38,22 @@ Keep the no-secret PR lane separate from opt-in real Slack/provider execution.
 See [testing](docs/pipa-testing.md) and [compatibility/rollback](docs/opencode-compatibility.md).
 No supported minimum or release qualification is implied by a subset of native passes.
 
+For session-form changes, run `node scripts/verification/slack-forms-native.mjs`
+with the target v2 `opencode` on PATH. An optional positional filename saves the
+JSON report. This starts a disposable native server with isolated HOME/XDG and
+database storage, drives real forms through Pipa's Slack callbacks, and asserts
+the native answers, cancellation, rejection/retry and Slack payload-size limits.
+It also runs a native question tool with a scripted loopback provider. It needs
+no Slack tokens or paid-provider credentials. Captured Slack transport does not
+verify visual rendering or real file uploads; those still need a test Slack app.
+
+For missing-location recovery, run `node scripts/verification/slack-location-native.mjs`
+with the target v2 engine on PATH. It uses disposable native storage and a scripted
+local provider, preserves idle/queued session history across a test-only engine
+restart, removes only empty test-owned folders, and verifies one native completion
+of both the rejected current request and any previously queued work. An optional
+positional filename saves the JSON report; no Slack or paid-provider tokens are used.
+
 The current native v2 target to qualify is **2.2.5**, alongside historical v2 **2.0.29** and v1 pins **1.18.35 / 1.19.0**. The SDK remains pinned to `@opencode/client@2.0.29` until qualified; its version is not the native engine target. These are qualification inputs, not passing compatibility results or a release recommendation.
 
 For model-selection changes, iterate with `node --test test/state.test.mjs test/opencode.test.mjs test/models.test.mjs test/app.test.mjs test/routines.test.mjs test/cli.test.mjs`, then run both required checks above.
@@ -69,13 +85,13 @@ Pipa follows Semantic Versioning:
 ### Controlled beta
 
 An opt-in beta is a limited trial, not full stable/platform qualification. For
-`0.6.0-beta.4`, use the [beta notes and publisher checklist](docs/beta-release.md).
+`0.6.0-beta.5`, use the [beta notes and publisher checklist](docs/beta-release.md).
 
 1. Confirm the version is unused on npm and record the current `latest` tag.
 2. Update both package files, beta notes and installation instructions in the PR.
 3. Run `npm test`, `npm run test:pack`, and `node --test scripts/verification/self-check.mjs` on that exact version. Inspect `npm publish --dry-run --tag beta --access public` for package contents and accidental private data. Confirm Linux PR CI passes.
 4. Record the scoped native smoke evidence and its platform/head limits. Retain known failures and gaps; do not label a beta `releaseQualified` or require the abandoned migration-status gate.
-5. Obtain explicit owner approval for merge, release tag and GitHub prerelease. Merge only after required CI passes, then tag the actual merged commit as `v0.6.0-beta.4`.
+5. Obtain explicit owner approval for merge, release tag and GitHub prerelease. Merge only after required CI passes, then tag the actual merged commit as `v0.6.0-beta.5`.
 6. The authorized publisher runs `npm publish --tag beta --access public` from that clean, versioned release checkout. Never omit `--tag beta`, move `latest`, or permanently set `publishConfig.tag` to beta.
 7. Verify npm's `beta` tag points to the new version and `latest` is unchanged. Create the matching GitHub release marked **Pre-release**. Installation into an existing daily profile is a separate owner-approved cutover.
 

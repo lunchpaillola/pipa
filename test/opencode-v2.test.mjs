@@ -23,6 +23,7 @@ async function fixture(t, options = {}) {
     const json = (data, status = 200) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(data)); };
     const sessionId = url.pathname.split("/")[3];
     if (await options.onRequest?.({ req, res, url, body, json })) return;
+    if (url.pathname === "/api/location") return json({ directory: url.searchParams.get("location[directory]") });
     if (url.pathname === "/api/event") {
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.flushHeaders();
@@ -98,6 +99,86 @@ async function until(predicate) {
   for (let count = 0; count < 500; count++) { if (predicate()) return; await delay(2); }
   assert.fail("Timed out waiting for native event delivery");
 }
+
+test("a rejected missing-location prompt waits for the native move and retries once with the same identity", async (t) => {
+  const old = "/native/deleted-checkout", target = "/native/canonical-start";
+  let directory = old;
+  let movePending = false;
+  let readsAfterMove = 0;
+  let attempts = 0;
+  const notices = [];
+  const f = await fixture(t, { onRequest: ({ req, res, url, body, json }) => {
+    if (url.pathname === "/api/session/ses_one") {
+      if (movePending && ++readsAfterMove === 3) directory = target;
+      json({ data: { id: "ses_one", location: { directory }, model: { providerID: "native", id: "kept" } } }); return true;
+    }
+    if (url.pathname.endsWith("/prompt")) {
+      attempts++;
+      if (attempts === 1) { json({ _tag: "LocationNotFoundError", location: { directory: old }, message: "Location not found" }, 404); return true; }
+      assert.equal(directory, target, "Do not submit before the queued move applies");
+    }
+    if (url.pathname.endsWith("/move")) {
+      assert.deepEqual(body, { directory: target, delivery: "queue" });
+      movePending = true; res.writeHead(204); res.end(); return true;
+    }
+  } });
+  const prepared = await f.adapter.resolveSession("ses_one", target, new AbortController());
+  assert.deepEqual(prepared, { sessionId: "ses_one", defaultEligible: false });
+  await f.adapter.execute(f.input("ses_one", { ...prepared, workingDirectory: target, onResponse: async () => {}, beforeLocationRetry: async metadata => notices.push(metadata) }));
+  assert.deepEqual(notices, [{ previousDirectory: old, directory: target }]);
+  assert.equal(f.requests.filter((r) => r.path.endsWith("/move")).length, 1);
+  const prompts = f.requests.filter((r) => r.path.endsWith("/prompt"));
+  assert.equal(prompts.length, 2);
+  assert.deepEqual(prompts[0].body, prompts[1].body);
+  assert.equal(f.requests.some((r) => r.path === "/api/location" || r.path === "/api/session/active" || r.path.endsWith("/inbox")), false);
+  assert.equal(f.requests.some((r) => r.path.endsWith("/model") || r.path.endsWith("/interrupt") || (r.path === "/api/session" && r.method === "POST")), false);
+});
+
+for (const failure of ["move failed", "retry rejected", "cancelled while queued"]) test(`missing-location recovery stops after ${failure} without replaying uncertain work`, async (t) => {
+  const old = "/native/deleted", target = "/native/start";
+  const controller = new AbortController();
+  let directory = old;
+  const f = await fixture(t, { onRequest: ({ req, res, url, json }) => {
+    if (url.pathname === "/api/session/ses_one") { json({ data: { id: "ses_one", location: { directory }, model: { providerID: "native", id: "kept" } } }); return true; }
+    if (url.pathname.endsWith("/prompt")) { json({ _tag: "LocationNotFoundError", location: { directory }, message: "Missing location" }, 404); return true; }
+    if (url.pathname.endsWith("/move")) {
+      if (failure === "move failed") req.socket.destroy();
+      else {
+        if (failure === "retry rejected") directory = target;
+        res.writeHead(204); res.end();
+        if (failure === "cancelled while queued") setTimeout(() => controller.abort(new Error("Cancelled waiting for native move")), 10);
+      }
+      return true;
+    }
+  } });
+  await assert.rejects(f.adapter.execute(f.input("ses_one", { workingDirectory: target, controller, onResponse: async () => {} })));
+  assert.equal(f.requests.filter(r => r.path.endsWith("/move")).length, 1);
+  assert.equal(f.requests.filter(r => r.path.endsWith("/prompt")).length, failure === "retry rejected" ? 2 : 1);
+  assert.equal(f.requests.some(r => r.path.endsWith("/interrupt") || r.path.endsWith("/inbox")), false);
+});
+
+test("healthy native location outside the starting folder is preserved", async (t) => {
+  const f = await fixture(t);
+  f.sessions.set("ses_one", { location: { directory: "/native/healthy-moved" } });
+  assert.deepEqual(await f.adapter.resolveSession("ses_one", "/native/start", new AbortController()), { sessionId: "ses_one", defaultEligible: false });
+  assert.deepEqual(f.requests.map((r) => r.path), ["/api/session/ses_one"]);
+});
+
+for (const failure of ["different directory", "untyped", "transport", "concurrently moved"]) test(`prompt-time ${failure} failure is never retried or repaired`, async (t) => {
+  const f = await fixture(t, { onRequest: ({ req, url, json }) => {
+    if (!url.pathname.endsWith("/prompt")) return;
+    if (failure === "transport") req.socket.destroy();
+    else {
+      if (failure === "concurrently moved") f.sessions.set("ses_one", { location: { directory: "/native/moved-by-another-client" } });
+      json({ _tag: failure === "untyped" ? "MessageNotFoundError" : "LocationNotFoundError", location: { directory: failure === "different directory" ? "/unrelated" : process.cwd() }, message: "Native rejection" }, 404);
+    }
+    return true;
+  } });
+  const prepared = await f.adapter.resolveSession("ses_one", process.cwd(), new AbortController());
+  await assert.rejects(f.adapter.execute(f.input("ses_one", { ...prepared, onResponse: async () => {} })));
+  assert.equal(f.requests.filter((r) => r.path.endsWith("/prompt")).length, 1);
+  assert.equal(f.requests.some((r) => r.path.endsWith("/move") || r.path.endsWith("/interrupt")), false);
+});
 
 test("native events deliver initial and later background responses after admission", async (t) => {
   const f = await fixture(t);
@@ -430,7 +511,7 @@ test("stable context migration is one-time, scoped, and never deletes pipa.slack
   assert.equal(f.requests.filter((r) => r.method === "DELETE").length, 1);
 });
 
-test("questions preserve options, multiselect and custom answers after admission", async (t) => {
+test("native forms preserve fields and keyed answers after admission", async (t) => {
   const f = await fixture(t);
   const interactions = [];
   await f.adapter.execute(f.input("ses_one", { onResponse: async () => {}, onInteraction: async (interaction) => {
@@ -444,11 +525,9 @@ test("questions preserve options, multiselect and custom answers after admission
   f.forms.push(form);
   f.globalEvent("form.created", { form });
   await until(() => interactions.length === 1);
-  assert.equal(interactions[0].type, "question");
-  assert.equal(interactions[0].request.questions[1].multiple, true);
-  assert.equal(interactions[0].request.questions[1].custom, true);
-  assert.equal(interactions[0].request.questions[0].options[0].value, "blue_value");
-  await interactions[0].submit({ type: "answer", answers: [["blue_value"], ["red_value", "custom text"]] });
+  assert.equal(interactions[0].type, "form");
+  assert.deepEqual(interactions[0].request, form);
+  await interactions[0].submit({ type: "answer", answer: { q0: "blue_value", q1: ["red_value", "custom text"] } });
   assert.deepEqual(f.requests.find((r) => r.path.endsWith("/frm_choices/reply")).body, { answer: { q0: "blue_value", q1: ["red_value", "custom text"] } });
 });
 
@@ -520,9 +599,34 @@ test("simple forms use field shapes rather than a closed list of metadata kinds 
     ] });
     await f.adapter.followSession(f.input("ses_one", { onInteraction: async (interaction) => { interactions.push(interaction); return { type: "cancelled" }; } }));
     await until(() => interactions.length === 1);
-    assert.equal(interactions[0].type, "question");
-    await interactions[0].submit({ type: "answer", answers: [["Pipa"], ["blue"]] });
+    assert.equal(interactions[0].type, "form");
+    await interactions[0].submit({ type: "answer", answer: { project: "Pipa", colors: ["blue"] } });
     assert.deepEqual(f.requests.find((request) => request.path.endsWith("/frm_plugin/reply")).body, { answer: { project: "Pipa", colors: ["blue"] } });
+  }
+});
+
+test("simple native forms with duplicate or empty keys stay dismissible without collecting answers", async (t) => {
+  for (const key of ["name", ""]) {
+    const f = await fixture(t);
+    const controls = createPendingInteractions(["U1"]);
+    t.after(() => controls.close());
+    const posted = [];
+    const thread = { id: "slack:C1:1.0", adapter: { webClient: { chat: {
+      postMessage: async message => { posted.push(message); return { ts: "2.0" }; },
+      update: async () => {}, delete: async () => {},
+    } } } };
+    f.forms.push({ id: "frm_malformed", sessionID: "ses_one", title: "Project", fields: [
+      { key: "name", type: "string", required: true }, { key, type: "string", required: true },
+    ] });
+    await f.adapter.followSession(f.input("ses_one", { onInteraction: interaction => controls.onInteraction({ thread }, interaction) }));
+    await until(() => posted.length === 1);
+    assert.match(JSON.stringify(posted[0]), /unsupported or malformed/u);
+    const actions = posted[0].blocks.flatMap(block => block.elements ?? []);
+    assert.equal(actions.length, 1);
+    const dismiss = actions[0];
+    await controls.onAction({ actionId: dismiss.action_id, value: dismiss.value, threadId: thread.id, user: { userId: "U1" } });
+    assert.ok(f.requests.some(request => request.method === "DELETE" && request.path.endsWith("/frm_malformed")));
+    assert.equal(f.requests.some(request => request.path.endsWith("/frm_malformed/reply")), false);
   }
 });
 
@@ -566,14 +670,9 @@ test("Slack preserves duplicate-label choices, custom text, empty answers and op
     await until(() => updated.length === 1);
     const expected = mode === "skip" ? {} : { answer: mode === "choice" ? "account-b" : mode === "custom" ? "Default" : mode === "empty" ? "" : [] };
     assert.deepEqual(f.requests.find(request => request.path.endsWith("/frm_answers/reply"))?.body, { answer: expected });
-    if (mode === "choice") {
-      assert.match(JSON.stringify(updated[0]), /Default/u);
-      assert.doesNotMatch(JSON.stringify(updated[0]), /account-b/u);
-    }
-    if (["empty", "skip", "empty-multiselect"].includes(mode)) {
-      assert.equal(updated[0].text, "Optional answers left blank.");
-      assert.equal(updated[0].blocks[1].text.text, "Optional answers left blank.");
-    }
+    assert.equal(updated[0].text, "Form submitted.");
+    assert.equal(updated[0].blocks[1].text.text, "Form submitted.");
+    assert.doesNotMatch(JSON.stringify(updated[0]), /account-b/u);
     });
   }
 });
@@ -593,10 +692,10 @@ test("native form validation rejection allows correcting the same pending form",
   await f.adapter.followSession(f.input("ses_one", { onInteraction: async (interaction) => { interactions.push(interaction); return { type: "cancelled" }; } }));
   await until(() => interactions.length === 1);
   const interaction = interactions[0];
-  assert.equal(interaction.type, "question");
-  await assert.rejects(interaction.submit({ type: "answer", answers: [["not an email"]] }), { _tag: "FormInvalidAnswerError" });
+  assert.equal(interaction.type, "form");
+  await assert.rejects(interaction.submit({ type: "answer", answer: { email: "not an email" } }), { _tag: "FormInvalidAnswerError" });
   assert.equal(f.forms.length, 1, "native rejection must leave the form pending");
-  await interaction.submit({ type: "answer", answers: [["person@example.com"]] });
+  await interaction.submit({ type: "answer", answer: { email: "person@example.com" } });
   assert.equal(attempts, 2);
   assert.deepEqual(f.requests.filter((request) => request.path.endsWith("/frm_validated/reply")).map((request) => request.body), [
     { answer: { email: "not an email" } }, { answer: { email: "person@example.com" } },
@@ -605,7 +704,7 @@ test("native form validation rejection allows correcting the same pending form",
   assert.equal(interactions.length, 1, "correction must reuse the existing interaction");
 });
 
-test("richer or partially supported forms still require a native client", async (t) => {
+test("richer forms accept keyed native answers and cancellation", async (t) => {
   for (const field of [
     { type: "number" }, { type: "integer" }, { type: "boolean" }, { type: "external", url: "https://example.com/connect" },
     { type: "string", hidden: true }, { type: "string", when: [{ key: "q0", op: "eq", value: "allow" }] },
@@ -618,9 +717,18 @@ test("richer or partially supported forms still require a native client", async 
     await f.adapter.followSession(f.input("ses_one", { onInteraction: async (interaction) => { interactions.push(interaction); return { type: "cancelled" }; } }));
     await until(() => interactions.length === 1);
     assert.equal(interactions[0].type, "form");
-    await assert.rejects(interactions[0].submit({ type: "answer", answers: [["allow"], ["anything"]] }), /requires an OpenCode client/u);
-    assert.equal(f.requests.some((request) => request.path.endsWith("/frm_rich/reply")), false);
+    const answer = { q0: "allow", q1: field.type === "boolean" ? false : field.type === "external" ? true : ["number", "integer"].includes(field.type) ? 0 : "anything" };
+    await interactions[0].submit({ type: "answer", answer });
+    assert.deepEqual(f.requests.find(request => request.path.endsWith("/frm_rich/reply")).body, { answer });
   }
+  const f = await fixture(t);
+  const interactions = [];
+  f.forms.push({ id: "frm_cancel", sessionID: "ses_one", title: "Unknown", fields: [{ key: "x", type: "future" }] });
+  await f.adapter.followSession(f.input("ses_one", { onInteraction: async interaction => { interactions.push(interaction); return { type: "cancelled" }; } }));
+  await until(() => interactions.length === 1);
+  await interactions[0].submit({ type: "stop" });
+  assert.equal(f.forms.length, 0);
+  assert.ok(f.requests.some(request => request.method === "DELETE" && request.path.endsWith("/frm_cancel")));
 });
 
 test("child permissions, native settlement and reconnect reconciliation share one live source", async (t) => {
@@ -814,7 +922,7 @@ test("failed descendant kinds stay editable while successful root and sibling ki
   assert.equal(snapshots.some((item) => item.sessionId === "ses_child"), false);
   fail = false;
   await interactions.find((item) => item.request.id === "per_ses_child").submit({ type: "reply", reply: "once" });
-  await interactions.find((item) => item.request.id === "frm_ses_one").submit({ type: "answer", answers: [["yes"]] });
+  await interactions.find((item) => item.request.id === "frm_ses_one").submit({ type: "answer", answer: { answer: "yes" } });
   await assert.rejects(interactions.find((item) => item.request.id === "per_ses_one").submit({ type: "reply", reply: "once" }), /already settled/u);
 });
 

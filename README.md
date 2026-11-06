@@ -53,10 +53,10 @@ pipa start
 
 ### Opt-in 0.6 beta
 
-`0.6.0-beta.4` is being prepared for controlled testing, not stable release. Once published, opt in with:
+`0.6.0-beta.5` is being prepared for controlled testing, not stable release. Once published, opt in with:
 
 ```sh
-npm install --global @usepipa/pipa@0.6.0-beta.4
+npm install --global @usepipa/pipa@0.6.0-beta.5
 ```
 
 Normal installs use npm's `latest` tag; later betas use `@beta`. This updates Pipa, not OpenCode. Before upgrading, stop Pipa and back up its profile. Keep your current OpenCode version initially. Do not rerun `pipa init` or start a second listener. Read the [beta release notes](https://github.com/lunchpaillola/pipa/blob/main/docs/beta-release.md) for limits and rollback steps.
@@ -100,6 +100,10 @@ pipa start
 Keep `pipa start` running. Invite Pipa to an allowed channel and mention it. Replies in that thread continue the same session without another mention. Different threads work independently.
 
 On OpenCode v2, replies steer ongoing work, and background results can return to the thread. V1 interrupts the current turn when a new message arrives. Replies missed during a disconnect or restart are not recovered. After restart, send another message in the thread to resume background forwarding. Failed Slack deliveries are not replayed.
+
+When you reply inside an existing Slack thread, Pipa reads preceding messages directly from Slack using its bot token, then sends that discussion plus your current request to OpenCode. No Composio connection is needed. New top-level mentions do not fetch history. History API reads are bounded to ten pages, 24 KiB of retained context, and 15 seconds; incomplete or unavailable history is identified in the prompt without a separate Slack warning. Old messages are quoted context, not fresh permission to act. Historical file contents and linked pages are not automatically downloaded. Repeated snapshots may overlap with the native conversation's existing history.
+
+On v2, Pipa tries to continue the saved conversation normally. If OpenCode explicitly rejects the prompt because that session's working folder is missing, Pipa queues a native move to the configured starting folder, waits for the location to change, then resubmits that rejected request once. OpenCode owns active and queued work; Pipa does not veto, clear, or replay it. A short Slack heads-up is best-effort and never required for continuation. Missing files are not restored. Transport-uncertain requests are never automatically replayed. Startup, stop, and restart behavior are unchanged.
 
 Startup waits for OpenCode and Slack to be ready, with no default overall timeout. Ctrl+C stops startup and processes Pipa owns, not attached servers. See [OpenCode compatibility](docs/opencode-compatibility.md) for startup, session, and upgrade details.
 
@@ -177,9 +181,9 @@ In an allowed channel, type your app's command followed by `model`: `/chopper mo
 
 The choice applies to new threads without restarting Pipa. Existing threads keep their model across replies and restarts. New routines save the current choice; existing routines keep theirs. Routines with no saved model use OpenCode's default. With no selection, new threads also use OpenCode's default. Changing this setting does not change subagents or external clients.
 
-To use a different model, start a new thread. Changing an existing v2 thread's model still requires OpenCode.
+To use a different model from Slack, save your choice and start a new thread. The picker does not change existing threads.
 
-The picker shows up to 100 matches; narrow your search for more. A listed model may still lack credentials or quota. Saving does not test it. Providers such as `opencode` and `openai` use separate credentials. Reconnect failed providers in OpenCode. Pipa never silently switches models.
+The picker shows up to 100 matches; narrow your search for more. A listed model may still lack credentials or quota. Saving does not test it. Providers such as `opencode` and `openai` use separate credentials. If a provider fails, choose an available model and start a new thread, or ask your Pipa operator to reconnect it. [Connecting providers from Slack](https://github.com/lunchpaillola/pipa/issues/68) is a separate follow-up. Pipa never silently switches models.
 
 **Multiple Slack apps:** give each a distinct command. Slack sends a shared `/pipa` command to the most recently installed app. Register that alias with only one app, and check the app name in the picker before saving.
 
