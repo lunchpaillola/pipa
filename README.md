@@ -51,6 +51,17 @@ pipa start
 
 `pipa init` walks you through Slack setup and saves your profile under `~/.pipa`. Invite Pipa to an allowed channel and mention it. Follow the [four-minute setup video](https://www.youtube.com/watch?v=rlTMdkPWPcA) or the [written tutorial](https://www.usepipa.com/opencode-slack?utm_source=github&utm_medium=repo_readme&utm_campaign=signup&utm_content=readme_install_guide).
 
+### Install with your agent
+
+Paste this into your coding agent on the computer where Pipa will run:
+
+```text
+Help me install Pipa Local by following https://www.usepipa.com/install.
+Check the prerequisites and guide me through setup. Ask me to complete Slack
+authentication and app setup myself; do not ask me to paste tokens into chat.
+Before changing an existing Pipa installation, explain the steps and ask me.
+```
+
 ### Opt-in 0.6 beta
 
 `0.6.0-beta.5` is being prepared for controlled testing, not stable release. Once published, opt in with:

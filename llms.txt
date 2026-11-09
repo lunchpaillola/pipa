@@ -1,0 +1,11 @@
+# Pipa
+
+> Pipa runs OpenCode as a Slack agent on your own computer.
+
+## Documentation
+
+- [Install Pipa Local](https://www.usepipa.com/install): Prerequisites and Slack setup.
+- [README](https://github.com/lunchpaillola/pipa/blob/main/README.md): Quickstart, commands, access controls, and security model.
+- [Security](https://github.com/lunchpaillola/pipa/blob/main/SECURITY.md): Trust boundaries and vulnerability reporting.
+- [OpenCode compatibility](https://github.com/lunchpaillola/pipa/blob/main/docs/opencode-compatibility.md): Server behavior and upgrade guidance.
+- [Contributing](https://github.com/lunchpaillola/pipa/blob/main/CONTRIBUTING.md): Development and testing.
