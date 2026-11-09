@@ -452,6 +452,8 @@ Use existing Windows `.cmd`/`cross-spawn` patterns and process-tree termination;
 
 ### Runtime and Mode Matrix
 
+The three-OS matrix below is historical. Current native scope is Linux/macOS: the broad matrix has 24 cells (4 pins × 3 modes × 2 OS jobs), and the default smoke collects 12 (2 pins × 3 modes × 2 OS jobs). Windows native remains `—` (not run); manual Windows unit/package CI remains available.
+
 Qualification pins: **1.18.35, 1.19.0, 2.0.29, 2.2.5**. Native **2.2.5** is the current v2 target; **2.0.29** remains historical. Require the same Pipa candidate on Linux, macOS, and Windows where these binaries are supported. `opencode-compatibility.yml` uses a separate no-secret job matrix; version/mode cells can share one job's cached binary installation. No paid/Slack secrets are exposed to fork pull requests.
 
 | Mode | Real-engine CI composition | Additional live qualification |

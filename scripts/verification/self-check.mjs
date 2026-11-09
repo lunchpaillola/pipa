@@ -5,7 +5,7 @@ import { request } from "node:http";
 import { access, readFile, rm } from "node:fs/promises";
 import { createRuntimeFixture, waitFor, FIXTURE_TEARDOWN_TIMEOUT_MS } from "../../test/helpers/runtime-fixture.mjs";
 import { assertTurnOutcome } from "../../test/helpers/opencode-contract.mjs";
-import { assertPin, compatibilityExit, selectGate, recordCase, finishCell, CELL_WORKER_TIMEOUT_MS, PINS, MODES, BETA_PINS, BETA_CASE_IDS } from "../test-opencode-matrix.mjs";
+import { assertPin, compatibilityExit, selectGate, recordCase, finishCell, unobservedPlatforms, CELL_WORKER_TIMEOUT_MS, PINS, MODES, BETA_PINS, BETA_CASE_IDS } from "../test-opencode-matrix.mjs";
 import { observeRuntimeReadiness, observeNativeAdmissions, assertRestartRoutineAdmission, releaseCases, runCell, protectedToolCommand, recordSharedCase } from "./opencode-release-cases.mjs";
 import { checkOpenCodeConnection } from "../../src/opencode.mjs";
 import { createWireFixture, loadWireFixture } from "../../test/helpers/opencode-contract.mjs";
@@ -249,6 +249,14 @@ test("targeted cell diagnostics reject invalid selections and cannot qualify the
   report.cells[0].caseSelection = ["startup-readiness", "stop-ownership"];
   report.cells[0].cases = report.cells[0].cases.filter((row) => report.cells[0].caseSelection.includes(row.id));
   assert.equal(selectGate(report).exitCode, 1, "Missing turn/recovery cases must remain gating");
+});
+
+test("generated missing-platform evidence covers only other Linux/macOS hosts", () => {
+  for (const [host, expected] of [["linux", ["darwin"]], ["darwin", ["linux"]], ["win32", ["linux", "darwin"]]]) {
+    const rows = unobservedPlatforms(host);
+    assert.deepEqual(rows.map((row) => row.platform), expected);
+    assert.ok(rows.every((row) => row.status === "BLOCKED" && row.observed.includes("separate OS CI evidence required")));
+  }
 });
 
 test("release platform scope omits Windows without waiving Linux, macOS or other gates", () => {

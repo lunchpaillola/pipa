@@ -145,6 +145,10 @@ async function installEngine(runtime, pin) {
   return { bin, binary, package: name, version: pin, integrity: digest };
 }
 
+export function unobservedPlatforms(host) {
+  return ["linux", "darwin"].filter((platform) => platform !== host).map((platform) => ({ platform, status: "BLOCKED", observed: "Not executed by this host; separate OS CI evidence required" }));
+}
+
 async function main(argv) {
   const value = (flag) => argv.find((arg) => arg.startsWith(`${flag}=`))?.slice(flag.length + 1);
   for (const arg of argv) assert.ok(["--baseline", "--migration", "--smoke"].includes(arg) || ["--pins=", "--modes=", "--report=", "--gate="].some((flag) => arg.startsWith(flag)), `Unknown argument ${arg}`);
@@ -163,7 +167,7 @@ async function main(argv) {
   const reportPath = path.resolve(value("--report") ?? path.join(os.tmpdir(), `pipa-engines-${Date.now()}.json`));
   const pkg = JSON.parse(await readFile(path.join(repo, "package.json"), "utf8"));
   const report = { schema: "pipa-opencode-matrix/v1", gate, matrix: { pins, modes }, migrationRequested: argv.includes("--migration"), collection: smoke ? "beta-smoke" : argv.includes("--baseline") ? "pre-port-baseline" : "compatibility", releaseQualified: false, date: new Date().toISOString(), pipa: pkg.version, node: process.version, platform: process.platform, arch: process.arch, cells: [], cases: [] };
-  report.unobservedPlatforms = ["linux", "darwin"].filter((platform) => platform !== process.platform).map((platform) => ({ platform, status: "BLOCKED", observed: "Not executed by this host; separate OS CI evidence required" }));
+  report.unobservedPlatforms = unobservedPlatforms(process.platform);
   try {
     const pack = npmSingle(await command(runtime, "npm", ["pack", "--ignore-scripts", "--json", "--pack-destination", runtime.root], { cwd: repo }));
     const installed = path.join(runtime.root, "candidate");
