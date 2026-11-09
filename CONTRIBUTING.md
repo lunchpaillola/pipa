@@ -25,7 +25,10 @@ and `npm run test:beta -- --report=beta-smoke.json`: real 1.19.0 / 2.2.5 engines
 three modes, six cells and 24 applicable case observations per host, with scripted
 local provider/Chat fixtures and no credentials or paid-provider quota.
 The **OpenCode compatibility** workflow is manual-only. Its default runs this
-smoke on all three platforms; select `full_qualification` or use
+smoke on Linux and macOS (12 cells total); Windows native harness runs are outside
+the current release scope and shown as `—` (not run), not a passing result.
+Windows unit/package checks remain available through manual **CI** dispatch.
+Select `full_qualification` or use
 `npm run test:engines -- --migration` for the broad matrix. Smoke covers basic
 startup, prompts/history, applicable restart and stop ownership. Richer files,
 approvals and routines stay in retained unit tests and the broad manual matrix,
@@ -100,7 +103,7 @@ An opt-in beta is a limited trial, not full stable/platform qualification. For
 The stronger qualification requirements still apply to a stable dual-engine release:
 
 1. Update `package.json` and `package-lock.json` in the feature pull request.
-2. Run `npm test` and `npm run test:pack`. For this dual-engine candidate, also collect the full required native OS/mode matrix, migration/rollback and private operator/live-client evidence. Missing required evidence blocks release; the automated Slack collector alone cannot certify it.
+2. Run `npm test` and `npm run test:pack`. For this dual-engine candidate, also collect the full required Linux/macOS native OS/mode matrix, migration/rollback and private operator/live-client evidence. Windows native runs are outside the current scope; their absence alone does not block it. Missing required evidence still blocks release; the automated Slack collector alone cannot certify it.
 3. Merge after CI passes.
 4. Tag the merge as `v<version>` and push the tag.
 5. Run `npm publish --access public`.

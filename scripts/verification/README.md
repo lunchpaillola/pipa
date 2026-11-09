@@ -35,7 +35,9 @@ evidence fails. Other catalog rows, including uncollected BLOCKED placeholders,
 are outside scope with explicit reasons and unchanged statuses.
 
 The manual-only **OpenCode compatibility** workflow uses `beta-smoke.json` on
-three OS hosts (18 cells). It does not run for normal PR updates. Workflow input
+Linux and macOS hosts (12 cells). Windows native is `—` (not run), outside the
+current release scope; manual **CI** still offers Windows unit/package checks.
+It does not run for normal PR updates. Workflow input
 `full_qualification` opts into the full deterministic/migration matrix. Richer files,
 approvals and routines remain covered by retained unit tests and the broad manual
 matrix, not the native beta promise; the existing Socket restart case still checks
@@ -88,7 +90,10 @@ cleanup retains the private root for diagnosis.
   every applicable deterministic case and cleanup result. Reports also retain
   live and mode-inapplicable observations, with explicit gate exclusion reasons.
 - `--gate=release` additionally requires applicable live/deployment and missing
-  platform evidence. This runner alone cannot establish release qualification;
+  Linux/macOS platform evidence. New reports list only these required platforms
+  as unobserved. Historical Windows platform rows remain intact but excluded
+  from the current platform gate; collected case/cleanup failures remain strict.
+  Windows absence alone does not block the chosen scope. This runner alone cannot establish release qualification;
   the live evaluator and aggregate OS evidence remain separate work.
 
 Each report preserves PASS/FAIL/BLOCKED/native NOT_APPLICABLE results, expected

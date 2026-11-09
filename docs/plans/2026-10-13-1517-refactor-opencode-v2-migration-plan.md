@@ -17,6 +17,7 @@ Product Contract preservation: R1 and R14 now cover both supported generations, 
 
 ## Latest Owner Scope
 
+- Current native release qualification covers Linux/macOS only. The historical three-OS requirements below are superseded by the [current platform scope](../opencode-compatibility.md#current-native-platform-scope): Windows native is `—` (not run), while manual Windows unit/package CI remains. Historical failures are preserved; Linux/macOS and all other required qualification gaps remain gating.
 - Migrate to v2 while preserving the current Pipa-on-v1 baseline, including the pre-existing model picker. No v1 feature expansion is authorized; broader historical requirements below are read within this boundary.
 - Instruction registration and its recovery journal are v2-only. V1 retains its existing per-prompt system instructions; do not add v1 instruction registration or automatic recovery merely to make the engines symmetrical.
 - A pre-existing v1 attached-command limitation is not a new migration blocker. Keep its failed observation visible and distinguish it from a candidate-introduced regression; do not expand v1 command support to clear the migration gate.

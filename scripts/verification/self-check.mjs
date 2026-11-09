@@ -251,6 +251,29 @@ test("targeted cell diagnostics reject invalid selections and cannot qualify the
   assert.equal(selectGate(report).exitCode, 1, "Missing turn/recovery cases must remain gating");
 });
 
+test("release platform scope omits Windows without waiving Linux, macOS or other gates", () => {
+  const report = gateFixture();
+  report.unobservedPlatforms = [{ platform: "win32", status: "BLOCKED", observed: "not run" }];
+  for (const cell of report.cells) for (const row of cell.cases) {
+    const definition = releaseCases.find((definition) => definition.id === row.id);
+    if (definition.modes.includes(cell.mode) && definition.generations.includes(cell.engine.split(".")[0])) row.status = "PASS";
+  }
+  const before = JSON.stringify(report);
+  const selected = selectGate(report, { gate: "release" });
+  assert.equal(selected.exitCode, 0, "Windows absence alone must not block the selected release scope");
+  assert.ok(selected.excluded.some((row) => row.platform === "win32" && /outside current native release scope/iu.test(row.reason)));
+  assert.equal(JSON.stringify(report), before);
+  assert.equal(report.releaseQualified, false);
+  for (const platform of ["linux", "darwin"]) {
+    const changed = structuredClone(report);
+    changed.unobservedPlatforms.push({ platform, status: "BLOCKED", observed: "not run" });
+    assert.equal(selectGate(changed, { gate: "release" }).exitCode, 1, platform);
+  }
+  report.cells[0].cases.find((row) => row.id === "live-slack-provider").status = "BLOCKED";
+  assert.equal(selectGate(report, { gate: "release" }).exitCode, 1, "Live evidence remains required");
+  assert.equal(selectGate(gateFixture(), { gate: "release" }).exitCode, 1, "Scope change cannot qualify existing gaps");
+});
+
 test("declarative gates select applicable cases across every mode and generation without mutating evidence", () => {
   const report = gateFixture();
   const before = JSON.stringify(report);

@@ -26,17 +26,36 @@ worker-PID scan and records `workerExitObserved:false`, not `workersExited:true`
 It still checks durable completion, changed PID/generation, readiness, follow-up
 and ownership. This is not proof of live Slack or detached-worker exit.
 
-The manual **OpenCode compatibility** workflow runs this smoke on Linux, macOS
-and Windows (18 cells total). It does not run automatically on PRs. Select its
+The manual **OpenCode compatibility** workflow runs this smoke on Linux and macOS
+(12 cells total). Windows native harness runs are outside the current release
+scope, not a passing result. It does not run automatically on PRs. Select its
 `full_qualification` input for the broad four-pin deterministic matrix with
 migration; locally use `npm run test:engines -- --migration`.
-Full deterministic/release gate semantics are unchanged. Richer files, approvals
+The release platform gate requires Linux/macOS evidence, not Windows; all other
+deterministic/release requirements remain strict. Richer files, approvals
 and routine coverage remains in retained unit tests and the broad manual matrix,
 not the native beta promise; the existing Socket restart case still checks its
 routine flow. Deep crash recovery, plugin/model combinations, migration/rollback,
 remote hosts and live client/operator qualification remain in the full/manual lanes. Smoke and
 targeted `caseIds` are never full qualification: `releaseQualified` stays false.
 No smoke result authorizes a release, version bump, publish or production change.
+
+### Current native platform scope
+
+| Platform | Native workflow collection | Current required release evidence |
+| --- | --- | --- |
+| Linux | Smoke by default; broad matrix opt-in | Required; missing evidence blocks qualification |
+| macOS | Smoke by default; broad matrix opt-in | Required; missing evidence blocks qualification |
+| Windows | — (not run) | — (outside current native scope) |
+
+This is a scope table, not a passing-results matrix. Windows unit/package checks
+remain in manual **CI** dispatch. Historical Windows failures, including the
+[retained cleanup receipt](beta-release.md#historical-unpublished-063-preparation-checks),
+are unchanged and unresolved; omitting new native runs does not turn them into
+passes. Historical three-OS requirements are superseded only for current native
+platform scope. Linux/macOS gaps, selected case failures, cleanup, migration and
+private live/operator evidence still block their required gates. `releaseQualified`
+remains false until the complete chosen scope is independently qualified.
 
 ## Versions and capabilities
 
