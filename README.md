@@ -44,22 +44,18 @@ Want Lunch Pail Labs to set up and run agent workflows for your team? See [Pipa 
 **Runs on** macOS, Linux, and Windows. **Requires** Node.js 22 or newer, [OpenCode](https://opencode.ai) installed and authenticated, and a Slack workspace where you can create an app.
 
 ```sh
-npm install --global @usepipa/pipa
+npm install --global @usepipa/pipa@0.6.0
 pipa init
 pipa start
 ```
 
 `pipa init` walks you through Slack setup and saves your profile under `~/.pipa`. Invite Pipa to an allowed channel and mention it. Follow the [four-minute setup video](https://www.youtube.com/watch?v=rlTMdkPWPcA) or the [written tutorial](https://www.usepipa.com/opencode-slack?utm_source=github&utm_medium=repo_readme&utm_campaign=signup&utm_content=readme_install_guide).
 
-### Opt-in 0.6 beta
+### OpenCode version selection
 
-`0.6.0-beta.5` is being prepared for controlled testing, not stable release. Once published, opt in with:
+Pipa automatically detects OpenCode v1 or v2 and selects its native adapter. There is no manual Pipa migration command. OpenCode owns its data/schema upgrades; installing Pipa does not install or upgrade OpenCode.
 
-```sh
-npm install --global @usepipa/pipa@0.6.0-beta.5
-```
-
-Normal installs use npm's `latest` tag; later betas use `@beta`. This updates Pipa, not OpenCode. Before upgrading, stop Pipa and back up its profile. Keep your current OpenCode version initially. Do not rerun `pipa init` or start a second listener. Read the [beta release notes](https://github.com/lunchpaillola/pipa/blob/main/docs/beta-release.md) for limits and rollback steps.
+Unversioned installs use npm's `latest` tag; `@beta` selects the beta channel. Before upgrading, stop/drain Pipa and back up its profile. Keep your current OpenCode version initially. Do not rerun `pipa init` or start a second listener. Read the [release notes](docs/release-0.6.0.md) for limits and rollback steps.
 
 ## Security model
 
@@ -80,7 +76,7 @@ Socket Mode connects Pipa to Slack through an outbound connection. You do not ne
 1. Install Pipa:
 
 ```sh
-npm install --global @usepipa/pipa
+npm install --global @usepipa/pipa@0.6.0
 ```
 
 2. From the folder where you want Pipa to work, run:
@@ -191,12 +187,12 @@ The picker shows up to 100 matches; narrow your search for more. A listed model 
 
 **An npm upgrade does not update your Slack app, register commands, or grant scopes.** Mentions and thread replies still work without the model command. Do not rerun `pipa init` or replace credentials to add it.
 
-To upgrade to `0.5.6`, use the same `PIPA_HOME` as your existing installation (leave it unset for the default `~/.pipa` profile):
+After verified publication, stop/drain Pipa and privately back up its profile before upgrading to `0.6.0`. Keep the current OpenCode version and use the same `PIPA_HOME` as your existing installation (leave it unset for the default `~/.pipa` profile):
 
 ```sh
-npm install --global @usepipa/pipa@0.5.6
+npm install --global @usepipa/pipa@0.6.0
 pipa --version
-pipa manifest > "$HOME/pipa-slack-manifest-0.5.6.json"
+pipa manifest > "$HOME/pipa-slack-manifest-0.6.0.json"
 ```
 
 `pipa manifest` prints a local template without tokens. It does not change your profile or contact Slack. It is not an export of your app's current Slack settings.
@@ -204,14 +200,13 @@ pipa manifest > "$HOME/pipa-slack-manifest-0.5.6.json"
 1. Open your **existing app** in [Slack App Management](https://api.slack.com/apps). Back up its current manifest.
 2. Merge the desired `features.slash_commands` entries and add `commands` to `oauth_config.scopes.bot`. Keep existing settings, commands, scopes, Socket Mode, and interactivity. **Do not replace a customized Slack manifest with the local template.**
 3. Save and reinstall or reauthorize the same app. Keep your tokens unless Slack rotates them. If it does, update the existing local config securely.
-4. Restart the same profile:
+4. Start the same stopped profile with its existing launch environment:
 
 ```sh
-pipa restart
-pipa restart --status
+pipa start
 ```
 
-Wait for restart completion, then try the registered model command. The absence of a startup warning does not prove the command is installed. Renaming the bot in Slack does not update Pipa's `botName` or command registration; keep them aligned and restart.
+Wait for readiness, then try the registered model command. The absence of a startup warning does not prove the command is installed. Renaming the bot in Slack does not update Pipa's `botName` or command registration; keep them aligned and restart.
 
 To try an unpublished branch, follow the isolated test-app steps in [CONTRIBUTING.md](CONTRIBUTING.md). Never start a second Socket listener with a running installation's credentials.
 

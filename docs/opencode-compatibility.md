@@ -4,6 +4,14 @@ This guide describes the dual-adapter candidate on `feat/opencode-v1-v2`.
 It is not a release-qualified upgrade recommendation. See the [native blocker follow-up](research/opencode-native-blockers-verification.md), [U7 evidence](research/opencode-u7-verification.md)
 and [testing procedure](pipa-testing.md) before choosing a deployment pin.
 
+For the metadata/docs-only `0.6.0` release, the owner accepted reusing beta.5
+native/live and daily-use evidence without new native/live/full-matrix runs;
+see the [specific evidence exception](../CONTRIBUTING.md#060-metadatadocs-only-release-decision)
+and [publisher notes](release-0.6.0.md). The general qualification gates below
+remain policy for future changes, not an additional run requirement for this
+release. This exception does not mark missing/failed observations as passed or
+make `releaseQualified` true. Publication remains pending.
+
 ## Small-beta smoke
 
 `npm run test:beta -- --report=beta-smoke.json` runs real native **1.19.0** and
