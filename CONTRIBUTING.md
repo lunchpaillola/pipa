@@ -100,11 +100,31 @@ An opt-in beta is a limited trial, not full stable/platform qualification. For
 
 ### Stable release
 
-The stronger qualification requirements still apply to a stable dual-engine release:
+Except for the explicit 0.6.0 decision below, the stronger qualification requirements apply to future stable dual-engine releases:
 
 1. Update `package.json` and `package-lock.json` in the feature pull request.
 2. Run `npm test` and `npm run test:pack`. For this dual-engine candidate, also collect the full required Linux/macOS native OS/mode matrix, migration/rollback and private operator/live-client evidence. Windows native runs are outside the current scope; their absence alone does not block it. Missing required evidence still blocks release; the automated Slack collector alone cannot certify it.
 3. Merge after CI passes.
 4. Tag the merge as `v<version>` and push the tag.
-5. Run `npm publish --access public`.
+5. The authorized human publisher runs `npm publish --tag latest --access public` from the clean, merged, tagged release commit.
 6. Verify the published npm version, then create the matching GitHub release.
+
+### 0.6.0 metadata/docs-only release decision
+
+For this `0.6.0` promotion only, the owner explicitly accepted reusing
+`0.6.0-beta.5` native/live evidence and daily use because runtime code and the
+dependency graph are unchanged, with no fresh native/live or full-matrix runs.
+This is a release-specific evidence exception, not a claim of full
+qualification or a weaker policy for future runtime changes. Windows native is
+`—` (not run); historical failures and unobserved receipts remain unchanged, and
+`releaseQualified` remains false.
+
+Full tests in exact-`0.6.0` release PR CI, `npm run test:pack` with
+packed CLI verification, and
+`npm publish --dry-run --tag latest --access public` remain required. Record
+their actual results before publication; prior beta package checks do not replace
+them. No new tests are required for this pure version/docs change. See the
+[release notes and human publisher gate](docs/release-0.6.0.md), including the
+unfixed stale-lock/PID-reuse and dependency follow-ups. Publication is pending;
+preparation does not authorize npm login/publish, production cutover, or a public
+announcement before verified npm publication.
