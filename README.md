@@ -56,10 +56,13 @@ pipa start
 Paste this into your coding agent on the computer where Pipa will run:
 
 ```text
-Help me install Pipa Local by following https://www.usepipa.com/install.
-Check the prerequisites and guide me through setup. Ask me to complete Slack
-authentication and app setup myself; do not ask me to paste tokens into chat.
-Before changing an existing Pipa installation, explain the steps and ask me.
+Help me install Pipa Local. Check prerequisites and whether a Pipa profile
+already exists. Inspect only non-secret configuration fields; never print or
+return credentials in tool output or chat. Ask me to complete Slack
+authentication and app setup myself; never ask me to paste tokens into chat.
+For a new installation, follow https://www.usepipa.com/install. For an existing
+profile, do not run pipa init: use the README's upgrade instructions, explain
+the steps and ask me before making changes, and back up the profile first.
 ```
 
 ### Opt-in 0.6 beta
