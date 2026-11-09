@@ -1,6 +1,6 @@
 # Pipa testing strategy
 
-This is the reusable testing procedure for the dual-adapter candidate. The implementation plan's Verification Contract owns the detailed feature matrix and release gates. Harness delivery and targeted native passes do not establish release qualification. See [compatibility and operator transition](opencode-compatibility.md) and the [U7 evidence](research/opencode-u7-verification.md).
+This is the reusable testing procedure for the dual-adapter candidate. The implementation plan's Verification Contract owns the detailed feature matrix and release gates, with its historical three-OS native requirement superseded by the [current Linux/macOS scope](opencode-compatibility.md#current-native-platform-scope). Windows native is `—` (not run), not a pass or a blocker solely because it is absent. Harness delivery and targeted native passes do not establish release qualification. See [compatibility and operator transition](opencode-compatibility.md) and the [U7 evidence](research/opencode-u7-verification.md).
 
 ## Three kinds of proof
 
@@ -27,7 +27,7 @@ Harness ownership:
 | `scripts/verification/opencode-release-cases.mjs` | Shared production-path real-engine scenarios, outside default test discovery |
 | `scripts/slack-release-eval.mjs` | Serial opt-in Slack/provider collection, shared live checklist, routine evaluator reuse, optional independent restart observation; human/integration gates remain blocked |
 
-Keep the default `npm test`/`npm run test:pack` lane free of downloaded engines and live credentials. The opt-in `test:engines` lane exercises pins **1.18.35, 1.19.0, 2.0.29, and 2.2.5** against Socket-owned, Managed, and attached modes on Linux/macOS/Windows where supported. Native **2.2.5** is the current v2 qualification target; **2.0.29** remains a historical comparison pin. The SDK remains `@opencode/client@2.0.29` pending real qualification. Pin inclusion does not claim passing native tests or release readiness; historical reports qualify only their recorded cases and versions. Node 22 is the baseline. The downloaded executable's identity and package integrity must match the selected cell; no global executable is replaced. Use `--migration` for synthetic upgrade/rollback. See [runner options](../scripts/verification/README.md).
+Keep the default `npm test`/`npm run test:pack` lane free of downloaded engines and live credentials. The opt-in `test:engines` lane exercises pins **1.18.35, 1.19.0, 2.0.29, and 2.2.5** against Socket-owned, Managed, and attached modes on Linux/macOS in the current release scope. Native **2.2.5** is the current v2 qualification target; **2.0.29** remains a historical comparison pin. The SDK remains `@opencode/client@2.0.29` pending real qualification. Pin inclusion does not claim passing native tests or release readiness; historical reports qualify only their recorded cases and versions. Node 22 is the baseline. The downloaded executable's identity and package integrity must match the selected cell; no global executable is replaced. Use `--migration` for synthetic upgrade/rollback. See [runner options](../scripts/verification/README.md).
 
 Real engines are not part of automatic PR CI. Maintainers can manually dispatch
 **OpenCode compatibility**, or run `npm run test:beta`, to check start, exact

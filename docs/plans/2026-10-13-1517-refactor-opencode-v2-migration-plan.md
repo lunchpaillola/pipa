@@ -17,6 +17,7 @@ Product Contract preservation: R1 and R14 now cover both supported generations, 
 
 ## Latest Owner Scope
 
+- Current native release qualification covers Linux/macOS only. The historical three-OS requirements below are superseded by the [current platform scope](../opencode-compatibility.md#current-native-platform-scope): Windows native is `—` (not run), while manual Windows unit/package CI remains. Historical failures are preserved; Linux/macOS and all other required qualification gaps remain gating.
 - Migrate to v2 while preserving the current Pipa-on-v1 baseline, including the pre-existing model picker. No v1 feature expansion is authorized; broader historical requirements below are read within this boundary.
 - Instruction registration and its recovery journal are v2-only. V1 retains its existing per-prompt system instructions; do not add v1 instruction registration or automatic recovery merely to make the engines symmetrical.
 - A pre-existing v1 attached-command limitation is not a new migration blocker. Keep its failed observation visible and distinguish it from a candidate-introduced regression; do not expand v1 command support to clear the migration gate.
@@ -450,6 +451,8 @@ Track every server, provider listener, stream, process tree, lock, file, and non
 Use existing Windows `.cmd`/`cross-spawn` patterns and process-tree termination; avoid shell interpolation. Handle Managed bind collisions with bounded retries. Test platform-supported path/symlink behavior explicitly; a missing privilege or binary is blocked coverage, not a blanket success skip. Harness deadlines bound tests only, never valid production turns.
 
 ### Runtime and Mode Matrix
+
+The three-OS matrix below is historical. Current native scope is Linux/macOS: the broad matrix has 24 cells (4 pins × 3 modes × 2 OS jobs), and the default smoke collects 12 (2 pins × 3 modes × 2 OS jobs). Windows native remains `—` (not run); manual Windows unit/package CI remains available.
 
 Qualification pins: **1.18.35, 1.19.0, 2.0.29, 2.2.5**. Native **2.2.5** is the current v2 target; **2.0.29** remains historical. Require the same Pipa candidate on Linux, macOS, and Windows where these binaries are supported. `opencode-compatibility.yml` uses a separate no-secret job matrix; version/mode cells can share one job's cached binary installation. No paid/Slack secrets are exposed to fork pull requests.
 
