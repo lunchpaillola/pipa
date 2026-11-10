@@ -51,6 +51,20 @@ pipa start
 
 `pipa init` walks you through Slack setup and saves your profile under `~/.pipa`. Invite Pipa to an allowed channel and mention it. Follow the [four-minute setup video](https://www.youtube.com/watch?v=rlTMdkPWPcA) or the [written tutorial](https://www.usepipa.com/opencode-slack?utm_source=github&utm_medium=repo_readme&utm_campaign=signup&utm_content=readme_install_guide).
 
+### Install with your agent
+
+Paste this into your coding agent on the computer where Pipa will run:
+
+```text
+Help me install Pipa Local. Check prerequisites and whether a Pipa profile
+already exists. Inspect only non-secret configuration fields; never print or
+return credentials in tool output or chat. Ask me to complete Slack
+authentication and app setup myself; never ask me to paste tokens into chat.
+For a new installation, follow https://www.usepipa.com/install. For an existing
+profile, do not run pipa init: use the README's upgrade instructions, explain
+the steps and ask me before making changes, and back up the profile first.
+```
+
 ### OpenCode version selection
 
 Pipa automatically detects OpenCode v1 or v2 and selects its native adapter. There is no manual Pipa migration command. OpenCode owns its data/schema upgrades; installing Pipa does not install or upgrade OpenCode.
