@@ -11,6 +11,12 @@ superseded. Publish only to npm's `beta` tag and mark the GitHub release
 
 ## Changes from 0.6.0-beta.4
 
+Current native release scope is Linux/macOS; Windows is `—` (not run).
+Windows unit/package checks remain available in manual **CI**. The historical
+Windows failure receipts below are preserved, not passing results or current
+native-scope requirements. All other required evidence remains unchanged; see
+the [platform scope](opencode-compatibility.md#current-native-platform-scope).
+
 - Read preceding Slack thread discussion directly with Pipa's bot token. No Composio dependency or adapter history reader is used. New top-level requests skip the read; partial or unavailable context is identified. Historical messages are context, not new action permission.
 - Config reads have no Pipa-added deadline and remain cancellable. History access is checked before reading and after preparation, not around every page. History limitations stay in the prompt without a separate Slack warning; cancelled turns finish silently. The replacement's restart-ready notification remains.
 - When OpenCode explicitly rejects a v2 prompt because its working folder is missing, queue a native move of the same conversation to the configured starting folder, await the location change, and submit that definitely rejected request once. Do not veto native active/queued work or replay uncertain requests. The short heads-up is best-effort; missing files are not restored.
@@ -184,8 +190,9 @@ Preparation checks on macOS with Node 22.23.2:
 
 The earlier targeted native check did not execute a model task or use an external provider;
 the recovery-simplification check above executes deterministic local model tasks.
-Live Slack bot-token access, provider-backed continuation, Linux/Windows native
-behavior, and whole-release qualification remain separate. No current production
+Live Slack bot-token access, provider-backed continuation, Linux native
+behavior, and whole-release qualification remain separate. Windows native is
+outside the current scope, not newly verified. No current production
 session was repaired or restarted.
 
 Recovery heads-up delivery is best-effort, not durable. Failed or stalled Slack
