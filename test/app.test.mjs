@@ -2494,7 +2494,8 @@ test("Slack SDK routes allowlisted webhook mentions and subscribed bot replies t
   });
   t.after(() => app.shutdown());
   const send = async (ts, text, extra = {}) => {
-    const message = adapter.parseMessage({ type: "message", subtype: "bot_message", channel: "C1", bot_id: "B1", ts, text, ...extra });
+    const event = { type: "message", subtype: "bot_message", channel: "C1", bot_id: "B1", ts, text, ...extra };
+    const message = await adapter.parseSlackMessage(event, adapter.threadIdForMessageEvent(event));
     const pending = [];
     chat.processMessage(adapter, message.threadId, message, { waitUntil: (promise) => pending.push(promise) });
     await Promise.all(pending);
@@ -2503,7 +2504,7 @@ test("Slack SDK routes allowlisted webhook mentions and subscribed bot replies t
   assert.deepEqual(calls, []);
   await send("2.0", "<@UPIPA> triage this alert");
   await waitFor(() => posts.length === 1);
-  await send("3.0", "more context", { user: "UAPPBOT", thread_ts: "2.0" });
+  await send("3.0", "more context <#C1> <@U1>", { user: "UAPPBOT", thread_ts: "2.0" });
   await waitFor(() => posts.length === 2);
   await send("4.0", "unlisted bot", { bot_id: "B2", thread_ts: "2.0" });
   await send("5.0", "<@UPIPA> wrong channel", { channel: "C2" });
@@ -2511,7 +2512,7 @@ test("Slack SDK routes allowlisted webhook mentions and subscribed bot replies t
   assert.equal(calls.length, 2);
   assert.equal(calls[0], "triage this alert");
   assert.match(calls[1], /B1.*triage this alert/u);
-  assert.match(calls[1], /Current request:\nmore context$/u);
+  assert.match(calls[1], /Current request:\nmore context.*C1.*U1/u);
   assert.equal(historyReads.length, 1);
   assert.equal(historyReads[0].searchParams.get("latest"), "3.0");
   assert.deepEqual(posts, calls.map((markdown) => ({ markdown })));
