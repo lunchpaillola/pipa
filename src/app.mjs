@@ -7,6 +7,7 @@ import { canonicalWorkingDirectory, createManifest, createModelSetting, createSe
 import { createModelPicker } from "./models.mjs";
 import { formQuestion, textAnswer } from "./slack-forms.mjs";
 import { safeError } from "./errors.mjs";
+import { warnMissingSlackScopes } from "./slack-permissions.mjs";
 import { checkOpenCodeConnection, createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, parseOpenCodeVersion, PipaRestartingError, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
 import { assertRoutineDestinationAllowed, createRoutineScheduler, loadRoutineState } from "./routines.mjs";
 
@@ -1057,7 +1058,10 @@ export async function checkSlackAppToken(token, fetchImpl = fetch) {
     signal: AbortSignal.timeout(15_000),
   });
   const result = await response.json();
-  if (!response.ok || !result.ok) throw new Error("Slack rejected the app token. Generate an app-level token with the connections:write scope.");
+  if (!response.ok || !result.ok) {
+    if (result.error === "missing_scope") throw new Error("Slack Socket Mode is unavailable. Grant connections:write to the app-level token.");
+    throw new Error("Slack rejected the app token.");
+  }
   return result;
 }
 
@@ -1100,16 +1104,6 @@ function normalizeGrantedScopes(value) {
   if (Array.isArray(value) && value.every((scope) => typeof scope === "string" && scope.trim())) {
     return [...new Set(value.map((scope) => scope.trim()))];
   }
-}
-
-function warnMissingSlackScopes(auth, warn = (message) => process.stderr.write(`${message}\n`)) {
-  if (!Array.isArray(auth?.grantedScopes)) return;
-  const missing = ["channels:read", "assistant:write"].filter((scope) => !auth.grantedScopes.includes(scope));
-  const scopes = missing.join(", ");
-  try {
-    if (missing.length) warn(`Pipa warning: Slack bot token is missing recommended ${missing.length === 1 ? "scope" : "scopes"} ${scopes}. Add ${missing.length === 1 ? "it" : "them"} and reinstall or reauthorize the Slack app.`);
-    if (!auth.grantedScopes.includes("commands")) warn("Pipa warning: Slack bot token is missing the commands scope. Model slash commands are unavailable until matching commands are registered and granted in Slack. Run `pipa manifest` for the local template, merge the command definitions and commands scope into your existing Slack app, then reinstall or reauthorize it. Existing mentions and thread replies can continue; do not rerun `pipa init`.");
-  } catch {}
 }
 
 function slackContext(thread, message) {

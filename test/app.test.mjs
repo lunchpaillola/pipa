@@ -12,9 +12,10 @@ import { checkSlackAppToken, checkSlackToken, createConversationRunner, createPe
 import { PipaRestartingError, PipaStoppedError, startSocketOpenCodeServer } from "../src/opencode.mjs";
 import { createRuntimeFixture } from "./helpers/runtime-fixture.mjs";
 import { createRoutineScheduler, normalizeRoutine } from "../src/routines.mjs";
-import { createSessionStore, pipaPaths, writePrivateJson } from "../src/state.mjs";
+import { createManifest, createSessionStore, pipaPaths, writePrivateJson } from "../src/state.mjs";
 
 const startPipa = (options) => startPipaRuntime({ routinesEnabled: false, ...(options.config && !options.paths ? { loadCurrentConfig: async () => options.config } : {}), ...options });
+const slackBotScopes = ["commands", "files:read", "app_mentions:read", "assistant:write", "channels:history", "channels:read", "chat:write", "groups:history", "groups:read", "reactions:write", "users:read", "files:write"];
 
 function slackForm(t, fields, submit = async () => {}, context = {}, interaction = {}) {
   const controls = createPendingInteractions(["U1"]);
@@ -965,7 +966,7 @@ for (const botName of ["🤖", "東京"]) test(`legacy ${botName} profile starts
   let mention;
   let commands;
   let initialized = false;
-  const app = await startPipa({ paths, checkSlackToken: async () => ({ ok: true, grantedScopes: ["channels:read", "assistant:write"] }),
+  const app = await startPipa({ paths, checkSlackToken: async () => ({ ok: true, grantedScopes: slackBotScopes.filter(scope => scope !== "commands") }),
     warn: (message) => warnings.push(message),
     executor: { runTurn: async (input) => { calls.push(input); return { text: "Still working.", sessionId: "ses_legacy" }; }, stopAll() {} },
     chat: { onSlashCommand: (names) => { commands = names; }, onNewMention: (handler) => { mention = handler; }, onSubscribedMessage() {},
@@ -973,8 +974,8 @@ for (const botName of ["🤖", "東京"]) test(`legacy ${botName} profile starts
   t.after(() => app.shutdown());
   assert.equal(initialized, true);
   assert.deepEqual(commands, ["/pipa"]);
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /missing.*commands/iu);
+  assert.equal(warnings.length, 2);
+  assert.match(warnings[0], /WARNING.*commands \(bot\)/u);
   const thread = { id: "slack:C1:1.0", channel: { isDM: false }, subscribe: async () => undefined,
     adapter: { addReaction: async () => undefined, removeReaction: async () => undefined }, post: async (payload) => posts.push(payload) };
   await mention(thread, { id: "1.0", text: "work", author: { userId: "U1" }, raw: {} });
@@ -1243,7 +1244,11 @@ test("Slack auth errors never include the token", async () => {
   );
   await assert.rejects(
     checkSlackAppToken("xapp-super-secret", async () => ({ ok: false, json: async () => ({ ok: false, error: "invalid_auth" }) })),
-    (error) => error.message.includes("connections:write") && !error.message.includes("super-secret"),
+    (error) => error.message === "Slack rejected the app token." && !error.message.includes("super-secret"),
+  );
+  await assert.rejects(
+    checkSlackAppToken("xapp-super-secret", async () => ({ ok: true, json: async () => ({ ok: false, error: "missing_scope" }) })),
+    /connections:write.*app-level/u,
   );
 });
 
@@ -1277,7 +1282,10 @@ test("init and start warn about known missing Slack scopes without blocking", as
   const paths = pipaPaths(home);
   const warnings = [];
   let checks = 0;
-  const checkSlackToken = async () => ({ ok: true, grantedScopes: checks++ === 0 ? ["assistant:write", "commands"] : ["channels:read", "commands"] });
+  const checkSlackToken = async () => {
+    const missing = checks++ === 0 ? "channels:read" : "assistant:write";
+    return { ok: true, grantedScopes: slackBotScopes.filter(scope => scope !== missing) };
+  };
   await initializePipa({
     botName: "Pipa",
     slackAppToken: "xapp-test",
@@ -1303,17 +1311,14 @@ test("init and start warn about known missing Slack scopes without blocking", as
   await app.shutdown();
 
   assert.equal(warnings.length, 2);
-  assert.match(warnings[0], /channels:read/u);
-  assert.match(warnings[1], /assistant:write/u);
-  for (const warning of warnings) {
-    assert.match(warning, /Add it/u);
-    assert.match(warning, /reinstall or reauthorize/u);
-  }
+  assert.match(warnings[0], /⚠ WARNING.*Public-channel names.*channels:read \(bot\)/u);
+  assert.equal(warnings[1], "Still available: Public-channel text requests and replies.");
+  assert.doesNotMatch(warnings.join("\n"), /assistant:write|reinstall|reauthorize/u);
 });
 
 test("complete or unknown Slack scope metadata does not warn", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-scopes-"));
-  for (const grantedScopes of [["channels:read", "assistant:write", "commands"], undefined]) {
+  for (const grantedScopes of [slackBotScopes, slackBotScopes.filter(scope => scope !== "assistant:write"), [...slackBotScopes, "canvases:read", "canvases:write", "unrelated:extra"], undefined]) {
     const warnings = [];
     await initializePipa({
       botName: "Pipa",
@@ -1333,16 +1338,117 @@ test("complete or unknown Slack scope metadata does not warn", async () => {
 
 test("missing commands scope explains the existing-app upgrade without blocking ordinary mentions", async () => {
   const warnings = [];
-  const delivery = await deliveryApp({ text: "Still working." }, { slackAuth: { ok: true, grantedScopes: ["channels:read", "assistant:write"] }, warn: (message) => warnings.push(message) });
+  const delivery = await deliveryApp({ text: "Still working." }, { slackAuth: { ok: true, grantedScopes: slackBotScopes.filter(scope => scope !== "commands") }, warn: (message) => warnings.push(message) });
   await delivery.mention();
   await waitFor(() => delivery.posts.length === 1);
   assert.deepEqual(delivery.posts, [{ markdown: "Still working." }]);
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /missing.*commands/iu);
-  assert.match(warnings[0], /pipa manifest/u);
-  assert.match(warnings[0], /register|registration/iu);
-  assert.match(warnings[0], /reinstall or reauthorize/u);
-  assert.match(warnings[0], /mentions.*thread/iu);
+  assert.equal(warnings.length, 2);
+  assert.match(warnings[0], /WARNING.*Model slash commands unavailable.*commands \(bot\)/u);
+  assert.doesNotMatch(warnings[0], /reinstall|reauthorize/u);
+  assert.match(warnings[1], /Public-channel text requests and replies/u);
+  await delivery.app.shutdown();
+});
+
+test("Slack permission notices cover every generated bot capability without treating defaults as requirements", async () => {
+  assert.deepEqual(createManifest("Pipa").oauth_config.scopes.bot, slackBotScopes);
+  assert.deepEqual(createManifest("Pipa").oauth_config.scopes.user, ["files:read", "files:write"]);
+  const impacts = {
+    "chat:write": /ERROR.*cannot send text replies/u,
+    "app_mentions:read": /ERROR.*Mention events unavailable/u,
+    "channels:history": /WARNING.*Unmentioned public-channel follow-ups and preceding thread context unavailable/u,
+    "groups:history": /WARNING.*Unmentioned private-channel follow-ups and preceding thread context unavailable/u,
+    "channels:read": /WARNING.*Public-channel names unavailable/u,
+    "groups:read": /WARNING.*Private-channel names unavailable/u,
+    commands: /WARNING.*Model slash commands unavailable/u,
+    "files:read": /WARNING.*Incoming file contents unavailable/u,
+    "files:write": /WARNING.*File uploads unavailable/u,
+    "reactions:write": /WARNING.*Receipt and result reactions unavailable/u,
+    "users:read": /WARNING.*User names and profiles unavailable/u,
+  };
+  for (const [scope, impact] of Object.entries(impacts)) {
+    const warnings = [];
+    const delivery = await deliveryApp({}, { slackAuth: { ok: true, grantedScopes: slackBotScopes.filter(value => value !== scope) }, warn: value => warnings.push(value) });
+    await delivery.app.shutdown();
+    assert.match(warnings[0], impact, scope);
+    assert.ok(warnings[0].includes(`${scope} (bot)`), scope);
+    assert.match(warnings[0], /ask your Slack app admin/iu);
+    assert.doesNotMatch(warnings.join("\n"), /INFO|Missing:|Next:|Help:|reinstall|provider|model error/u);
+  }
+});
+
+test("Slack permission notices combine related losses and honor status alternatives and unknown grants", async () => {
+  const cases = [
+    { scopes: slackBotScopes.filter(scope => !["files:write", "reactions:write", "groups:history"].includes(scope)), count: 4 },
+    { scopes: ["assistant:write"], count: 11 },
+    { scopes: [], count: 12 },
+    { scopes: undefined, count: 0 },
+  ];
+  for (const { scopes, count } of cases) {
+    const warnings = [];
+    const delivery = await deliveryApp({}, { slackAuth: { ok: true, grantedScopes: scopes }, warn: value => warnings.push(value) });
+    await delivery.app.shutdown();
+    assert.equal(warnings.length, count);
+    const text = warnings.join("\n");
+    if (count === 4) {
+      assert.equal((text.match(/groups:history/gu) ?? []).length, 1);
+      assert.equal((text.match(/Still available:/gu) ?? []).length, 1);
+      assert.match(warnings[0], /File uploads/u);
+      assert.match(warnings[1], /reactions/u);
+      assert.match(warnings[2], /private-channel/u);
+    }
+    if (count >= 11) {
+      assert.match(warnings[0], /ERROR.*text replies/u);
+      assert.doesNotMatch(text, /Still available/u);
+      assert.equal(text.includes("Processing status unavailable"), scopes.length === 0);
+    }
+  }
+});
+
+test("missing optional Slack grants and status failures do not block mentions or subscribed replies", async () => {
+  for (const startTyping of [() => { throw new Error("missing_scope"); }, async () => { throw new Error("missing_scope"); }]) {
+    const warnings = [];
+    const delivery = await deliveryApp({ text: "Reply delivered." }, {
+      startTyping, failReactions: true,
+      slackAuth: { ok: true, grantedScopes: slackBotScopes.filter(scope => !["assistant:write", "reactions:write"].includes(scope)) },
+      warn: value => warnings.push(value),
+    });
+    const noticeCount = warnings.length;
+    await delivery.mention();
+    await waitFor(() => delivery.posts.length === 1);
+    await delivery.reply();
+    await waitFor(() => delivery.posts.length === 2);
+    assert.deepEqual(delivery.posts, [{ markdown: "Reply delivered." }, { markdown: "Reply delivered." }]);
+    assert.equal(warnings.length, noticeCount, "scope notices must not repeat per message");
+    assert.doesNotMatch(warnings.join("\n"), /assistant:write|Processing status/u);
+    await delivery.app.shutdown();
+  }
+});
+
+test("Slack permission notices do not rewrite provider failures", async () => {
+  const warnings = [];
+  const delivery = await deliveryApp(new Error("Bedrock model unavailable"), {
+    slackAuth: { ok: true, grantedScopes: slackBotScopes.filter(scope => scope !== "files:write") },
+    warn: value => warnings.push(value),
+  });
+  await delivery.mention();
+  await waitFor(() => delivery.posts.length === 1);
+  assert.deepEqual(delivery.posts, ["Pipa failed: Bedrock model unavailable"]);
+  assert.match(warnings[0], /File uploads unavailable/u);
+  assert.doesNotMatch(warnings.join("\n"), /Bedrock|provider|assistant:write/u);
+  await delivery.app.shutdown();
+});
+
+test("a throwing Slack notice callback stops notices without blocking startup or replies", async () => {
+  let notices = 0;
+  const delivery = await deliveryApp({ text: "Reply delivered." }, {
+    slackAuth: { ok: true, grantedScopes: ["assistant:write"] },
+    warn: () => { notices++; throw new Error("notice sink unavailable"); },
+  });
+  assert.equal(notices, 1);
+  await delivery.mention();
+  await waitFor(() => delivery.posts.length === 1);
+  assert.deepEqual(delivery.posts, [{ markdown: "Reply delivered." }]);
+  assert.equal(notices, 1);
   await delivery.app.shutdown();
 });
 
@@ -1530,9 +1636,9 @@ test("conversation runner starts typing once for active turns and ignores typing
     sessionStore: { get: () => null, set: async () => undefined },
     runTurn: async ({ prompt }) => ({ text: prompt, sessionId: `ses_${prompt}` }),
   });
-  await runner.enqueue("A", { prompt: "one", startTyping: () => typing.push("one") });
-  await runner.enqueue("A", { prompt: "two", startTyping: () => { throw new Error("typing unavailable"); } });
-  await runner.enqueue("B", { prompt: "three", startTyping: async () => { throw new Error("typing unavailable"); } });
+  assert.equal((await runner.enqueue("A", { prompt: "one", startTyping: () => typing.push("one") })).text, "one");
+  assert.equal((await runner.enqueue("A", { prompt: "two", startTyping: () => { throw new Error("typing unavailable"); } })).text, "two");
+  assert.equal((await runner.enqueue("B", { prompt: "three", startTyping: async () => { throw new Error("typing unavailable"); } })).text, "three");
   assert.deepEqual(typing, ["one"]);
 });
 
@@ -2012,20 +2118,21 @@ test("inline fallback prefers paragraphs and lines and preserves fenced code acr
   await delivery.app.shutdown();
 });
 
-async function deliveryApp(result, { failFiles = false, slackAuth = { ok: true }, warn } = {}) {
+async function deliveryApp(result, { failFiles = false, slackAuth = { ok: true }, warn, startTyping = async () => undefined, failReactions = false } = {}) {
   const handlers = {};
   const posts = [];
   const reactions = [];
   const chat = {
     onNewMention(handler) { handlers.mention = handler; },
-    onSubscribedMessage() {},
+    onSubscribedMessage(handler) { handlers.reply = handler; },
     async initialize() {},
     async shutdown() {},
   };
   const app = await startPipa({
     chat,
-    executor: { runTurn: async () => ({ ...result, sessionId: "ses_1" }), stopAll() {} },
+    executor: { runTurn: async () => { if (result instanceof Error) throw result; return { ...result, sessionId: "ses_1" }; }, stopAll() {} },
     checkSlackToken: async () => slackAuth,
+    slackFetch: async () => Response.json({ ok: true, messages: [] }),
     warn,
     sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
     config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
@@ -2033,11 +2140,12 @@ async function deliveryApp(result, { failFiles = false, slackAuth = { ok: true }
   const thread = {
     id: "slack:C1:1.0",
     adapter: {
-      addReaction: async (_, __, emoji) => reactions.push(`add:${emoji}`),
+      addReaction: async (_, __, emoji) => { if (failReactions) throw new Error("missing_scope"); reactions.push(`add:${emoji}`); },
       removeReaction: async (_, __, emoji) => reactions.push(`remove:${emoji}`),
     },
     channel: { isDM: false, channelVisibility: "private" },
     subscribe: async () => undefined,
+    startTyping,
     post: async (payload) => {
       posts.push(payload);
       if (failFiles && payload.files) throw new Error("adapter rejected files");
@@ -2048,6 +2156,7 @@ async function deliveryApp(result, { failFiles = false, slackAuth = { ok: true }
     posts,
     reactions,
     mention: () => handlers.mention(thread, { id: "1", text: "@Pipa work", author: { userId: "U1" }, raw: {} }),
+    reply: () => handlers.reply(thread, { id: "2", text: "follow up", author: { userId: "U1" }, raw: { ts: "2.0", thread_ts: "1.0" } }),
   };
 }
 
@@ -2370,11 +2479,18 @@ test("Socket drain stops ingress before accepting a late modal-close envelope", 
 test("Slack SDK routes allowlisted webhook mentions and subscribed bot replies to Pipa", async (t) => {
   const adapter = createSlackAdapter({ signingSecret: "test", botToken: "xoxb-test", botUserId: "UPIPA", userName: "Pipa" });
   const posts = [];
+  const statuses = [];
+  const warnings = [];
   // Only outbound Slack APIs are replaced; parsing, routing and authorization are real.
   adapter.postMessage = async (threadId, text) => { posts.push(text); return { id: "reply", threadId, raw: {} }; };
   adapter.addReaction = async () => undefined;
   adapter.removeReaction = async () => undefined;
-  adapter.startTyping = async () => undefined;
+  adapter._client.assistant.threads.setStatus = async (payload) => { statuses.push(payload); throw new Error("missing_scope"); };
+  adapter._client.users.info = async () => { throw new Error("missing_scope"); };
+  adapter._client.conversations.info = async () => { throw new Error("missing_scope"); };
+  adapter.logger.warn = () => undefined;
+  assert.equal(await adapter.lookupUser("U1"), null);
+  assert.equal(await adapter.lookupChannel("C1"), "C1");
   const chat = new Chat({ adapters: { slack: adapter }, state: createMemoryState(), concurrency: "concurrent", userName: "Pipa", logger: "silent" });
   const calls = [];
   const historyReads = [];
@@ -2385,13 +2501,15 @@ test("Slack SDK routes allowlisted webhook mentions and subscribed bot replies t
       return Response.json({ ok: true, messages: [{ ts: "2.0", bot_id: "B1", text: "triage this alert" }] });
     },
     executor: { runTurn: async ({ prompt }) => { calls.push(prompt); return { text: prompt, sessionId: "ses_bot" }; }, stopAll() {} },
-    checkSlackToken: async () => ({ ok: true }),
+    checkSlackToken: async () => ({ ok: true, grantedScopes: slackBotScopes.filter(scope => scope !== "assistant:write") }),
+    warn: value => warnings.push(value),
     sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
     config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work", allowedSlackChannelIds: ["C1"], allowedSlackBotIds: ["B1"] },
   });
   t.after(() => app.shutdown());
   const send = async (ts, text, extra = {}) => {
-    const message = adapter.parseMessage({ type: "message", subtype: "bot_message", channel: "C1", bot_id: "B1", ts, text, ...extra });
+    const event = { type: "message", subtype: "bot_message", channel: "C1", bot_id: "B1", ts, text, ...extra };
+    const message = await adapter.parseSlackMessage(event, adapter.threadIdForMessageEvent(event));
     const pending = [];
     chat.processMessage(adapter, message.threadId, message, { waitUntil: (promise) => pending.push(promise) });
     await Promise.all(pending);
@@ -2400,7 +2518,7 @@ test("Slack SDK routes allowlisted webhook mentions and subscribed bot replies t
   assert.deepEqual(calls, []);
   await send("2.0", "<@UPIPA> triage this alert");
   await waitFor(() => posts.length === 1);
-  await send("3.0", "more context", { user: "UAPPBOT", thread_ts: "2.0" });
+  await send("3.0", "more context <#C1> <@U1>", { user: "UAPPBOT", thread_ts: "2.0" });
   await waitFor(() => posts.length === 2);
   await send("4.0", "unlisted bot", { bot_id: "B2", thread_ts: "2.0" });
   await send("5.0", "<@UPIPA> wrong channel", { channel: "C2" });
@@ -2408,10 +2526,13 @@ test("Slack SDK routes allowlisted webhook mentions and subscribed bot replies t
   assert.equal(calls.length, 2);
   assert.equal(calls[0], "triage this alert");
   assert.match(calls[1], /B1.*triage this alert/u);
-  assert.match(calls[1], /Current request:\nmore context$/u);
+  assert.match(calls[1], /Current request:\nmore context.*C1.*U1/u);
   assert.equal(historyReads.length, 1);
   assert.equal(historyReads[0].searchParams.get("latest"), "3.0");
   assert.deepEqual(posts, calls.map((markdown) => ({ markdown })));
+  assert.equal(statuses.length, 2, "the real adapter must still attempt status without assistant:write");
+  assert.ok(statuses.every(payload => payload.status === "Working on it..."));
+  assert.deepEqual(warnings, []);
 });
 
 test("routine scheduler uses an exact destination and binds replies to its fresh session", async () => {

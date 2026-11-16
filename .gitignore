@@ -6,7 +6,8 @@ node_modules/
 .DS_Store
 .opencode/.gitignore
 .opencode/goals/
-.opencode/skills/
+.opencode/skills/*
+!.opencode/skills/verify-slack-permissions/
 docs/plans/*
 !docs/plans/2026-10-13-1517-refactor-opencode-v2-migration-plan.md
 tmp/slack-routine-evals/

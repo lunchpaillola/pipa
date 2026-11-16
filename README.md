@@ -117,6 +117,50 @@ On v2, Pipa tries to continue the saved conversation normally. If OpenCode expli
 
 Startup waits for OpenCode and Slack to be ready, with no default overall timeout. Ctrl+C stops startup and processes Pipa owns, not attached servers. See [OpenCode compatibility](docs/opencode-compatibility.md) for startup, session, and upgrade details.
 
+### Slack permissions
+
+The generated manifest requests the out-of-box experience, **not a minimum set of mandatory permissions**. `pipa init` and `pipa start` explain missing capabilities from the bot token's reported grants, without blocking startup:
+
+```text
+✖ ERROR — Pipa cannot send text replies. Ask your Slack app admin to grant chat:write (bot) to enable replies.
+⚠ WARNING — File uploads unavailable. To enable uploads, ask your Slack app admin to grant files:write (bot).
+```
+
+ERROR means a core path is unavailable; WARNING means an enhancement or channel-specific capability is unavailable. Each notice connects the consequence to its fix. Related private-channel follow-up/context losses share one notice. A single “Still available” line may identify unaffected public-channel text capabilities based on the reported scopes; it is not a live connection or provider test. The subsequent Socket Mode connection message does not establish that replies or every feature work.
+
+Healthy grants produce no permission checklist. Missing `assistant:write` alone produces no notice when `chat:write` is present. Extra grants and scopes Pipa does not use are ignored. If scope metadata is unavailable or unusable, the existing check stays silent rather than guessing that permissions are missing. An actual authentication, Slack operation or OpenCode/provider error is separate; adding an optional Slack scope does not fix a provider/model failure.
+
+#### Requested scopes and actual use
+
+All links below describe current official Slack permissions. This audit covers Pipa and its pinned Slack adapter, not independently configured OpenCode tools or MCP integrations. “Required” applies to the named path, not every possible entry point. The xoxb bot token supplies all bot rows; Slack may also support these scopes on other token types.
+
+| Scope | Token | Requirement and impact when absent |
+| --- | --- | --- |
+| [connections:write](https://docs.slack.dev/reference/scopes/connections.write/) | App-level (`xapp-`), requested separately during setup | **Core Socket Mode:** required to open the event connection. Not a bot scope. Managed profiles need no Slack permissions. |
+| [app_mentions:read](https://docs.slack.dev/reference/scopes/app_mentions.read/) | Bot | **Core mention-event path:** allows the subscribed `app_mention` event. Without it that event path is unavailable; channel message subscriptions are separate entry paths. |
+| [chat:write](https://docs.slack.dev/reference/scopes/chat.write/) | Bot | **Core replies:** sends text replies and interaction feedback. Without it Pipa cannot post ordinary replies. Also authorizes current processing-status calls. |
+| [channels:history](https://docs.slack.dev/reference/scopes/channels.history/) | Bot | **Public-channel experience:** receives `message.channels` events and reads preceding thread context. Without it unmentioned public-channel follow-ups/context are unavailable; new mention events are a separate path. |
+| [groups:history](https://docs.slack.dev/reference/scopes/groups.history/) | Bot | **Private-channel experience:** the equivalent dependency for `message.groups` and private thread context. Does not affect public-channel history. |
+| [commands](https://docs.slack.dev/reference/scopes/commands/) | Bot | **Optional model slash commands:** required for this entry point, not ordinary mentions/replies. Matching command registration and interactivity are also needed. |
+| [files:read](https://docs.slack.dev/reference/scopes/files.read/) | Bot | **Optional incoming files:** the adapter downloads private attachment URLs using the bot token. Missing access can fail an attachment-bearing request; plain text does not need it. |
+| [files:write](https://docs.slack.dev/reference/scopes/files.write/) | Bot | **Optional outgoing files:** the adapter uploads artifacts and full-form details. Artifact delivery has a text-only fallback, not a guarantee that every file-dependent interaction works. |
+| [reactions:write](https://docs.slack.dev/reference/scopes/reactions.write/) | Bot | **Optional receipt/result reactions:** eyes/success/failure reactions are best-effort: rejections are caught, but a slow or pending receipt reaction can delay the reply because Pipa awaits it before enqueueing the turn. |
+| [channels:read](https://docs.slack.dev/reference/scopes/channels.read/) | Bot | **Optional public-channel names:** adapter `conversations.info` lookups resolve channel references; denied lookups fall back to IDs. Not required for every text reply. |
+| [groups:read](https://docs.slack.dev/reference/scopes/groups.read/) | Bot | **Optional private-channel names:** the corresponding metadata permission; denied lookups fall back to IDs. |
+| [users:read](https://docs.slack.dev/reference/scopes/users.read/) | Bot | **Optional user names/profiles:** adapter `users.info` lookups enrich authors and mentions. IDs remain available for Pipa authorization. Email access is not requested. |
+| [assistant:write](https://docs.slack.dev/reference/scopes/assistant.write/) | Bot | **Transitional alternative for processing status**, not required for ordinary replies or a prerequisite for DMs. Pipa currently calls only `assistant.threads.setStatus`; `chat:write` already satisfies that method. |
+| [files:read](https://docs.slack.dev/reference/scopes/files.read/), [files:write](https://docs.slack.dev/reference/scopes/files.write/) | User (`xoxp-`), generated user grants | **Unused by Pipa's runtime:** Pipa accepts app/bot tokens, not a user token. These user grants do not authorize its bot downloads/uploads. The generated defaults are retained; Pipa does not automatically remove grants. |
+
+As checked on November 16, 2026, Slack's [status-method documentation](https://docs.slack.dev/reference/methods/assistant.threads.setStatus/) and [scope-update changelog](https://docs.slack.dev/changelog/2026/03/05/set-status-scope-update/) allow **`chat:write` OR `assistant:write`**. Slack explicitly describes the latter as transitional and plans to accept only `chat:write`. Do not rely on it as a lasting alternative. Pipa keeps its existing best-effort typing call and default manifest; failed status calls do not block replies. The pinned adapter's comment about requiring `assistant:write` and the assistant split view predates this Slack change. This is documentation/contract evidence, not a live Slack rendering test.
+
+Pipa does **not** request [canvases:read](https://docs.slack.dev/reference/scopes/canvases.read/) or [canvases:write](https://docs.slack.dev/reference/scopes/canvases.write/), or invoke canvas APIs. The adapter can recognize a canvas ID, but that is not canvas content support. No canvas permissions warning is warranted. DMs remain excluded; granting `assistant:write` does not enable them.
+
+#### Enabling a capability
+
+Enable only the optional capabilities you want. Use `pipa manifest` to inspect the local template, then merge the desired scopes/commands into the **existing** Slack app; do not overwrite a customized manifest or rerun `pipa init`. If you change granted scopes, Slack may require installation/reauthorization. A package upgrade alone does not change app grants.
+
+Scopes alone are not sufficient: keep Socket Mode enabled, install/invite the bot to the intended channels, subscribe the matching events, and keep Pipa's channel/user allowlists correct. Private-channel access needs membership. Model slash commands also need matching definitions and interactivity; see [existing-installation upgrades](#upgrading-an-existing-installation). Scope metadata describes the bot token only, not app-level or user-token grants. App-token preflight remains separate and reports a required scope only for Slack's explicit `missing_scope` rejection. Permission notices are printed once per init/start invocation, not on each message or status attempt; no new logs or permission probes are added.
+
 ### Files
 
 Include a text prompt with attachments. Incoming messages allow up to 10 files, each at most 10 MiB. Temporary copies are removed after the turn. Your model must support the files you send.
