@@ -1438,6 +1438,20 @@ test("Slack permission notices do not rewrite provider failures", async () => {
   await delivery.app.shutdown();
 });
 
+test("a throwing Slack notice callback stops notices without blocking startup or replies", async () => {
+  let notices = 0;
+  const delivery = await deliveryApp({ text: "Reply delivered." }, {
+    slackAuth: { ok: true, grantedScopes: ["assistant:write"] },
+    warn: () => { notices++; throw new Error("notice sink unavailable"); },
+  });
+  assert.equal(notices, 1);
+  await delivery.mention();
+  await waitFor(() => delivery.posts.length === 1);
+  assert.deepEqual(delivery.posts, [{ markdown: "Reply delivered." }]);
+  assert.equal(notices, 1);
+  await delivery.app.shutdown();
+});
+
 test("starts and health-checks OpenCode before Slack, then stops only the owned server", async () => {
   const events = [];
   const controller = new AbortController();

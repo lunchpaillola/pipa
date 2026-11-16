@@ -13,11 +13,12 @@ From the Pipa checkout, use Node 22+ and installed dependencies (`npm ci` only i
 
 ## Doctor
 
-Run `git status --short --branch`, `git rev-parse HEAD` and `node --version`. Check the intended revision and inspect `src/app.mjs`'s capability map plus [the feature map](features/README.md). Never run `pipa start` against the operator's profile as a substitute for these tests.
+Run `git status --short --branch`, `git rev-parse HEAD` and `node --version`. Check the intended revision and inspect `src/slack-permissions.mjs`'s capability map plus [the feature map](features/README.md). Never run `pipa start` against the operator's profile as a substitute for these tests.
 
 ## Drive
 
 ```sh
+node scripts/verification/slack-permissions.mjs 2>&1 | tee /path/outside/checkout/slack-permissions.log
 node --test test/app.test.mjs test/state.test.mjs
 npm test
 npm run test:pack
@@ -25,6 +26,8 @@ git diff --check
 ```
 
 The focused suite must prove init/start notices and successful mention/follow-up delivery, not merely call a formatter. It also exercises the pinned adapter's real status method with controlled outbound APIs, metadata ID fallbacks and unchanged default manifest grants. See [permission notices](features/permissions.md) for the observable contract.
+
+The capture command executes production `initializePipa`/`startPipa`, saving and loading configuration in the existing disposable runtime fixture. It prints actual notices through the injected warning sink and captures fake outbound posts, asserting healthy silence, core loss, optional/private loss copy/order, and mention/subscribed delivery through rejected status/reactions. Auth, Chat ingress and executor are injected; this is not a full Socket CLI start. Package smoke separately exercises actual CLI init and Managed start. Use a clean committed checkout for revision-bound evidence; the capture labels dirty development runs.
 
 ## Evidence
 
