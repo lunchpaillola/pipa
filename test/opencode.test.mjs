@@ -561,6 +561,8 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
   assert.match(promptBody.system, /not as shell environment variables/u);
   assert.match(promptBody.system, /PIPA_MESSAGE_CHANNEL=slack/u);
   assert.match(promptBody.system, /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
+  assert.match(promptBody.system, /PIPA_CURRENT_SLACK_THREAD_TS=123\.456/u);
+  assert.match(promptBody.system, /If earlier context is needed, read the Slack thread/u);
   assert.match(promptBody.system, /consult `pipa routine --help`/u);
   assert.match(promptBody.system, /run `pipa restart --channel C1 --thread 123\.456`/u);
   assert.match(promptBody.system, /existing messaging authorization is sufficient/u);
