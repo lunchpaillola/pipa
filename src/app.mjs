@@ -1057,7 +1057,10 @@ export async function checkSlackAppToken(token, fetchImpl = fetch) {
     signal: AbortSignal.timeout(15_000),
   });
   const result = await response.json();
-  if (!response.ok || !result.ok) throw new Error("Slack rejected the app token. Generate an app-level token with the connections:write scope.");
+  if (!response.ok || !result.ok) {
+    if (result.error === "missing_scope") throw new Error("Slack Socket Mode is unavailable. Grant connections:write to the app-level token.");
+    throw new Error("Slack rejected the app token.");
+  }
   return result;
 }
 
@@ -1102,13 +1105,42 @@ function normalizeGrantedScopes(value) {
   }
 }
 
+const SLACK_CAPABILITIES = [
+  { scopes: ["chat:write"], level: "ERROR",
+    message: "Pipa cannot send text replies. Ask your Slack app admin to grant chat:write (bot) to enable replies." },
+  { scopes: ["app_mentions:read"], level: "ERROR",
+    message: "Mention events unavailable. To enable mention events, ask your Slack app admin to grant app_mentions:read (bot)." },
+  { scopes: ["files:write"], level: "WARNING",
+    message: "File uploads unavailable. To enable uploads, ask your Slack app admin to grant files:write (bot)." },
+  { scopes: ["reactions:write"], level: "WARNING",
+    message: "Receipt and result reactions unavailable. To enable reactions, ask your Slack app admin to grant reactions:write (bot)." },
+  { scopes: ["groups:history"], level: "WARNING",
+    message: "Unmentioned private-channel follow-ups and preceding thread context unavailable. If you use private channels, ask your Slack app admin to grant groups:history (bot)." },
+  { scopes: ["channels:history"], level: "WARNING",
+    message: "Unmentioned public-channel follow-ups and preceding thread context unavailable. If you use public channels, ask your Slack app admin to grant channels:history (bot)." },
+  { scopes: ["commands"], level: "WARNING",
+    message: "Model slash commands unavailable. To enable them, ask your Slack app admin to grant commands (bot) and register the matching commands from pipa manifest; do not rerun pipa init." },
+  { scopes: ["files:read"], level: "WARNING",
+    message: "Incoming file contents unavailable. To read attached files, ask your Slack app admin to grant files:read (bot)." },
+  { scopes: ["channels:read"], level: "WARNING",
+    message: "Public-channel names unavailable; IDs remain visible. To enable names, ask your Slack app admin to grant channels:read (bot)." },
+  { scopes: ["groups:read"], level: "WARNING",
+    message: "Private-channel names unavailable; IDs remain visible. To enable names, ask your Slack app admin to grant groups:read (bot)." },
+  { scopes: ["users:read"], level: "WARNING",
+    message: "User names and profiles unavailable; user IDs remain visible. To enable profiles, ask your Slack app admin to grant users:read (bot)." },
+  // Slack currently accepts assistant:write as a transitional alternative to chat:write for setStatus.
+  { scopes: ["chat:write", "assistant:write"], level: "WARNING",
+    message: "Processing status unavailable. To enable it, ask your Slack app admin to grant chat:write (bot)." },
+];
+
 function warnMissingSlackScopes(auth, warn = (message) => process.stderr.write(`${message}\n`)) {
   if (!Array.isArray(auth?.grantedScopes)) return;
-  const missing = ["channels:read", "assistant:write"].filter((scope) => !auth.grantedScopes.includes(scope));
-  const scopes = missing.join(", ");
+  const unavailable = SLACK_CAPABILITIES.filter(capability => !capability.scopes.some(scope => auth.grantedScopes.includes(scope)));
   try {
-    if (missing.length) warn(`Pipa warning: Slack bot token is missing recommended ${missing.length === 1 ? "scope" : "scopes"} ${scopes}. Add ${missing.length === 1 ? "it" : "them"} and reinstall or reauthorize the Slack app.`);
-    if (!auth.grantedScopes.includes("commands")) warn("Pipa warning: Slack bot token is missing the commands scope. Model slash commands are unavailable until matching commands are registered and granted in Slack. Run `pipa manifest` for the local template, merge the command definitions and commands scope into your existing Slack app, then reinstall or reauthorize it. Existing mentions and thread replies can continue; do not rerun `pipa init`.");
+    for (const capability of unavailable) warn(`${capability.level === "ERROR" ? "✖" : "⚠"} ${capability.level} — ${capability.message}`);
+    if (unavailable.length && ["chat:write", "app_mentions:read", "channels:history"].every(scope => auth.grantedScopes.includes(scope))) {
+      warn("Still available: Public-channel text requests and replies.");
+    }
   } catch {}
 }
 
