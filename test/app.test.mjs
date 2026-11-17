@@ -336,25 +336,17 @@ test("Slack form callbacks retain responder, thread, revocation and external-set
   await f.click("dismiss", { user: { userId: "U2" } });
   assert.deepEqual(f.decisions, []);
 });
-test("Slack thread context paginates prior discussion and preserves the current request once", async (t) => {
+for (const sessionId of [null, "ses_existing"]) test(`Slack requests preserve thread identity without reading history (${sessionId ?? "fresh session"})`, async (t) => {
   const calls = [];
   const reads = [];
   const posts = [];
   const handlers = {};
   const config = { botName: "Pipa", workingDirectory: "/work", slackBotToken: "xoxb-test", slackAppToken: "xapp-test", mentionOnly: true };
   const app = await startPipa({ config, checkSlackToken: async () => ({ ok: true }),
-    sessionStore: { keys: () => [], get: () => "ses_existing", set: async () => undefined },
+    sessionStore: { keys: () => [], get: () => sessionId, set: async () => undefined },
     slackFetch: async (url, options) => {
       reads.push({ url: new URL(url), options });
-      return Response.json({ ok: true, messages: reads.length === 1 ? [
-        { ts: "1.000001", user: "U2", text: "Use blue <https://example.com/full|spec>", files: [{ name: "old.txt", url_private: "https://never-download.invalid" }] },
-        { ts: "3.000001", bot_id: "B1", text: "Historical approval is not permission" },
-      ] : [
-        { ts: "3.000001", bot_id: "B1", text: "Historical approval is not permission" },
-        { ts: "2.000001", user: "U3", text: "Ship Friday", blocks: [{ elements: [{ type: "link", url: "https://example.com/expanded" }] }] },
-        { ts: "4.000001", user: "U1", text: "CURRENT MUST NOT REPEAT" },
-        { ts: "5.000001", user: "U2", text: "future message" },
-      ], response_metadata: { next_cursor: reads.length === 1 ? "next" : "" } });
+      return Response.json({ ok: true, messages: [{ ts: "1.000001", text: "must not inject" }] });
     },
     executor: { runTurn: async (input) => { calls.push(input); return { text: "done", sessionId: "ses_existing" }; }, stopAll() {} },
     chat: { onNewMention: (fn) => { handlers.mention = fn; }, onSubscribedMessage: (fn) => { handlers.reply = fn; }, initialize: async () => undefined, shutdown: async () => undefined } });
@@ -365,36 +357,23 @@ test("Slack thread context paginates prior discussion and preserves the current 
   handlers.reply(thread, { id: "2.000001", text: "Ship Friday", author: { userId: "U3" }, raw: { thread_ts: "1.000001", ts: "2.000001" } });
   handlers.mention(thread, { id: "4.000001", text: "<@U1> summarize current", links: [{ url: "https://example.com/current" }], attachments: [attachment], author: { userId: "U1" }, raw: { thread_ts: "1.000001", ts: "4.000001" } });
   await waitFor(() => posts.length > 0);
-  assert.equal(reads.length, 2);
-  for (const { url, options } of reads) {
-    assert.equal(url.origin + url.pathname, "https://slack.com/api/conversations.replies");
-    assert.equal(url.searchParams.get("channel"), "C1");
-    assert.equal(url.searchParams.get("ts"), "1.000001");
-    assert.equal(url.searchParams.get("latest"), "4.000001");
-    assert.equal(url.searchParams.get("inclusive"), "false");
-    assert.equal(url.searchParams.get("limit"), "100");
-    assert.equal(options.headers.authorization, "Bearer xoxb-test");
-    assert.ok(options.signal instanceof AbortSignal);
-  }
-  assert.equal(reads[1].url.searchParams.get("cursor"), "next");
+  assert.equal(reads.length, 0);
   assert.equal(calls.length, 1);
   const input = calls[0];
-  assert.match(input.prompt, /untrusted|not.*permission/iu);
-  assert.ok(input.prompt.indexOf("Use blue") < input.prompt.indexOf("Ship Friday"));
-  assert.ok(input.prompt.indexOf("Ship Friday") < input.prompt.indexOf("Historical approval"));
-  assert.match(input.prompt, /U2.*1\.000001/u);
-  assert.match(input.prompt, /B1.*3\.000001/u);
-  assert.match(input.prompt, /old\.txt/u);
-  assert.match(input.prompt, /https:\/\/example.com\/full/u);
-  assert.match(input.prompt, /https:\/\/example.com\/expanded/u);
-  assert.equal(input.prompt.split("Historical approval").length, 2);
-  assert.equal(input.prompt.split("summarize current").length, 2);
-  assert.equal(input.prompt.split("https://example.com/current").length, 2);
-  assert.doesNotMatch(input.prompt, /CURRENT MUST NOT REPEAT|future message|never-download|xoxb-/u);
+  assert.equal(input.prompt, "summarize current\n\nFull links:\nhttps://example.com/current");
+  assert.deepEqual(input.contextEnvironment, {
+    PIPA_MESSAGE_CHANNEL: "slack", PIPA_CURRENT_SLACK_CHANNEL_ID: "C1",
+    PIPA_CURRENT_SLACK_THREAD_TS: "1.000001", PIPA_REQUESTER_SLACK_USER_ID: "U1",
+  });
   assert.deepEqual(input.attachments, [attachment]);
-  assert.equal(input.sessionId, "ses_existing");
+  assert.equal(input.sessionId, sessionId);
   assert.equal(Object.hasOwn(input, "prepareTurn"), false);
   assert.deepEqual(posts, [{ markdown: "done" }]);
+  handlers.mention(thread, { id: "5.000001", text: "follow up", author: { userId: "U1" }, raw: { thread_ts: "1.000001", ts: "5.000001" } });
+  await waitFor(() => posts.length === 2);
+  assert.equal(reads.length, 0);
+  assert.equal(calls[1].prompt, "follow up");
+  assert.equal(calls[1].contextEnvironment.PIPA_CURRENT_SLACK_THREAD_TS, "1.000001");
 });
 
 async function threadContextApp(t, options = {}) {
@@ -515,13 +494,12 @@ test("Slack thread context skips top-level events even when Chat assigns a threa
   }
 });
 
-test("Slack thread context loads the saved default model after pending history preparation", async (t) => {
+test("Slack requests load the saved default model after pending authorization", async (t) => {
   const entered = Promise.withResolvers();
   const release = Promise.withResolvers();
   let current = { defaultModel: { providerID: "provider", modelID: "old" } };
-  const fixture = await threadContextApp(t, { loadCurrentConfig: async () => current,
-    sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
-    slackFetch: async () => { entered.resolve(); await release.promise; return Response.json({ ok: true, messages: [] }); } });
+  const fixture = await threadContextApp(t, { loadCurrentConfig: async () => { entered.resolve(); await release.promise; return current; },
+    sessionStore: { keys: () => [], get: () => null, set: async () => undefined } });
   fixture.send();
   await entered.promise;
   current = { defaultModel: { providerID: "provider", modelID: "fresh" } };
@@ -531,84 +509,9 @@ test("Slack thread context loads the saved default model after pending history p
   assert.equal(fixture.calls[0].sessionId, null, "A newly created session must receive the fresh fallback");
 });
 
-for (const failure of ["missing scope", "rate limited", "transport", "invalid JSON"]) test(`Slack thread context falls back safely when ${failure}`, async (t) => {
-  const fixture = await threadContextApp(t, { slackFetch: async () => {
-    if (failure === "transport") throw new Error("credential xoxb-must-not-leak");
-    if (failure === "rate limited") return new Response("xoxb-must-not-leak", { status: 429 });
-    if (failure === "invalid JSON") return new Response("xoxb-must-not-leak");
-    return Response.json({ ok: false, error: "missing_scope", secret: "xoxb-must-not-leak" });
-  } });
-  fixture.send();
-  await waitFor(() => fixture.calls.length === 1);
-  assert.equal(fixture.reads.length, 1);
-  assert.match(fixture.calls[0].prompt, /discussion is unavailable/u);
-  assert.match(fixture.calls[0].prompt, /Current request:\ncurrent request$/u);
-  assert.equal(fixture.posts.filter((post) => typeof post === "string").length, 0);
-  assert.doesNotMatch(JSON.stringify({ calls: fixture.calls, posts: fixture.posts }), /xoxb-/u);
-});
-
-test("Slack thread context retains collected history when a later page fails", async (t) => {
-  let pages = 0;
-  const fixture = await threadContextApp(t, { slackFetch: async () => ++pages === 1 ? Response.json({ ok: true, messages: [{ ts: "1.000001", user: "U2", text: "collected root" }], response_metadata: { next_cursor: "next" } }) : new Response("", { status: 429 }) });
-  fixture.send();
-  await waitFor(() => fixture.calls.length === 1);
-  assert.equal(pages, 2);
-  assert.match(fixture.calls[0].prompt, /discussion is partial.*Slack history unavailable/u);
-  assert.match(fixture.calls[0].prompt, /collected window 1\.000001–1\.000001/u);
-  assert.match(fixture.calls[0].prompt, /collected root/u);
-});
-
-test("Slack thread context bounds pages and labels the collected window rather than claiming latest history", async (t) => {
-  let pages = 0;
-  const fixture = await threadContextApp(t, { slackFetch: async () => Response.json({ ok: true,
-    messages: [{ ts: `${++pages}.000001`, user: "U2", text: `collected ${pages}` }], response_metadata: { next_cursor: `cursor-${pages}` } }) });
-  fixture.send("99.000001");
-  await waitFor(() => fixture.calls.length === 1);
-  assert.equal(pages, 10);
-  assert.match(fixture.calls[0].prompt, /partial \(page limit\).*collected window 1\.000001–10\.000001/u);
-  assert.doesNotMatch(fixture.calls[0].prompt, /latest discussion/u);
-  assert.equal(fixture.posts.filter((post) => typeof post === "string").length, 0);
-});
-
-test("Slack thread context counts Unicode and metadata bytes while retaining root and latest collected replies", async (t) => {
-  const fixture = await threadContextApp(t, { slackFetch: async () => Response.json({ ok: true,
-    messages: [{ ts: "1.000001", user: "U2", text: "root retained" }, ...Array.from({ length: 30 }, (_, i) => ({
-      ts: `${i + 2}.000001`, user: "U3", text: `reply ${i + 2} ${"🌈".repeat(400)}`, files: [{ name: `${"名".repeat(100)}.txt`, content: "BODY NOT CONTEXT" }],
-    }))], response_metadata: { next_cursor: "must-not-read" } }) });
-  fixture.send("99.000001");
-  await waitFor(() => fixture.calls.length === 1);
-  const history = fixture.calls[0].prompt.split("\n\nCurrent request:")[0];
-  assert.ok(Buffer.byteLength(history) <= 24 * 1024);
-  assert.match(history, /partial \(byte limit\)/u);
-  assert.match(history, /root retained/u);
-  assert.match(history, /reply 31 /u);
-  assert.doesNotMatch(history, /reply 2 |BODY NOT CONTEXT|�/u);
-  assert.equal(fixture.reads.length, 1);
-});
-
-test("Slack thread context uses one overall fifteen-second deadline and no retry", async (t) => {
-  mockHistoryDeadline(t);
-  const entered = Promise.withResolvers();
-  const fixture = await threadContextApp(t, { slackFetch: async (_url, { signal }) => {
-    entered.resolve();
-    await new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
-  } });
-  fixture.send();
-  await entered.promise;
-  t.mock.timers.tick(14_999);
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(fixture.calls.length, 0);
-  t.mock.timers.tick(1);
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(fixture.calls.length, 1);
-  assert.match(fixture.calls[0].prompt, /unavailable \(time limit\)/u);
-  assert.equal(fixture.reads.length, 1);
-});
-
 test("Slack thread failure delivery respects a newly enabled mention-only gate", async (t) => {
-  const fixture = await threadContextApp(t, { slackFetch: async () => {
-    fixture.config.mentionOnly = true;
-    return Response.json({ ok: true, messages: [] });
+  const fixture = await threadContextApp(t, { loadCurrentConfig: async () => {
+    return { ...fixture.config, mentionOnly: true };
   } });
   fixture.reply(fixture.thread, { id: "4.000001", text: "current request", isMention: false,
     author: { userId: "U1" }, raw: { ts: "4.000001", thread_ts: "1.000001" } });
@@ -627,63 +530,12 @@ function mockHistoryDeadline(t) {
   });
 }
 
-test("Slack thread context shares the deadline across slow pages", async (t) => {
-  mockHistoryDeadline(t);
-  const secondPage = Promise.withResolvers();
-  let pages = 0;
-  const fixture = await threadContextApp(t, { slackFetch: async () => {
-    pages++;
-    if (pages === 1) return new Promise((resolve) => setTimeout(() => resolve(Response.json({ ok: true,
-      messages: [{ ts: "1.000001", text: "collected root" }], response_metadata: { next_cursor: "next" } })), 8_000));
-    secondPage.resolve();
-    return new Promise((resolve) => setTimeout(() => resolve(Response.json({ ok: true,
-      messages: [{ ts: "2.000001", text: "too late" }] })), 8_000));
-  } });
-  fixture.send();
-  await new Promise((resolve) => setImmediate(resolve));
-  t.mock.timers.tick(8_000);
-  await secondPage.promise;
-  t.mock.timers.tick(7_000);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(fixture.calls.length, 1);
-  assert.match(fixture.calls[0].prompt, /partial \(time limit\)/u);
-  assert.match(fixture.calls[0].prompt, /collected root/u);
-  assert.doesNotMatch(fixture.calls[0].prompt, /too late/u);
-  assert.equal(pages, 2);
-});
-
-test("Slack thread context multipage deadline includes a slow first page and stalled second page", async (t) => {
-  mockHistoryDeadline(t);
-  const secondPage = Promise.withResolvers();
-  const fixture = await threadContextApp(t, { slackFetch: async (_url, { signal }) => {
-    if (fixture.reads.length === 1) return new Promise((resolve) => setTimeout(() => resolve(Response.json({ ok: true,
-      messages: [{ ts: "1.000001", text: "collected before deadline" }], response_metadata: { next_cursor: "next" } })), 12_000));
-    secondPage.resolve();
-    return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
-  } });
-  fixture.send();
-  await new Promise((resolve) => setImmediate(resolve));
-  t.mock.timers.tick(12_000);
-  await secondPage.promise;
-  t.mock.timers.tick(2_999);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(fixture.calls.length, 0, "Do not finish before the overall fifteen-second deadline");
-  t.mock.timers.tick(1);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(fixture.calls.length, 1, "A second page must not receive a fresh fifteen-second budget");
-  assert.equal(fixture.reads.length, 2);
-  assert.match(fixture.calls[0].prompt, /partial \(time limit\)/u);
-  assert.match(fixture.calls[0].prompt, /collected before deadline/u);
-});
-
-for (const phase of ["before history", "after history"]) test(`Slack thread authorization cancellation settles a stalled config read ${phase}`, async (t) => {
+test("Slack thread authorization cancellation settles a stalled config read", async (t) => {
   const stalled = Promise.withResolvers();
-  let historyRead = false;
   const fixture = await threadContextApp(t, { background: true, loadCurrentConfig: async () => {
-    if ((phase === "after history") !== historyRead) return {};
     stalled.resolve();
     return new Promise(() => undefined);
-  }, slackFetch: async () => { historyRead = true; return Response.json({ ok: true, messages: [] }); } });
+  } });
   fixture.send();
   await stalled.promise;
   let timeout;
@@ -738,9 +590,9 @@ test("shutdown cancels a pending failure-delivery config read without posting", 
 
 for (const reason of [new PipaStoppedError(), new PipaRestartingError()]) test(`Slack thread cancellation finishes silently for ${reason.constructor.name}`, async (t) => {
   const entered = Promise.withResolvers();
-  const fixture = await threadContextApp(t, { slackFetch: async (_url, { signal }) => {
+  const fixture = await threadContextApp(t, { loadCurrentConfig: async () => {
     entered.resolve();
-    return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    return new Promise(() => {});
   } });
   fixture.send();
   await entered.promise;
@@ -750,15 +602,14 @@ for (const reason of [new PipaStoppedError(), new PipaRestartingError()]) test(`
   assert.deepEqual(fixture.posts, []);
 });
 
-for (const phase of ["before history", "after history"]) test(`Slack thread config waits without an arbitrary deadline ${phase}`, async (t) => {
+test("Slack thread config waits without an arbitrary deadline", async (t) => {
   mockHistoryDeadline(t);
   const entered = Promise.withResolvers();
   const release = Promise.withResolvers();
-  let historyRead = false;
   const fixture = await threadContextApp(t, { loadCurrentConfig: async () => {
-    if ((phase === "after history") === historyRead) { entered.resolve(); await release.promise; }
+    entered.resolve(); await release.promise;
     return { botName: "Pipa", workingDirectory: "/work" };
-  }, slackFetch: async () => { historyRead = true; return Response.json({ ok: true, messages: [] }); } });
+  } });
   fixture.send();
   await entered.promise;
   try {
@@ -813,11 +664,11 @@ test("closing a native-steering runner aborts every inflight local turn and drai
   assert.equal(drained, true);
 });
 
-test("Slack thread context rejects denied traffic before reading and rechecks authorization before admission", async (t) => {
+test("Slack requests reject denied traffic and recheck authorization before admission", async (t) => {
   const entered = Promise.withResolvers();
   const release = Promise.withResolvers();
   const fixture = await threadContextApp(t, { config: { allowedSlackChannelIds: ["C1"], allowedSlackUserIds: ["U1"] },
-    slackFetch: async () => { entered.resolve(); await release.promise; return Response.json({ ok: true, messages: [] }); } });
+    loadCurrentConfig: async () => { entered.resolve(); await release.promise; return fixture.config; } });
   fixture.send("3.000001", { author: { userId: "U2" } });
   fixture.send("3.000001", { author: { userId: "B1", isBot: true }, raw: { ts: "3.000001", thread_ts: "1.000001", bot_id: "B1" } });
   fixture.send("3.000001", {}, { ...fixture.thread, id: "slack:C2:1.000001" });
@@ -832,7 +683,7 @@ test("Slack thread context rejects denied traffic before reading and rechecks au
   assert.deepEqual(fixture.posts, []);
 });
 
-test("Slack thread context checks fresh authorization before the first read", async (t) => {
+test("Slack requests check fresh authorization before admission", async (t) => {
   const entered = Promise.withResolvers();
   const release = Promise.withResolvers();
   let current = { botName: "Pipa", workingDirectory: "/work", allowedSlackUserIds: ["U1"] };
@@ -851,25 +702,17 @@ test("Slack thread context checks fresh authorization before the first read", as
   assert.deepEqual(fixture.posts, []);
 });
 
-test("Slack thread context keeps history limitations in the prompt without a separate Slack notice", async (t) => {
-  const fixture = await threadContextApp(t, { slackFetch: async () => Response.json({ ok: false }), post: async () => {
-    fixture.config.allowedSlackChannelIds = ["C2"];
-  } });
-  fixture.send();
-  await waitFor(() => fixture.finished.length === 1);
-  assert.equal(fixture.calls.length, 1);
-  assert.match(fixture.calls[0].prompt, /discussion is unavailable/u);
-  assert.equal(fixture.posts.length, 1);
-  assert.deepEqual(fixture.posts[0], { markdown: "done" });
-});
-
-test("Slack thread context suppresses queued subscribed failure after mention-only is enabled", async (t) => {
+test("Slack requests suppress queued subscribed failure after mention-only is enabled", async (t) => {
   const entered = Promise.withResolvers();
   const release = Promise.withResolvers();
-  const fixture = await threadContextApp(t, { background: true, slackFetch: async () => {
-    entered.resolve();
-    await release.promise;
-    return Response.json({ ok: true, messages: [] });
+  let first = true;
+  const fixture = await threadContextApp(t, { background: true, loadCurrentConfig: async () => {
+    if (first) {
+      first = false;
+      entered.resolve();
+      await release.promise;
+    }
+    return fixture.config;
   } });
   fixture.send();
   await entered.promise;
@@ -880,23 +723,26 @@ test("Slack thread context suppresses queued subscribed failure after mention-on
   release.resolve();
   await waitFor(() => fixture.finished.length === 2);
   assert.equal(fixture.calls.length, 1);
-  assert.equal(fixture.reads.length, 1);
+  assert.equal(fixture.reads.length, 0);
   assert.deepEqual(fixture.posts, [{ markdown: "done" }]);
 });
 
-test("Slack thread context uses message ID when the raw timestamp is absent", async (t) => {
+test("Slack requests preserve thread identity when the raw timestamp is absent", async (t) => {
   const fixture = await threadContextApp(t);
   fixture.send("4.000001", { raw: { thread_ts: "1.000001" } });
   await waitFor(() => fixture.calls.length === 1);
-  assert.equal(fixture.reads[0].url.searchParams.get("latest"), "4.000001");
+  assert.equal(fixture.reads.length, 0);
+  assert.equal(fixture.calls[0].contextEnvironment.PIPA_CURRENT_SLACK_THREAD_TS, "1.000001");
+  assert.equal(fixture.calls[0].prompt, "current request");
 });
 
-for (const mode of ["shutdown", "replacement", "native steering"]) test(`Slack thread context preserves queue order and thread independence during ${mode}`, async (t) => {
+for (const mode of ["shutdown", "replacement", "native steering"]) test(`Slack requests preserve queue order and thread independence without history during ${mode}`, async (t) => {
   const entered = Promise.withResolvers();
   const release = Promise.withResolvers();
-  const fixture = await threadContextApp(t, { background: mode === "native steering", slackFetch: async (url) => {
-    if (new URL(url).searchParams.get("latest") === "4.000001") { entered.resolve(); await release.promise; }
-    return Response.json({ ok: true, messages: [] });
+  let first = true;
+  const fixture = await threadContextApp(t, { background: mode === "native steering", loadCurrentConfig: async () => {
+    if (first) { first = false; entered.resolve(); await release.promise; }
+    return fixture.config;
   } });
   fixture.send();
   await entered.promise;
@@ -913,24 +759,24 @@ for (const mode of ["shutdown", "replacement", "native steering"]) test(`Slack t
   }
   fixture.send("5.000001", { text: "<@U1> newer request" });
   await new Promise((resolve) => setImmediate(resolve));
-  if (mode === "native steering") assert.equal(fixture.reads.length, 2, "The second same-thread read must wait for admission");
+  assert.equal(fixture.reads.length, 0);
   release.resolve();
   await waitFor(() => fixture.calls.length === (mode === "replacement" ? 2 : 3));
   assert.match(fixture.calls.at(-1).prompt, /newer request$/u);
   assert.equal(fixture.calls.filter((input) => input.prompt.endsWith("current request")).length, mode === "replacement" ? 0 : 1);
+  assert.equal(fixture.reads.length, 0);
+  assert.ok(fixture.calls.every(input => ["current request", "other thread", "newer request"].includes(input.prompt)));
 });
 
-test("Slack thread context shutdown aborts earlier native-steering preparation with a newer turn queued", async (t) => {
+test("Slack shutdown cancels earlier native-steering authorization with a newer turn queued", async (t) => {
   const entered = Promise.withResolvers();
   const release = Promise.withResolvers();
-  let historySignal;
   const fixture = await threadContextApp(t, { background: true,
     abortTurn: () => assert.fail("V2 shutdown must not interrupt native sessions"),
-    slackFetch: async (_url, { signal }) => {
-      historySignal = signal;
+    loadCurrentConfig: async () => {
       entered.resolve();
-      await Promise.race([release.promise, new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }))]);
-      return Response.json({ ok: true, messages: [] });
+      await release.promise;
+      return {};
     } });
   fixture.send();
   await entered.promise;
@@ -939,11 +785,10 @@ test("Slack thread context shutdown aborts earlier native-steering preparation w
   let timeout;
   try {
     await Promise.race([fixture.app.shutdown(), new Promise((_, reject) => {
-      timeout = setTimeout(() => reject(new Error("Shutdown waited for history instead of cancelling it")), 500);
+      timeout = setTimeout(() => reject(new Error("Shutdown waited for authorization instead of cancelling it")), 500);
     })]);
-    assert.equal(historySignal.aborted, true);
     assert.equal(fixture.calls.length, 0);
-    assert.equal(fixture.reads.length, 1);
+    assert.equal(fixture.reads.length, 0);
   } finally {
     clearTimeout(timeout);
     release.resolve();
@@ -2525,10 +2370,9 @@ test("Slack SDK routes allowlisted webhook mentions and subscribed bot replies t
   await send("6.0", "<@UPIPA> self", { user: "UPIPA" });
   assert.equal(calls.length, 2);
   assert.equal(calls[0], "triage this alert");
-  assert.match(calls[1], /B1.*triage this alert/u);
-  assert.match(calls[1], /Current request:\nmore context.*C1.*U1/u);
-  assert.equal(historyReads.length, 1);
-  assert.equal(historyReads[0].searchParams.get("latest"), "3.0");
+  assert.match(calls[1], /^more context.*C1.*U1/u);
+  assert.doesNotMatch(calls[1], /triage this alert|Earlier Slack discussion/u);
+  assert.equal(historyReads.length, 0);
   assert.deepEqual(posts, calls.map((markdown) => ({ markdown })));
   assert.equal(statuses.length, 2, "the real adapter must still attempt status without assistant:write");
   assert.ok(statuses.every(payload => payload.status === "Working on it..."));
