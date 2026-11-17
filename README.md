@@ -35,9 +35,9 @@ If Pipa is useful, [star the repo](https://github.com/lunchpaillola/pipa).
 | **Routines** | Schedule work in your timezone. Send results to a channel or thread. |
 | **Access control** | Choose which Slack channels, people, and bots can use Pipa. |
 
-## Pipa Managed
+## Pipa for Teams
 
-Want Lunch Pail Labs to set up and run agent workflows for your team? See [Pipa Managed](https://usepipa.com/managed?utm_source=github&utm_medium=repo_readme&utm_campaign=signup&utm_content=readme_footer).
+Pipa is free and open source. [Pipa for Teams](https://www.usepipa.com/teams?utm_source=github&utm_medium=repo_readme&utm_campaign=teams&utm_content=readme) is an optional service for organizations: deployment and configuration for agreed workflows using supported integrations, plus training and handover.
 
 ## Quickstart
 
