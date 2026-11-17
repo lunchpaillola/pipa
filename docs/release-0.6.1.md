@@ -6,7 +6,7 @@ Neither a draft nor this version-bump PR authorizes tagging, npm publication,
 installation, or restart. npm `latest` was `0.6.0` and `beta` was
 `0.6.0-beta.5` at preparation; recheck before any separately approved publication.
 
-GitHub draft: [Pipa 0.6.1](https://github.com/lunchpaillola/pipa/releases/tag/untagged-a2f9159b3380de63506d),
+GitHub draft: [Pipa 0.6.1](https://github.com/lunchpaillola/pipa/releases/tag/untagged-7b86c2cf25104c663eb4),
 release ID `447679446`. Its provisional target is the feature merge below, not
 a merged `0.6.1` version-bump commit.
 
@@ -26,6 +26,36 @@ a merged `0.6.1` version-bump commit.
   replies because it is awaited before enqueueing. Scheduling is unchanged.
 
 ## Evidence and limits
+
+### Slack history removal
+
+[PR #76](https://github.com/lunchpaillola/pipa/pull/76) was squash-merged into
+the release branch as `5906b29095ec60e796b3d1fad647f913ef5d29d9`.
+Pipa no longer fetches or injects prior Slack messages when assembling any turn.
+The current request, attachments/full links, channel/thread identity, explicit
+Slack tools and authorization remain available. Agents receive a short
+read-on-demand instruction. Existing OpenCode history is not cleared or rewritten.
+
+The fix head passed 557 full-suite tests, installed-package checks and Linux CI.
+The test count fell because tests for the removed history loader were removed;
+authorization, cancellation and queue coverage were retained. Fresh and existing
+session regressions failed before the fix and pass afterward.
+
+Fresh release-branch checks passed the 28 verification self-checks and installed
+package smoke for all three existing engine contracts. Stable publish dry-run
+contains 15 expected public files, reports `0.6.1`, and includes the history fix.
+All three package/lock version fields match. No package was published.
+
+Fresh Linux/macOS native matrix and migration collection was dispatched in
+[this workflow](https://github.com/lunchpaillola/pipa/actions/runs/43984076115).
+Dispatch is not a passing result or whole-release qualification. Live Slack and
+operator/client gates remain separate; the running profile was not changed.
+npm authentication returned E401; the publisher must sign in before publication.
+Registry checks still show `latest: 0.6.0`, `beta: 0.6.0-beta.5`, and no `0.6.1`.
+The fresh audit still reports two high-severity transitive findings (`axios` and
+`follow-redirects`); dependency changes were not mixed into this fix.
+
+### Prior permission-guidance evidence
 
 The exact feature head passed 171 focused tests, 569 full tests, package smoke
 for the existing 1.19.0/2.0.29/2.2.5 contracts and
@@ -58,8 +88,8 @@ remain unresolved; see [the prior release notes](release-0.6.0.md).
 
 ## Remaining release gates
 
-1. Review this metadata/docs PR and its exact-version checks/CI. Merge requires
-   approval separate from the already-merged feature PR. The main-branch package
+1. Review the combined release PR and its exact-version checks/CI. The owner
+   authorized squash-merging the fix and preparing publication. The main-branch package
    remains `0.6.0` until this version bump is merged.
 2. Resolve the stable qualification requirements in
    [CONTRIBUTING](../CONTRIBUTING.md#stable-release); retain every missing or failed
