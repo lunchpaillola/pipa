@@ -113,6 +113,10 @@ On OpenCode v2, replies steer ongoing work, and background results can return to
 
 Pipa sends only your current request, attachments/full links, and Slack channel/thread identity to OpenCode. It does not automatically fetch or inject earlier Slack messages, even for a new or replacement session. Existing OpenCode sessions retain their own conversation history. When earlier context is needed, the agent can explicitly read the Slack thread using its available Slack tools; old messages are context, not fresh permission to act.
 
+When Pipa starts its own OpenCode v2 server for Slack, it registers `pipa_slack` automatically. These tools use the existing bot's Slack permissions and memberships, without starting another listener or falling back to a personal account. Invite the bot only to conversations you want it to be able to act in. If the helper isn't ready at startup, Pipa warns and continues to handle ordinary replies. Pipa does not configure these tools on attached servers or OpenCode v1.
+
+Explicit Slack file transfers use `slack-files` inside the private Pipa profile directory. Stage a top-level file there to upload it; downloads (up to 10 MiB) are saved there without overwriting files. These downloads are kept for you to use or remove, unlike temporary incoming message attachments.
+
 On v2, Pipa tries to continue the saved conversation normally. If OpenCode explicitly rejects the prompt because that session's working folder is missing, Pipa queues a native move to the configured starting folder, waits for the location to change, then resubmits that rejected request once. OpenCode owns active and queued work; Pipa does not veto, clear, or replay it. A short Slack heads-up is best-effort and never required for continuation. Missing files are not restored. Transport-uncertain requests are never automatically replayed. Startup, stop, and restart behavior are unchanged.
 
 Startup waits for OpenCode and Slack to be ready, with no default overall timeout. Ctrl+C stops startup and processes Pipa owns, not attached servers. See [OpenCode compatibility](docs/opencode-compatibility.md) for startup, session, and upgrade details.

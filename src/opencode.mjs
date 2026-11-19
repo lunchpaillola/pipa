@@ -4,7 +4,7 @@ import { constants } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createV1Adapter } from "./opencode-v1.mjs";
 import { createV2Adapter } from "./opencode-v2.mjs";
 import { normalizeModel } from "./state.mjs";
@@ -56,6 +56,15 @@ export async function startSocketOpenCodeServer(config, options = {}) {
   const identity = parseOpenCodeVersion(await (options.checkOpenCode ?? runOpenCodeVersion)(options));
   options.signal?.throwIfAborted();
   const childEnvironment = ownedEnvironment(environment, identity.major);
+  const chatTools = identity.major === 2 && Boolean(config.slackBotToken);
+  if (chatTools) {
+    const inline = JSON.parse(childEnvironment.OPENCODE_CONFIG_CONTENT || "{}");
+    inline.mcp ??= {};
+    inline.mcp.servers ??= {};
+    if (Object.hasOwn(inline.mcp.servers, "pipa_slack")) throw new Error("OpenCode inline configuration already defines the reserved pipa_slack server.");
+    inline.mcp.servers.pipa_slack = { type: "local", codemode: false, command: [process.execPath, fileURLToPath(new URL("./slack-mcp.mjs", import.meta.url)), childEnvironment.PIPA_HOME] };
+    childEnvironment.OPENCODE_CONFIG_CONTENT = JSON.stringify(inline);
+  }
   const spawn = options.spawn ?? crossSpawn;
   const platform = options.platform ?? process.platform;
   const child = spawn("opencode", [
@@ -84,6 +93,10 @@ export async function startSocketOpenCodeServer(config, options = {}) {
       checkOpenCodeConnection(baseUrl, config.workingDirectory, { ...options, environment: childEnvironment, identity, signal: startupSignal }),
       exit.then((code) => { throw new Error(`OpenCode server exited before startup with code ${code}.`); }),
     ]);
+    if (chatTools) await Promise.race([
+      waitForSlackTools(connection, options, startupSignal),
+      exit.then((code) => { throw new Error(`OpenCode server exited before Slack tools were ready with code ${code}.`); }),
+    ]);
     return { ...ownedServer(baseUrl, child, exit, platform), connection };
   } catch (error) {
     terminateChild(child, platform);
@@ -92,6 +105,35 @@ export async function startSocketOpenCodeServer(config, options = {}) {
   } finally {
     controller.abort();
   }
+}
+
+async function waitForSlackTools(connection, options, signal) {
+  const readiness = AbortSignal.any([signal, AbortSignal.timeout(options.startupTimeoutMs ?? 15_000)]);
+  const url = new URL("/api/mcp", connection.baseUrl);
+  url.searchParams.set("location[directory]", connection.workingDirectory);
+  try {
+    while (!readiness.aborted) {
+      let response;
+      try { response = await (options.fetch ?? fetch)(url, { headers: connection.headers, redirect: "error", signal: readiness }); }
+      catch (error) { if (!isNetworkError(error)) throw error; }
+      if (!response || [502, 503, 504].includes(response.status)) {
+        await response?.body?.cancel();
+        await delay(100, readiness);
+        continue;
+      }
+      if (!response.ok) { await response.body?.cancel(); break; }
+      const { data: servers } = await response.json();
+      const status = Array.isArray(servers) && servers.find((server) => server.name === "pipa_slack")?.status?.status;
+      if (status === "connected") return;
+      if (status && status !== "pending") break;
+      await delay(100, readiness);
+    }
+  } catch {
+    // A failed helper must not prevent the Slack listener from starting.
+  }
+  signal.throwIfAborted();
+  const warn = options.warn ?? ((message) => process.stderr.write(`${message}\n`));
+  warn("WARNING: Pipa Slack tools did not become ready. Continuing with ordinary Slack replies. Check the selected profile and OpenCode version.");
 }
 
 export function createOpenCodeExecutor(options = {}) {
@@ -492,13 +534,13 @@ function parseArtifactDeclaration(text) {
   return { text: cleanText, paths };
 }
 
-function validArtifactPath(value) {
+export function validArtifactPath(value) {
   if (!value || Buffer.byteLength(value) > MAX_ARTIFACT_PATH_BYTES || value.includes("\0") || value.includes("\\") || path.isAbsolute(value)) return false;
   const parts = value.split("/");
   return parts.length === 1 && parts[0] !== "." && parts[0] !== "..";
 }
 
-async function readArtifacts(directory, paths, onOpened) {
+export async function readArtifacts(directory, paths, onOpened) {
   const files = [];
   let total = 0;
   try {
@@ -509,9 +551,10 @@ async function readArtifacts(directory, paths, onOpened) {
       let current = root;
       for (const part of relativePath.split("/")) {
         current = path.join(current, part);
-        if ((await lstat(current)).isSymbolicLink()) throw new Error("Artifact path contains a symbolic link.");
+        const stat = await lstat(current);
+        if (stat.isSymbolicLink() || (current === filename && !stat.isFile())) throw new Error("Artifact is not a regular file.");
       }
-      const handle = await open(filename, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      const handle = await open(filename, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
       try {
         const before = await handle.stat({ bigint: true });
         await onOpened?.(filename);
@@ -543,7 +586,7 @@ function changedFile(before, after) {
   return before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs;
 }
 
-function sanitizeFilename(value, fallback = "artifact") {
+export function sanitizeFilename(value, fallback = "artifact") {
   const sanitized = value.replace(/[<>:"/\\|?*\u0000-\u001f]/gu, "_").replace(/[. ]+$/u, "");
   return Array.from(sanitized).reduce((result, character) => Buffer.byteLength(result + character) <= 200 ? result + character : result, "") || fallback;
 }

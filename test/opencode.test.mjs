@@ -409,6 +409,43 @@ test("starts one owned loopback server on port 0 and stops it", async () => {
   assert.equal(killed, true);
 });
 
+for (const finalStatus of ["connected", "failed"]) test(`owned v2 startup with Slack tools ${finalStatus}`, async () => {
+  const child = childProcess();
+  let killed = false;
+  child.kill = () => { killed = true; queueMicrotask(() => child.emit("close", 0)); return true; };
+  const statuses = [503, "pending", finalStatus];
+  const warnings = [];
+  const server = await startSocketOpenCodeServer({ workingDirectory: "/work", slackBotToken: "synthetic-secret" }, {
+    checkOpenCode: async () => "2.0.29",
+    startupTimeoutMs: 2500,
+    warn: (message) => warnings.push(message),
+    environment: { PIPA_HOME: "/profile", PIPA_SLACK_BOT_TOKEN: "synthetic-secret", OPENCODE_CONFIG_CONTENT: '{"mcp":{"servers":{"other":{"type":"local","command":["other"]}}}}' },
+    spawn(_command, _args, options) {
+      const inline = JSON.parse(options.env.OPENCODE_CONFIG_CONTENT);
+      assert.equal(inline.mcp.servers.pipa_slack.command.at(-1), path.resolve("/profile"));
+      assert.deepEqual(inline.mcp.servers.other.command, ["other"]);
+      assert.ok(!JSON.stringify(options.env).includes("synthetic-secret"));
+      queueMicrotask(() => child.stdout.write("opencode server listening on http://127.0.0.1:54321\n"));
+      return child;
+    },
+    fetch: async (url) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/global/health") return new Response("<html>");
+      if (pathname === "/api/info") return jsonResponse(v2Info);
+      if (pathname === "/api/location") return jsonResponse(v2Location);
+      assert.equal(pathname, "/api/mcp");
+      const status = statuses.shift();
+      return status === 503 ? jsonResponse({}, 503) : jsonResponse({ data: [{ name: "pipa_slack", status: { status } }] });
+    },
+  });
+  assert.deepEqual(statuses, []);
+  assert.equal(killed, false);
+  server.stop();
+  await server.wait();
+  assert.equal(warnings.length, finalStatus === "failed" ? 1 : 0);
+  if (finalStatus === "failed") assert.match(warnings[0], /Continuing with ordinary Slack replies/u);
+});
+
 test("checks an authenticated attached workspace without owning it", async () => {
   let spawned = false;
   const requests = [];
