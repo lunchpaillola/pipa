@@ -8,7 +8,7 @@ import { slackActions } from "./slack-actions.mjs";
 const channel = z.string().regex(/^[CG][A-Z0-9]+$/u);
 const ts = z.string().regex(/^\d{10}\.\d{6}$/u);
 const text = z.string().min(1).max(4000).refine((value) => value.trim().length > 0, "Provide non-blank text.");
-const emoji = z.string().regex(/^[\w+-]+$/u).max(100);
+const emoji = z.string().regex(/^[\w+-]+(?:::skin-tone-[2-6])?$/u).max(100);
 
 try {
   const home = process.argv[2];

@@ -1,9 +1,31 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { slackActions } from "../src/slack-actions.mjs";
+
+test("both MCP reaction schemas accept Slack skin tones and reject invalid names", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-reaction-schema-"));
+  const mcp = new Client({ name: "reaction-schema-test", version: "1" });
+  try {
+    await mkdir(path.join(home, ".pipa"));
+    await writeFile(path.join(home, ".pipa", "config.json"), JSON.stringify({ botName: "Fixture", workingDirectory: home, slackBotToken: "xoxb-synthetic", slackAppToken: "xapp-synthetic" }));
+    await mcp.connect(new StdioClientTransport({ command: process.execPath, args: [fileURLToPath(new URL("../src/slack-mcp.mjs", import.meta.url)), home] }));
+    const { tools } = await mcp.listTools();
+    for (const name of ["add_reaction", "remove_reaction"]) {
+      const pattern = new RegExp(tools.find((tool) => tool.name === name).inputSchema.properties.name.pattern, "u");
+      for (const valid of ["wave", "wave::skin-tone-3", "thumbsup::skin-tone-6"]) assert.match(valid, pattern);
+      for (const invalid of ["wave::skin-tone-1", "wave::skin-tone-7", "::skin-tone-3", "bad emoji::skin-tone-3"]) assert.doesNotMatch(invalid, pattern);
+    }
+  } finally {
+    await mcp.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
 
 test("reads a linked thread by its parent timestamp and returns pagination", async () => {
   const actions = slackActions({ conversations: { replies: async (args) => {

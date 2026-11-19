@@ -68,6 +68,7 @@ export async function startPipa(options = {}) {
   const server = options.server ?? (options.executor ? null : await (options.startServer ?? startSocketOpenCodeServer)(config, {
     startupTimeoutMs: options.startupTimeoutMs,
     signal: options.signal,
+    warn: options.warn,
   }));
   let executor;
   try {

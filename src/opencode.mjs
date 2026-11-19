@@ -128,10 +128,12 @@ async function waitForSlackTools(connection, options, signal) {
       if (status && status !== "pending") break;
       await delay(100, readiness);
     }
-  } catch (error) {
-    if (signal.aborted) throw signal.reason;
+  } catch {
+    // A failed helper must not prevent the Slack listener from starting.
   }
-  throw new OpenCodeReadinessError("Pipa Slack tools did not become ready in the owned OpenCode server. Check the selected profile and OpenCode version.");
+  signal.throwIfAborted();
+  const warn = options.warn ?? ((message) => process.stderr.write(`${message}\n`));
+  warn("WARNING: Pipa Slack tools did not become ready. Continuing with ordinary Slack replies. Check the selected profile and OpenCode version.");
 }
 
 export function createOpenCodeExecutor(options = {}) {
