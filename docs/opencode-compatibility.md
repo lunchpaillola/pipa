@@ -57,7 +57,7 @@ No smoke result authorizes a release, version bump, publish or production change
 | Windows | — (not run) | — (outside current native scope) |
 
 This is a scope table, not a passing-results matrix. Windows unit/package checks
-remain in manual **CI** dispatch. Historical Windows failures, including the
+can be run locally on Windows. Historical Windows failures, including the
 [retained cleanup receipt](beta-release.md#historical-unpublished-063-preparation-checks),
 are unchanged and unresolved; omitting new native runs does not turn them into
 passes. Historical three-OS requirements are superseded only for current native
