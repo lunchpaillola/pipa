@@ -4,6 +4,7 @@ node_modules/
 .env.*
 !.env.example
 .DS_Store
+/progress.md
 .opencode/.gitignore
 .opencode/goals/
 .opencode/skills/*
