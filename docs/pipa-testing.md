@@ -4,7 +4,7 @@ This is the reusable testing procedure for the dual-adapter candidate. The imple
 
 ## Three kinds of proof
 
-1. **Deterministic:** `npm test` verifies implementation behavior, failure paths, concurrency, scheduling with controlled clocks, and process ownership. `npm run test:pack` verifies the installed npm package. PRs and pushes to `main` run these on Linux; maintainers manually dispatch **CI** for Linux/macOS/Windows checks on platform/process changes and before releases.
+1. **Deterministic:** `npm test` verifies implementation behavior, failure paths, concurrency, scheduling with controlled clocks, and process ownership. `npm run test:pack` verifies the installed npm package. PR CI runs only the state, Slack actions, routines, and OpenCode v2 adapter tests on Linux. The full suite and package smoke are available locally; neither runs automatically after merge.
 2. **Real OpenCode:** Qualify the exact CLI/client versions with isolated profile/database paths. Prove prompt admission versus final output, history migration, permissions/forms, attachments, cancellation, background work, and model switching against the real server.
 3. **Real Slack:** Prove message routing, scheduled delivery, result-thread continuation, artifacts, and detached restart in the selected channel. An HTTP fixture cannot substitute for these round-trips.
 

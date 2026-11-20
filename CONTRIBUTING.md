@@ -14,11 +14,10 @@ npm run test:pack
 
 Keep changes small, include a regression test for behavior changes, and never commit Slack tokens or files from `~/.pipa`.
 
-Every PR and push to `main` automatically runs unit tests and package checks on
-Linux only. Add focused regression tests for the behavior your change affects.
-Maintainers can select **CI -> Run workflow** on the target branch for the same
-checks on Linux, macOS and Windows when changing platform/process behavior or
-preparing a release. Normal contributor PRs do not launch real engines.
+Pull requests run one Linux CI job covering state, Slack actions, routines, and
+the OpenCode v2 adapter. There is no repeat run on `main` or before npm publish.
+`npm test` and `npm run test:pack` remain available for local verification. Add
+focused regression tests for behavior changes.
 
 For maintainer runtime compatibility checks or pre-release verification, run `node --test scripts/verification/self-check.mjs`
 and `npm run test:beta -- --report=beta-smoke.json`: real 1.19.0 / 2.2.5 engines,
@@ -27,7 +26,7 @@ local provider/Chat fixtures and no credentials or paid-provider quota.
 The **OpenCode compatibility** workflow is manual-only. Its default runs this
 smoke on Linux and macOS (12 cells total); Windows native harness runs are outside
 the current release scope and shown as `—` (not run), not a passing result.
-Windows unit/package checks remain available through manual **CI** dispatch.
+Windows unit/package checks can be run locally on Windows.
 Select `full_qualification` or use
 `npm run test:engines -- --migration` for the broad matrix. Smoke covers basic
 startup, prompts/history, applicable restart and stop ownership. Richer files,
@@ -79,6 +78,13 @@ For an existing profile, test `pipa manifest` as a read-only local-template expo
 
 ## Releases
 
+Reuse the PR results if the merged tree matches the tested tree. If it differs,
+verify the affected change. Verify the Git release tag points to the merge
+commit. From that clean checkout, check the version and npm dist-tag, inspect
+and clean-install the packed tarball, and confirm `pipa --version`. Keep the
+exact checked archive as `$TARBALL`; publish it with the explicit tag and
+verify its integrity and dist-tag on npm. Do not rerun the PR suite for publication.
+
 Pipa follows Semantic Versioning:
 
 - New backward-compatible capability: minor release (`0.1.0` to `0.2.0`)
@@ -95,7 +101,7 @@ An opt-in beta is a limited trial, not full stable/platform qualification. For
 3. Run `npm test`, `npm run test:pack`, and `node --test scripts/verification/self-check.mjs` on that exact version. Inspect `npm publish --dry-run --tag beta --access public` for package contents and accidental private data. Confirm Linux PR CI passes.
 4. Record the scoped native smoke evidence and its platform/head limits. Retain known failures and gaps; do not label a beta `releaseQualified` or require the abandoned migration-status gate.
 5. Obtain explicit owner approval for merge, release tag and GitHub prerelease. Merge only after required CI passes, then tag the actual merged commit as `v0.6.0-beta.5`.
-6. The authorized publisher runs `npm publish --tag beta --access public` from that clean, versioned release checkout. Never omit `--tag beta`, move `latest`, or permanently set `publishConfig.tag` to beta.
+6. The authorized publisher runs `npm publish "$TARBALL" --tag beta --access public` from that clean, versioned release checkout. Never omit `--tag beta`, move `latest`, or permanently set `publishConfig.tag` to beta.
 7. Verify npm's `beta` tag points to the new version and `latest` is unchanged. Create the matching GitHub release marked **Pre-release**. Installation into an existing daily profile is a separate owner-approved cutover.
 
 ### Stable release
@@ -106,7 +112,7 @@ Except for the explicit 0.6.0 decision below, the stronger qualification require
 2. Run `npm test` and `npm run test:pack`. For this dual-engine candidate, also collect the full required Linux/macOS native OS/mode matrix, migration/rollback and private operator/live-client evidence. Windows native runs are outside the current scope; their absence alone does not block it. Missing required evidence still blocks release; the automated Slack collector alone cannot certify it.
 3. Merge after CI passes.
 4. Tag the merge as `v<version>` and push the tag.
-5. The authorized human publisher runs `npm publish --tag latest --access public` from the clean, merged, tagged release commit.
+5. The authorized human publisher runs `npm publish "$TARBALL" --tag latest --access public` from the clean, merged, tagged release commit.
 6. Verify the published npm version, then create the matching GitHub release.
 
 ### 0.6.0 metadata/docs-only release decision

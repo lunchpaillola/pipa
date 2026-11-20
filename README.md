@@ -5,7 +5,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/lunchpaillola/pipa/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/lunchpaillola/pipa/ci.yml?branch=main&style=flat-square&label=CI"></a>
   <a href="https://www.npmjs.com/package/@usepipa/pipa"><img alt="npm" src="https://img.shields.io/npm/v/@usepipa/pipa?style=flat-square&color=2437F5&label=npm"></a>
 </p>
 
