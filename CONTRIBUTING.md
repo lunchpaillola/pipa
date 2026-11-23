@@ -78,6 +78,9 @@ For an existing profile, test `pipa manifest` as a read-only local-template expo
 
 ## Releases
 
+Use the [release notes template](docs/release-notes-template.md) when preparing
+a GitHub release.
+
 Reuse the PR results if the merged tree matches the tested tree. If it differs,
 verify the affected change. Verify the Git release tag points to the merge
 commit. From that clean checkout, check the version and npm dist-tag, inspect
