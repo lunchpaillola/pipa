@@ -1,10 +1,9 @@
-import { constants, readFileSync, unlinkSync } from "node:fs";
-import { access, chmod, link, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { constants, existsSync, readFileSync, unlinkSync } from "node:fs";
+import { access, chmod, link, mkdir, readFile, realpath, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { setTimeout as delay } from "node:timers/promises";
 
 const MANIFEST = {
   display_information: {
@@ -68,52 +67,118 @@ export function pipaPaths(home = process.env.PIPA_HOME || os.homedir()) {
 export async function acquireInstanceLock(file = pipaPaths().lock) {
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  const identity = Object.freeze({ pid: process.pid, generation: randomUUID() });
+  const birth = processBirth(process.pid);
+  if (!birth) throw unverifiedOwner(process.pid);
+  const identity = Object.freeze({ pid: process.pid, generation: randomUUID(), birth });
   await writeFile(temporary, JSON.stringify(identity), { mode: 0o600 });
   try {
-    await claimLock(temporary, file);
+    await link(temporary, file);
   } catch (error) {
     if (error?.code !== "EEXIST") throw error;
-    const previous = await readInstanceLock(file);
-    if (previous && isRunning(previous.pid)) throw new Error(`Pipa is already running (PID ${previous.pid}).`);
-    removeInstanceLock(file, previous);
-    await claimLock(temporary, file);
+    const guard = `${file}.recovering`;
+    // Serialize stale-lock removal across processes; re-read only after claiming the guard.
+    try { await mkdir(guard, { mode: 0o700 }); }
+    catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      throw new Error(`Pipa lock recovery is in progress. Retry; if interrupted, stop all Pipa launchers for this profile before moving ${guard} aside.`);
+    }
+    try {
+      const previous = await readInstanceLock(file);
+      if (verifyInstanceOwner(previous)) throw new Error(`Pipa is already running (PID ${previous.pid}).`);
+      if (previous) {
+        removeInstanceLock(file, previous);
+        if (previous.birth) await rm(stopFile(file, previous), { force: true });
+      }
+      try { await link(temporary, file); }
+      catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+        throw new Error("Another Pipa instance acquired the lock during startup.");
+      }
+    } finally { await rmdir(guard); }
   } finally {
     await rm(temporary, { force: true });
   }
-  const release = async () => removeInstanceLock(file, identity);
+  const release = async () => {
+    removeInstanceLock(file, identity);
+    await rm(stopFile(file, identity), { force: true });
+  };
   release.identity = identity;
   return release;
 }
 
-export async function stopInstance(file = pipaPaths().lock, kill = process.kill, { platform = process.platform, terminate = spawnSync, running = isRunning } = {}) {
+const stopFile = (file, identity) => `${file}.${identity.generation}.stop`;
+const birthFormats = {
+  linux: /^linux:[a-f0-9-]{36}:\d+$/u,
+  darwin: /^darwin:[A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/u,
+  win32: /^win32:\d{1,19}$/u,
+};
+const birthPlatform = (birth) => Object.keys(birthFormats).find((platform) => birthFormats[platform].test(birth));
+
+export function watchInstanceStop(identity, stop, file = pipaPaths().lock) {
+  const request = stopFile(file, identity);
+  const timer = setInterval(() => {
+    if (!existsSync(request)) return;
+    clearInterval(timer);
+    stop();
+  }, 100);
+  timer.unref();
+  return () => clearInterval(timer);
+}
+
+export async function stopInstance(file = pipaPaths().lock) {
   const identity = await readInstanceLock(file);
-  const pid = identity?.pid;
-  if (!pid) return null;
-  if (platform === "win32" && kill === process.kill) {
-    if (!running(pid)) { removeInstanceLock(file, identity); return null; }
-    // Windows SIGTERM does not run Node's shutdown handler. Stop the owned tree
-    // and release only the unchanged lock after the original process has exited.
-    const result = terminate(process.env.SystemRoot ? path.join(process.env.SystemRoot, "System32", "taskkill.exe") : "taskkill", ["/PID", String(pid), "/T", "/F"], {
-      timeout: 5000, windowsHide: true, stdio: "ignore", shell: false,
+  if (!verifyInstanceOwner(identity)) return null;
+  // A PID can be reused after inspection. Only the owning generation consumes this request.
+  const request = stopFile(file, identity);
+  await writeFile(request, "", { mode: 0o600, flag: "wx" }).catch((error) => {
+    if (error?.code !== "EEXIST") throw error;
+  });
+  const current = await readInstanceLock(file);
+  if (current?.generation === identity.generation) return identity.pid;
+  await rm(request, { force: true });
+  return null;
+}
+
+function unverifiedOwner(pid) {
+  return new Error(`Cannot verify Pipa instance ownership (PID ${pid}). Stop Pipa using its original terminal or service manager. If no Pipa is running and automatic launchers are paused, move pipa.lock aside and start again.`);
+}
+
+export function verifyInstanceOwner(identity) {
+  if (!identity) return false;
+  const birth = processBirth(identity.pid);
+  if (birth === false) return false;
+  if (birth && birthPlatform(identity.birth) === process.platform) return birth === identity.birth;
+  try { process.kill(identity.pid, 0); }
+  catch (error) { if (error?.code === "ESRCH") return false; }
+  throw unverifiedOwner(identity.pid);
+}
+
+function processBirth(pid) {
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      if (fields[0] === "Z" || fields[0] === "X") return false;
+      const boot = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+      const birth = `linux:${boot}:${fields[19]}`;
+      if (birthFormats.linux.test(birth)) return birth;
+    } catch { return null; }
+  }
+  if (process.platform === "darwin") {
+    const result = spawnSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
+      encoding: "utf8", env: { LC_ALL: "C", TZ: "UTC" }, timeout: 2000,
     });
-    if (result.error || result.status !== 0) throw new Error("Could not stop Pipa's Windows process tree.");
-    const deadline = Date.now() + 5000;
-    while (running(pid)) {
-      if (Date.now() >= deadline) throw new Error("Could not confirm Pipa's Windows process tree stopped.");
-      await delay(25);
-    }
-    removeInstanceLock(file, identity);
-    return pid;
+    const birth = `darwin:${result.stdout?.trim()}`;
+    if (result.status === 0 && birthFormats.darwin.test(birth)) return birth;
   }
-  try {
-    kill(pid, "SIGTERM");
-    return pid;
-  } catch (error) {
-    if (error?.code === "ESRCH") removeInstanceLock(file, identity);
-    else throw error;
-    return null;
+  if (process.platform === "win32" && process.env.SystemRoot) {
+    const result = spawnSync(path.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+      ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference = 'Stop'; (Get-Process -Id ${pid}).StartTime.ToUniversalTime().Ticks`],
+      { encoding: "utf8", env: { SystemRoot: process.env.SystemRoot }, timeout: 5000, windowsHide: true });
+    const birth = `win32:${result.stdout?.trim()}`;
+    if (result.status === 0 && birthFormats.win32.test(birth)) return birth;
   }
+  return null;
 }
 
 export async function readInstanceLock(file = pipaPaths().lock) {
@@ -129,7 +194,9 @@ function parseInstanceLock(text) {
   const value = JSON.parse(text);
   const identity = typeof value === "number" ? { pid: value, generation: null } : value;
   if (!Number.isSafeInteger(identity?.pid) || identity.pid <= 0
-    || (identity.generation !== null && !/^[a-f0-9-]{36}$/u.test(identity.generation ?? ""))) {
+    || identity.pid > 0x7fffffff
+    || (identity.generation !== null && !/^[a-f0-9-]{36}$/u.test(identity.generation ?? ""))
+    || (identity.birth !== undefined && (!identity.generation || typeof identity.birth !== "string" || !birthPlatform(identity.birth)))) {
     throw new Error("Invalid Pipa instance lock.");
   }
   return identity;
@@ -137,7 +204,7 @@ function parseInstanceLock(text) {
 
 function removeInstanceLock(file, identity) {
   try {
-    // No await between checking ownership and unlinking; repeated old releases are harmless.
+    // Only the owner releases a live lock; stale removers serialize under the recovery guard.
     const current = parseInstanceLock(readFileSync(file, "utf8"));
     if (current.pid === identity?.pid && current.generation === identity?.generation) unlinkSync(file);
   } catch (error) {
@@ -306,8 +373,4 @@ export function isRunning(pid) {
   } catch (error) {
     return error?.code === "EPERM";
   }
-}
-
-function claimLock(source, destination) {
-  return link(source, destination);
 }

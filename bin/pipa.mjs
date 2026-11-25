@@ -9,7 +9,7 @@ import os from "node:os";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { stdin, stdout } from "node:process";
-import { acquireInstanceLock, createManifest, createManifestUrl, loadConfig, stopInstance } from "../src/state.mjs";
+import { acquireInstanceLock, createManifest, createManifestUrl, loadConfig, stopInstance, watchInstanceStop } from "../src/state.mjs";
 import { initializePipa, startPipa } from "../src/app.mjs";
 import { PipaRestartingError, startOpenCodeServer } from "../src/opencode.mjs";
 import { createRoutine, deleteRoutine, editRoutine, loadRoutineState, requestRoutineRun } from "../src/routines.mjs";
@@ -301,7 +301,7 @@ function cliError(message, code = "invalid_arguments") {
 
 async function stop(io) {
   const pid = await stopInstance();
-  io.output.write(pid ? `Pipa is stopping (PID ${pid}).\n` : "Pipa is not running.\n");
+  io.output.write(pid ? `Stop requested for Pipa (PID ${pid}). If it does not exit, use its original terminal or service manager.\n` : "Pipa is not running.\n");
 }
 
 async function init(io) {
@@ -410,6 +410,7 @@ async function start(io) {
   };
   const stopWithSigint = () => stop("SIGINT");
   const stopWithSigterm = () => stop();
+  const unwatchStop = watchInstanceStop(releaseLock.identity, stopWithSigterm);
   const disconnected = () => {
     if (!ready) {
       failure ??= new Error("Restart readiness handoff disconnected before startup completed.");
@@ -456,6 +457,7 @@ async function start(io) {
     failure = error;
   } finally {
     watcher?.stop();
+    unwatchStop();
     try {
       stop();
       if (app) await app.shutdown();
