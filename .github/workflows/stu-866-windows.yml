@@ -19,4 +19,5 @@ jobs:
       - run: npm ci
       - run: node --test test/state.test.mjs test/restart.test.mjs
       - if: ${{ !cancelled() }}
-        run: node --test --test-name-pattern='isolated Managed restart .*: ready' test/cli.test.mjs
+        run: >-
+          node --test --test-name-pattern='isolated Managed restart .*: ready' test/cli.test.mjs
