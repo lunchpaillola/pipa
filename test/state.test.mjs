@@ -289,6 +289,21 @@ test("instance lock rejects a second process and can be reacquired", async () =>
   await simultaneous.find(({ status }) => status === "fulfilled").value();
 });
 
+test("a live owner takes precedence over a leftover recovery guard", async (t) => {
+  const runtime = await createRuntimeFixture();
+  t.after(() => runtime.teardown());
+  const file = pipaPaths(runtime.home).lock;
+  const release = await acquireInstanceLock(file);
+  try {
+    await mkdir(`${file}.recovering`);
+    await assert.rejects(acquireInstanceLock(file), /already running/u);
+    assert.deepEqual(JSON.parse(await readFile(file, "utf8")), release.identity);
+    assert.ok((await stat(`${file}.recovering`)).isDirectory());
+  } finally {
+    await release();
+  }
+});
+
 test("live legacy numeric and generation locks fail closed", async (t) => {
   const runtime = await createRuntimeFixture();
   t.after(() => runtime.teardown());

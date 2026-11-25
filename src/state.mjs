@@ -75,6 +75,9 @@ export async function acquireInstanceLock(file = pipaPaths().lock) {
     await link(temporary, file);
   } catch (error) {
     if (error?.code !== "EEXIST") throw error;
+    const owner = await readInstanceLock(file);
+    // A routine duplicate start must not leave a recovery guard if interrupted.
+    if (verifyInstanceOwner(owner)) throw new Error(`Pipa is already running (PID ${owner.pid}).`);
     const guard = `${file}.recovering`;
     // Serialize stale-lock removal across processes; re-read only after claiming the guard.
     try { await mkdir(guard, { mode: 0o700 }); }
