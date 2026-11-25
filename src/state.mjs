@@ -175,8 +175,9 @@ function processBirth(pid) {
     if (result.status === 0 && birthFormats.darwin.test(birth)) return birth;
   }
   if (process.platform === "win32" && process.env.SystemRoot) {
+    // Avoid cmdlet discovery: the restricted environment omits the PowerShell module cache.
     const result = spawnSync(path.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
-      ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference = 'Stop'; (Get-Process -Id ${pid}).StartTime.ToUniversalTime().Ticks`],
+      ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference = 'Stop'; [Console]::WriteLine(([System.Diagnostics.Process]::GetProcessById(${pid})).StartTime.ToUniversalTime().Ticks)`],
       { encoding: "utf8", env: { SystemRoot: process.env.SystemRoot }, timeout: 5000, windowsHide: true });
     const birth = `win32:${result.stdout?.trim()}`;
     if (result.status === 0 && birthFormats.win32.test(birth)) return birth;
