@@ -10,6 +10,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { acquireInstanceLock, isRunning, pipaPaths, readInstanceLock, stopInstance, writePrivateJson } from "../src/state.mjs";
 import { restartStatus } from "../src/restart.mjs";
 import { createRuntimeFixture, waitFor } from "./helpers/runtime-fixture.mjs";
+import { staleInstance } from "./helpers/stale-instance.mjs";
 
 const cli = fileURLToPath(new URL("../bin/pipa.mjs", import.meta.url));
 
@@ -210,6 +211,16 @@ for (const version of ["1.19.0", "2.0.29"]) for (const mode of ["ready", "unread
         && !(settled?.state === "unconfirmed" && settled.phase !== "acceptance");
     }, { timeoutMs: 8_000, label: "private CLI profile handoff/stop/lock/port/processes" });
   }, "Managed CLI profile cleanup");
+  if (mode === "ready") {
+    await writePrivateJson(paths.lock, staleInstance(process.pid));
+    const stop = spawnSync(process.execPath, [cli, "stop"], { cwd: runtime.workspace, env: environment, encoding: "utf8" });
+    assert.equal(stop.status, 0, stop.stderr);
+    assert.match(stop.stdout, /not running/u);
+    const restart = spawnSync(process.execPath, [cli, "restart"], { cwd: runtime.workspace, env: environment, encoding: "utf8" });
+    assert.equal(restart.status, 1);
+    assert.match(restart.stderr, /not running/u);
+    assert.equal(await restartStatus({ home }), null);
+  }
   original = runtime.spawn(process.execPath, [cli, "start"], { env: environment }).child;
   let output = "";
   for (const stream of [original.stdout, original.stderr]) stream.on("data", (chunk) => { output += chunk; });
@@ -261,6 +272,11 @@ for (const version of ["1.19.0", "2.0.29"]) for (const mode of ["ready", "unread
   const status = spawnSync(process.execPath, [cli, "restart", "--status"], { cwd: runtime.workspace, env: environment, encoding: "utf8" });
   assert.equal(JSON.parse(status.stdout).state, "completed");
   assert.equal(await readFile(paths.config, "utf8"), configBefore);
+  const stop = spawnSync(process.execPath, [cli, "stop"], { cwd: runtime.workspace, env: environment, encoding: "utf8" });
+  assert.equal(stop.status, 0, stop.stderr);
+  assert.match(stop.stdout, new RegExp(`Stop requested.*${replacement.pid}`, "u"));
+  await until(async () => !await readInstanceLock(paths.lock) && !isRunning(replacement.pid));
+  await assert.rejects(fetch(url, { signal: AbortSignal.timeout(1_000) }));
 });
 
 async function until(check, timeoutMs = 20_000) {

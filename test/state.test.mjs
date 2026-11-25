@@ -1,11 +1,78 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
-import { writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { acquireInstanceLock, createManifest, createManifestUrl, createSessionStore, createModelSetting, loadConfig, loadSessions, pipaPaths, saveConfig, slackCommandName, stopInstance, writePrivateJson } from "../src/state.mjs";
+import { acquireInstanceLock, createManifest, createManifestUrl, createSessionStore, createModelSetting, loadConfig, loadSessions, pipaPaths, saveConfig, slackCommandName, stopInstance, watchInstanceStop, writePrivateJson } from "../src/state.mjs";
 import { createRuntimeFixture } from "./helpers/runtime-fixture.mjs";
+import { staleInstance } from "./helpers/stale-instance.mjs";
+
+test("a live PID with a different birth identity is stale, not a stop target", async (t) => {
+  const runtime = await createRuntimeFixture();
+  t.after(() => runtime.teardown());
+  const file = pipaPaths(runtime.home).lock;
+  const stale = staleInstance(process.pid);
+  await writePrivateJson(file, stale);
+  assert.equal(await stopInstance(file), null);
+  const module = new URL("../src/state.mjs", import.meta.url).href;
+  const launches = Array.from({ length: 4 }, () => {
+    const fixture = runtime.spawn(process.execPath, ["--input-type=module", "-e", `
+      const { acquireInstanceLock } = await import(${JSON.stringify(module)});
+      process.stdin.resume();
+      process.stdin.once('data', async () => {
+        try {
+          const release = await acquireInstanceLock(${JSON.stringify(file)});
+          process.stdout.write('won');
+          process.stdin.once('end', async () => { await release(); });
+        } catch (error) { process.stdout.write(error.message); }
+      });
+    `], { stdio: ["pipe", "pipe", "pipe"] });
+    const result = new Promise((resolve) => fixture.child.stdout.once("data", (data) => resolve(String(data))));
+    return { ...fixture, result: Promise.race([result, fixture.exited.then(({ code }) => `exited (${code})`)]) };
+  });
+  for (const { child } of launches) child.stdin.write("start\n");
+  const results = await Promise.all(launches.map(({ result }) => result));
+  assert.equal(results.filter((result) => result === "won").length, 1, JSON.stringify(results));
+  const owner = JSON.parse(await readFile(file, "utf8"));
+  assert.equal(owner.pid, launches[results.indexOf("won")].child.pid);
+  assert.notEqual(owner.generation, stale.generation);
+  for (const { child } of launches) child.stdin.end();
+  await Promise.all(launches.map(({ exited }) => exited));
+  await assert.rejects(readFile(file), { code: "ENOENT" });
+});
+
+test("malformed birth information never makes a live owner's lock removable", async (t) => {
+  const runtime = await createRuntimeFixture();
+  t.after(() => runtime.teardown());
+  const file = pipaPaths(runtime.home).lock;
+  const identity = { ...staleInstance(process.pid), birth: `${process.platform}:` };
+  await writePrivateJson(file, identity);
+  await assert.rejects(acquireInstanceLock(file), /Invalid Pipa instance lock/u);
+  await assert.rejects(stopInstance(file), /Invalid Pipa instance lock/u);
+  assert.deepEqual(JSON.parse(await readFile(file, "utf8")), identity);
+});
+
+test("start recovers after an owner exits without cleanup, including older lock formats", async (t) => {
+  const runtime = await createRuntimeFixture();
+  t.after(() => runtime.teardown());
+  const file = pipaPaths(runtime.home).lock;
+  const module = new URL("../src/state.mjs", import.meta.url).href;
+  const { child, exited } = runtime.spawn(process.execPath, ["--input-type=module", "-e", `
+    const { acquireInstanceLock } = await import(${JSON.stringify(module)});
+    await acquireInstanceLock(${JSON.stringify(file)});
+    process.exit(37);
+  `]);
+  assert.equal((await exited).code, 37);
+  const abandoned = JSON.parse(await readFile(file, "utf8"));
+  assert.equal(abandoned.pid, child.pid);
+  for (const identity of [abandoned, abandoned.pid, { pid: abandoned.pid, generation: abandoned.generation }]) {
+    await writePrivateJson(file, identity);
+    const replacement = await acquireInstanceLock(file);
+    assert.notEqual(replacement.identity.generation, abandoned.generation);
+    await replacement();
+  }
+});
 
 test("installation command names are shared with the manifest and fit Slack's limit", () => {
   for (const [name, command] of [
@@ -222,50 +289,31 @@ test("instance lock rejects a second process and can be reacquired", async () =>
   await simultaneous.find(({ status }) => status === "fulfilled").value();
 });
 
-test("stops the process recorded in the instance lock", async () => {
-  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-stop-"));
-  const file = pipaPaths(home).lock;
-  await mkdir(path.dirname(file), { recursive: true });
-  await writeFile(file, "12345");
-  let signal;
-  assert.equal(await stopInstance(file, (pid, received) => { signal = { pid, received }; }), 12345);
-  assert.deepEqual(signal, { pid: 12345, received: "SIGTERM" });
-});
-
-for (const outcome of ["stopped", "replacement", "failed", "parent-exited-on-failure"]) test(`Windows stop uses the owned tree and preserves lock identity: ${outcome}`, async (t) => {
+test("a live owner takes precedence over a leftover recovery guard", async (t) => {
   const runtime = await createRuntimeFixture();
   t.after(() => runtime.teardown());
-  const { child } = runtime.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
   const file = pipaPaths(runtime.home).lock;
-  const identity = { pid: child.pid, generation: "00000000-0000-0000-0000-000000000001" };
-  const replacement = { ...identity, generation: "00000000-0000-0000-0000-000000000002" };
-  await writePrivateJson(file, identity);
-  let alive = true;
-  let calls = 0;
-  const stopping = stopInstance(file, undefined, {
-    platform: "win32", running: () => alive,
-    terminate: (command, args, options) => {
-      calls++;
-      assert.match(command, /(?:^|[\\/])taskkill(?:\.exe)?$/u);
-      assert.deepEqual(args, ["/PID", String(child.pid), "/T", "/F"]);
-      assert.equal(options.shell, false);
-      assert.equal(options.timeout, 5000);
-      if (outcome === "replacement") writeFileSync(file, JSON.stringify(replacement));
-      if (outcome === "failed") return { status: 1 };
-      alive = false;
-      if (outcome === "parent-exited-on-failure") return { status: 1 };
-      return { status: 0 };
-    },
-  });
-  if (outcome === "failed" || outcome === "parent-exited-on-failure") {
-    await assert.rejects(stopping, /Could not stop/u);
-    assert.deepEqual(JSON.parse(await readFile(file, "utf8")), identity);
-  } else {
-    assert.equal(await stopping, child.pid);
-    if (outcome === "replacement") assert.deepEqual(JSON.parse(await readFile(file, "utf8")), replacement);
-    else await assert.rejects(readFile(file), { code: "ENOENT" });
+  const release = await acquireInstanceLock(file);
+  try {
+    await mkdir(`${file}.recovering`);
+    await assert.rejects(acquireInstanceLock(file), /already running/u);
+    assert.deepEqual(JSON.parse(await readFile(file, "utf8")), release.identity);
+    assert.ok((await stat(`${file}.recovering`)).isDirectory());
+  } finally {
+    await release();
   }
-  assert.equal(calls, 1);
+});
+
+test("live legacy numeric and generation locks fail closed", async (t) => {
+  const runtime = await createRuntimeFixture();
+  t.after(() => runtime.teardown());
+  const file = pipaPaths(runtime.home).lock;
+  for (const identity of [process.pid, { pid: process.pid, generation: randomUUID() }]) {
+    await writePrivateJson(file, identity);
+    await assert.rejects(stopInstance(file), /Cannot verify.*original terminal/u);
+    await assert.rejects(acquireInstanceLock(file), /Cannot verify.*automatic launchers/u);
+    assert.deepEqual(JSON.parse(await readFile(file, "utf8")), identity);
+  }
 });
 
 test("lock generations are unique and an old release cannot delete a replacement", async () => {
@@ -282,19 +330,21 @@ test("lock generations are unique and an old release cannot delete a replacement
   await replacement();
 });
 
-test("stop reads generation locks and ESRCH never removes a changed owner", async () => {
-  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-stop-"));
-  const file = pipaPaths(home).lock;
+test("stop requests reach only their owning generation", async (t) => {
+  const runtime = await createRuntimeFixture();
+  t.after(() => runtime.teardown());
+  const file = pipaPaths(runtime.home).lock;
   const release = await acquireInstanceLock(file);
-  assert.equal(await stopInstance(file, (pid, signal) => {
-    assert.equal(pid, release.identity.pid);
-    assert.equal(signal, "SIGTERM");
-  }), process.pid);
-  const replacement = { pid: 12345, generation: "00000000-0000-0000-0000-000000000000" };
-  assert.equal(await stopInstance(file, () => {
-    writeFileSync(file, JSON.stringify(replacement));
-    throw Object.assign(new Error("gone"), { code: "ESRCH" });
-  }), null);
+  assert.equal(await stopInstance(file), process.pid);
   await release();
-  assert.deepEqual(JSON.parse(await readFile(file, "utf8")), replacement);
+  const replacement = await acquireInstanceLock(file);
+  t.after(replacement);
+  let requested = false;
+  const unwatch = watchInstanceStop(replacement.identity, () => { requested = true; }, file);
+  t.after(unwatch);
+  await writeFile(`${file}.${release.identity.generation}.stop`, "");
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(requested, false);
+  assert.equal(await stopInstance(file), process.pid);
+  await runtime.waitFor(() => requested, { label: "stop request reached owner" });
 });

@@ -318,7 +318,11 @@ pipa restart --status
 
 Anyone allowed by Slack user and channel controls can request a restart. There is no separate approval. **Requested does not mean completed.** Check status; if failed or unconfirmed, inspect the reported phase and running instance before starting another process.
 
-The replacement runs in the background. Use `pipa stop` to stop it. A Slack restart posts to the same thread when ready. Pipa never stops an attached OpenCode server. On Windows, `pipa stop` forcibly stops owned processes and can interrupt work; use `pipa restart` for a cooperative restart.
+The replacement runs in the background. Use `pipa stop` to request shutdown. A Slack restart posts to the same thread when ready. Pipa never stops an attached OpenCode server. If Pipa does not respond to a stop request, use the terminal or service manager that launched it.
+
+`pipa start` recovers a confirmed stale instance lock automatically. If Pipa cannot verify ownership (including older locks that only identify a live PID), it leaves the lock alone. Pause automatic launchers and verify that no Pipa instance is running for that profile before moving `pipa.lock` or `pipa.lock.recovering` aside. Do not signal a process just because its PID appears in the lock.
+
+Keep each Pipa profile on one host and in one PID namespace. Stop Pipa and pause its automatic launchers before upgrading or rolling back; don't run two versions against the same profile. On macOS, process start times have one-second precision, so a PID reused within the same second may still block startup; `pipa stop` won't signal that PID.
 
 Do not chain `pipa stop` and `pipa start` inside an agent turn: stopping owned OpenCode kills that turn. OpenCode's `/instance/dispose` does not restart the server.
 

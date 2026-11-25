@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { staleInstance } from "./helpers/stale-instance.mjs";
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, rm, readFile, stat, writeFile } from "node:fs/promises";
@@ -241,10 +242,13 @@ for (const failure of ["cleanup", "cleanup-timeout", "lock", "process", "identit
   });
 }
 
-test("numeric legacy locks remain stoppable but cannot request cooperative restart", async (t) => {
+test("legacy live PID and stale reused PID cannot request restart", async (t) => {
   const { home } = await fixture(t);
   await writeFile(pipaPaths(home).lock, String(process.pid));
-  await assert.rejects(requestRestart({ home }), /manual stop\/start/);
+  await assert.rejects(requestRestart({ home }), /Cannot verify Pipa instance ownership/u);
+  await writePrivateJson(pipaPaths(home).lock, staleInstance(process.pid));
+  await assert.rejects(requestRestart({ home }), /not running/u);
+  assert.equal(await restartStatus({ home }), null);
 });
 
 test("independent concurrent watchers atomically accept only once", async (t) => {

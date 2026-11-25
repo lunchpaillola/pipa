@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { cleanChildEnvironment } from "./opencode.mjs";
-import { isRunning, pipaPaths, readInstanceLock, writePrivateJson } from "./state.mjs";
+import { pipaPaths, readInstanceLock, verifyInstanceOwner, writePrivateJson } from "./state.mjs";
 
 const WORKER = fileURLToPath(import.meta.url);
 const CLI = fileURLToPath(new URL("../bin/pipa.mjs", import.meta.url));
@@ -59,11 +59,10 @@ function validRequest(request, identity) {
 }
 
 // Generation is identity, not a grant: local execution keeps the existing local-user authority.
-export async function requestRestart({ home, running = isRunning, now = Date.now, destination } = {}) {
+export async function requestRestart({ home, now = Date.now, destination } = {}) {
   home = homePath(home);
   const identity = await readInstanceLock(pipaPaths(home).lock);
-  if (!identity || !running(identity.pid)) throw new Error("Pipa is not running.");
-  if (!identity.generation) throw new Error("This Pipa needs one manual stop/start before restart is available.");
+  if (!verifyInstanceOwner(identity)) throw new Error("Pipa is not running. Run `pipa start` to recover a stale lock.");
   const createdAt = now();
   if (destination && (!/^[A-Z][A-Z0-9]+$/u.test(destination.channelId ?? "")
     || (destination.threadTs !== undefined && !/^\d+\.\d+$/u.test(destination.threadTs)))) {
@@ -225,7 +224,7 @@ export function startRestartWatcher({ home, identity, shutdown, spawn: spawnImpl
 }
 
 export async function runRestartWorker({ home, id, peer = process, spawn: spawnImpl = spawn,
-  environment = process.env, running = isRunning, limits = {} }) {
+  environment = process.env, running, limits = {} }) {
   home = homePath(home);
   const timing = { ...LIMITS, ...limits };
   const request = await readOptional(fileFor(home, id, "request"));
@@ -252,7 +251,7 @@ export async function runRestartWorker({ home, id, peer = process, spawn: spawnI
     while (true) {
       const lock = await readInstanceLock(pipaPaths(home).lock);
       if (lock && !same(lock, request)) throw new Error("Instance changed.");
-      if (!lock && !running(request.pid)) break;
+      if (!lock && !(running ? running(request.pid) : verifyInstanceOwner(request))) break;
       if (Date.now() >= deadline) throw new Error("Original instance did not stop.");
       await delay(timing.pollMs);
     }
@@ -268,7 +267,8 @@ export async function runRestartWorker({ home, id, peer = process, spawn: spawnI
     const ready = await receive(child, "ready", id, timing.readyMs);
     const replacement = await readInstanceLock(pipaPaths(home).lock);
     if (ready.pid !== child.pid || !validId(ready.generation) || ready.generation === request.generation
-      || !same(ready, replacement) || !running(ready.pid) || child.exitCode != null || child.signalCode != null) {
+      || !same(ready, replacement) || !(running ? running(ready.pid) : verifyInstanceOwner(replacement))
+      || child.exitCode != null || child.signalCode != null) {
       throw new Error("Replacement identity not confirmed.");
     }
     await send(child, { type: "accepted", id }, timing.armMs);
