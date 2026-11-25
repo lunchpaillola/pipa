@@ -16,6 +16,8 @@ for (const [label, env, command, timeout] of [
   ['with-path', allow('SystemRoot','PATH'), cmd, 5000],
   ['with-windir', allow('SystemRoot','windir'), cmd, 5000],
   ['with-temp', allow('SystemRoot','TEMP','TMP'), cmd, 5000],
+  ['with-cache', allow('SystemRoot','PSModuleAnalysisCachePath'), cmd, 5000],
+  ['dotnet', {SystemRoot: root}, `[Console]::WriteLine(([System.Diagnostics.Process]::GetProcessById(${process.pid})).StartTime.ToUniversalTime().Ticks)`, 5000],
   ['inherited', undefined, cmd, 5000],
 ]) {
   const t=performance.now();
