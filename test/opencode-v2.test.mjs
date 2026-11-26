@@ -972,6 +972,24 @@ test("explicit permission rejection completes headless caller without a native i
   assert.equal(f.requests.filter((r) => r.path.endsWith("/per_reject/reply")).length, 1);
 });
 
+test("explicit permission rejection settles a background turn without a native idle", async (t) => {
+  const f = await fixture(t);
+  let interaction;
+  const responses = [];
+  await f.adapter.execute(f.input("ses_one", {
+    onInteraction: async (item) => { interaction = item; return { type: "cancelled" }; },
+    onResponse: async (text) => { responses.push(text); },
+  }));
+  const permission = { id: "per_background_reject", sessionID: "ses_one", action: "bash", resources: ["pwd"] };
+  f.permissions.push(permission);
+  f.globalEvent("permission.asked", permission);
+  await until(() => interaction);
+  await interaction.submit({ type: "reject" });
+  await until(() => responses.length);
+  assert.deepEqual(responses, ["Stopped after a permission was rejected."]);
+  assert.equal(f.requests.filter((r) => r.path.endsWith("/per_background_reject/reply")).length, 1);
+});
+
 test("question dismissal interrupts natively and settles without idle", async (t) => {
   const f = await fixture(t);
   f.forms.push({ id: "frm_stop", sessionID: "ses_one", title: "Continue?", metadata: { kind: "question" }, fields: [{ key: "q0", type: "string", title: "Answer", required: true }] });

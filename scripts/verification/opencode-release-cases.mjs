@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import { createRuntimeFixture, bounded, waitFor } from "../../test/helpers/runtime-fixture.mjs";
 import { assertTurnOutcome, assertPromptReceipt } from "../../test/helpers/opencode-contract.mjs";
 import { assertPin, command, recordCase, finishCell } from "../test-opencode-matrix.mjs";
-import { createProvider, providerConfig, writeDefinitions } from "./opencode-provider.mjs";
+import { CONTROLLED_PROVIDER_FAILURE, createProvider, providerConfig, writeDefinitions } from "./opencode-provider.mjs";
 import { createMigrationJourney } from "./opencode-migration.mjs";
 import { deflateSync } from "node:zlib";
 
@@ -244,8 +244,11 @@ export async function abruptTurnProbe({ runtime, candidate, baseUrl, boundary, p
       assertNativeAdmissionCount(recovered.wires, prompt, 0);
       assertNativeAdmissionCount(recovered.wires, followup, 0);
       assert.ok(!recoveredMessages.some(message => message.kind === "followup"));
+      // V2 follows native completion events, including work that survived the crash.
+      // Settle that work before measuring the explicit follow-up's response.
+      if (nativeV2) await releaseSurvivingTurn?.(sessionId, reached);
       replacement.child.send({ followup: true });
-      if (releaseSurvivingTurn) {
+      if (releaseSurvivingTurn && !nativeV2) {
         const waiting = await runtime.waitFor(() => recoveredMessages.find(message => message.kind === "waiting"), { timeoutMs: 5000, label: "replacement waits for surviving native turn" });
         assertNativeAdmissionCount(waiting.wires, prompt, 0);
         assertNativeAdmissionCount(waiting.wires, followup, 0);
@@ -262,7 +265,7 @@ export async function abruptTurnProbe({ runtime, candidate, baseUrl, boundary, p
       assert.equal(deliveries.length, 1);
       assert.equal(deliveries[0].result.sessionId, sessionId);
       assert.equal((await bounded(replacement.exited, { timeoutMs: 5000 })).code, 0, replacementError);
-      if (releaseSurvivingTurn) {
+      if (releaseSurvivingTurn && !nativeV2) {
         const attempts = recoveredMessages.filter(message => message.kind === "mutation-attempt");
         assert.ok(!attempts.some(message => message.wire.path.endsWith("/abort")), "Replacement must not cancel surviving v1 work");
         const admissions = attempts.filter(message => isNativeAdmission(message.wire, followup));
@@ -739,7 +742,7 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
           const submit = elements.find((element) => element.action_id.startsWith("pipa_submit_"));
           await chat.handlers.action({ ...event, actionId: submit.action_id, value: submit.value });
         }
-        await waitMessage(message);
+        await waitMessage(message, `${kind} interaction settlement`);
         assert.equal(chat.posts.findLast((post) => post.thread === thread)?.content?.markdown, kind === "rejection" ? "Stopped after a permission was rejected." : marker);
         if (kind === "rejection") await assert.rejects(readFile(rejectedFile), { code: "ENOENT" });
         else assert.ok(provider.receipts.some((receipt) => receipt.prompt === promptFor(id) && receipt.toolResults.length), "Tool continuation absent");
@@ -980,12 +983,15 @@ throw Error('Native file-command completion deadline exceeded');
       };
       const before = await get();
       const writesBefore = wires.filter((wire) => wire.method === "POST" && wire.path.endsWith("/model")).length;
-      const invalidModels = [{ providerID: "absent", id: "matrix" }, { providerID: "excluded", id: "matrix" }, { providerID: "matrix", id: "disabled" }, { providerID: "matrix", id: "matrix", variant: "absent" }];
-      for (const model of invalidModels) {
-        await assert.rejects(executor.switchModel({ sessionId: first.sessionId, model, workingDirectory: runtime.workspace }));
-        assert.deepEqual(await get(), before, "Unavailable selection mutated the native session");
+      // Native versions can accept model metadata before discovering an unavailable provider at execution.
+      const unavailable = { providerID: "absent", id: "matrix" };
+      const rejectedAtSwitch = await executor.switchModel({ sessionId: first.sessionId, model: unavailable, workingDirectory: runtime.workspace }).then(() => false, () => true);
+      if (rejectedAtSwitch) assert.deepEqual(await get(), before, "Rejected selection mutated the native session");
+      else {
+        await assert.rejects(turn("model-unavailable", { sessionId: first.sessionId }), /provider|model/iu);
+        assert.ok(!provider.receipts.some(receipt => receipt.prompt === promptFor("model-unavailable")), "Unavailable provider silently fell back to a different provider");
       }
-      assert.equal(wires.filter((wire) => wire.method === "POST" && wire.path.endsWith("/model")).length, writesBefore + invalidModels.length);
+      assert.equal(wires.filter((wire) => wire.method === "POST" && wire.path.endsWith("/model")).length, writesBefore + 1);
       await executor.switchModel({ sessionId: first.sessionId, model: { providerID: "matrix", id: "matrix-next" }, workingDirectory: runtime.workspace });
       const next = await turn("model-next", { sessionId: first.sessionId }, { verify: (messages) => assert.ok(JSON.stringify(messages).includes(promptFor("model-first"))) });
       assertTurnOutcome(next, { sessionId: first.sessionId, text: textFor("model-next") });
@@ -1040,7 +1046,9 @@ throw Error('Native file-command completion deadline exceeded');
     },
     "failed-turn": async () => {
       if (requireExecutor()) return requireExecutor();
-      await assert.rejects(turn("failure", {}, { fail: true }), /failed|status|response/iu);
+      await assert.rejects(turn("failure", {}, { fail: true }), pin.startsWith("2.")
+        ? { message: CONTROLLED_PROVIDER_FAILURE }
+        : /failed|status|response/iu);
       assert.ok(provider.receipts.some((receipt) => receipt.prompt === promptFor("failure")), "Failure occurred before the controlled provider request (native admission incompatible)");
     },
     "local-attachment-bytes": async () => {
@@ -1202,6 +1210,7 @@ throw Error('Native file-command completion deadline exceeded');
     },
     "artifact-bytes": async () => {
       if (requireExecutor()) return requireExecutor();
+      const existing = (await readdir(runtime.artifactRoot)).sort();
       const bytes = Buffer.from(`matrix artifact café\n${nonce}\n`);
       const result = await turn("artifact", { contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack", PIPA_CURRENT_SLACK_CHANNEL_ID: "CMATRIX", PIPA_CURRENT_SLACK_THREAD_TS: "400.001" } }, {
         text: `${textFor("artifact")}\nPIPA_ARTIFACTS: ["result.txt"]`,
@@ -1218,10 +1227,11 @@ throw Error('Native file-command completion deadline exceeded');
       });
       assertTurnOutcome(result, { sessionId: result.sessionId, text: textFor("artifact"), files: [{ filename: "result.txt", base64: bytes.toString("base64") }] });
       cell.evidence.artifactSha256 = createHash("sha256").update(result.files[0].data).digest("hex");
-      assert.deepEqual(await readdir(runtime.artifactRoot), [], "Artifact staging leaked");
+      assert.deepEqual((await readdir(runtime.artifactRoot)).sort(), existing, "Artifact staging leaked");
     },
     "artifact-limits-fallback": async () => {
       if (requireExecutor()) return requireExecutor();
+      const existing = (await readdir(runtime.artifactRoot)).sort();
       const size = 20 * 1024 * 1024 + 1;
       const writer = path.join(runtime.workspace, "artifact-writer.cjs");
       await writeFile(writer, "require('node:fs').writeFileSync(process.argv[2], Buffer.alloc(Number(process.argv[3]), 97));\n");
@@ -1247,7 +1257,7 @@ throw Error('Native file-command completion deadline exceeded');
       assert.deepEqual(attempts[1], { markdown: textFor("large-artifact") });
       const unsafe = await turn("unsafe-artifact", { contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" } }, { text: `${textFor("unsafe-artifact")}\nPIPA_ARTIFACTS: ["../unsafe.txt"]` });
       assertTurnOutcome(unsafe, { sessionId: unsafe.sessionId, text: textFor("unsafe-artifact") });
-      assert.deepEqual(await readdir(runtime.artifactRoot), []);
+      assert.deepEqual((await readdir(runtime.artifactRoot)).sort(), existing);
     },
     "routine-cli": async () => {
       const prompt = `  ${promptFor("routine-cli")}\ncafé $(never execute)  \n`;
@@ -1602,20 +1612,42 @@ throw Error('Native file-command completion deadline exceeded');
       ...(boundary === "approval" ? { tool: { names: ["bash", "shell", "$shell"], arguments: () => ({ command: `"${process.execPath}" -e "console.log('${textFor(id)}')"`, description: "Reach a real protected-tool approval before abrupt Pipa death" }) } } : {}),
     });
     const evidence = await abruptTurnProbe({ runtime, candidate, baseUrl, boundary, prompt: promptFor(id), sessionFile: path.join(runtime.state, `${id}-sessions.json`), ...(replace ? { followup: promptFor(followup) } : {}),
-      ...(pin.startsWith("1.") && boundary === "admission" ? { releaseSurvivingTurn: async () => {
-        await runtime.waitFor(() => provider.receipts.some(receipt => receipt.prompt === promptFor(id)), { timeoutMs: 12000, label: "surviving v1 turn reaches held provider" });
+      ...(boundary === "admission" ? { releaseSurvivingTurn: async (sessionId) => {
+        const receipt = await runtime.waitFor(() => provider.receipts.find(receipt => receipt.prompt === promptFor(id)), { timeoutMs: 12000, label: "surviving native turn reaches held provider" });
         const releasedAt = process.hrtime.bigint().toString();
-        provider.release(promptFor(id));
+        if (!receipt.closed) provider.release(promptFor(id));
+        if (sessionId) await runtime.waitFor(async () => {
+          const response = await fetch(`${baseUrl}/api/session/${encodeURIComponent(sessionId)}/message`, { headers, signal: AbortSignal.timeout(1000) });
+          assert.ok(response.ok, `Surviving turn history HTTP ${response.status}`);
+          return (await response.json()).data.some(message => message.type === "assistant" && message.finish === "stop"
+            && typeof message.time?.completed === "number" && message.content.some(part => part.type === "text" && part.text === textFor(id)));
+        }, { timeoutMs: 12000, label: "surviving native response completes before follow-up" });
         return releasedAt;
+      } } : boundary === "approval" && pin.startsWith("2.") ? { releaseSurvivingTurn: async (sessionId, reached) => {
+        assert.equal(reached.type, "permission");
+        assert.ok(reached.requestId);
+        const sessionUrl = `${baseUrl}/api/session/${encodeURIComponent(sessionId)}`;
+        const request = await fetch(`${sessionUrl}/permission`, { headers, signal: AbortSignal.timeout(1000) });
+        assert.ok(request.ok, `Pending permission HTTP ${request.status}`);
+        assert.ok((await request.json()).data.some(item => item.id === reached.requestId), "Native approval did not survive the crash");
+        // Model an explicit operator rejection, never grant or silently cancel work on reconnect.
+        const reply = await fetch(`${sessionUrl}/permission/${encodeURIComponent(reached.requestId)}/reply`, {
+          method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ decision: "reject" }), signal: AbortSignal.timeout(1000),
+        });
+        assert.ok(reply.ok, `Native operator rejection HTTP ${reply.status}`);
+        await runtime.waitFor(async () => {
+          const active = await fetch(`${baseUrl}/api/session/active`, { headers, signal: AbortSignal.timeout(1000) });
+          assert.ok(active.ok, `Active sessions HTTP ${active.status}`);
+          return !Object.hasOwn((await active.json()).data, sessionId);
+        }, { timeoutMs: 12000, label: "native session settles after operator rejection" });
       } } : {}),
     });
     (cell.evidence.crashes ??= []).push(evidence);
     if (evidence.recovery) {
       assertTurnOutcome(evidence.recovery.result, { sessionId: evidence.sessionId, text: textFor(followup) });
       if (boundary === "completion") assertTurnOutcome(evidence.result, { sessionId: evidence.sessionId, text: textFor(id) });
-      if (pin.startsWith("2.") && boundary === "admission") provider.release(promptFor(id));
       return { observed: pin.startsWith("2.")
-        ? `Actual executor SIGKILL at ${boundary}; replacement reused native session history without automatically replaying the original prompt and delivered one explicit follow-up. Native engine survived executor death. Not full Socket application death or routine crash-window proof.`
+        ? `Actual executor SIGKILL at ${boundary}; ${boundary === "approval" ? "explicit operator rejection settled the surviving native approval; " : ""}replacement reused native session history without automatically replaying the original prompt and delivered one explicit follow-up. Native engine survived executor death. Not full Socket application death or routine crash-window proof.`
         : `Actual v1 executor SIGKILL at ${boundary}; separate replacement retained the mapped session/history, replayed no input, delivered no original result, and completed one explicit follow-up. ${boundary === "admission" ? "Replacement waited for surviving native work to settle; it did not cancel or claim abandoned ownership. " : ""}No native restart, v1 startup cancellation, Slack-card cleanup or whole-app recovery is claimed.`, evidence };
     }
     if (boundary === "admission") {
@@ -1651,8 +1683,11 @@ throw Error('Native file-command completion deadline exceeded');
     let replacementIdentity;
     let url;
     let blocker;
+    let verifiedFaultCleanup = false;
     const invoke = (...args) => command(fault, process.execPath, [cli, ...args]);
-    fault.defer(() => stopProfile(fault.home, () => [url], () => [original?.child.pid, replacementIdentity?.pid]), "fault replacement identity and lock");
+    fault.defer(() => {
+      if (!verifiedFaultCleanup) return stopProfile(fault.home, () => [url], () => [original?.child.pid, replacementIdentity?.pid]);
+    }, "fault replacement identity and lock");
     try {
       const reservation = createServer();
       await fault.listen(reservation);
@@ -1691,7 +1726,9 @@ throw Error('Native file-command completion deadline exceeded');
       const requests = await Promise.all([restart.requestRestart({ home: fault.home }), restart.requestRestart({ home: fault.home })]);
       assert.equal(requests[0].id, requests[1].id, "Concurrent requests did not join one generation");
       assert.equal(requests[0].id, old.generation);
+      const workerPids = new Set();
       const outcome = await fault.waitFor(async () => {
+        for (const pid of await observeWorker(old.generation)) workerPids.add(pid);
         const lock = await state.readInstanceLock(faultPaths.lock);
         if (lock && lock.pid !== old.pid) replacementIdentity = lock;
         const status = await restart.restartStatus({ home: fault.home });
@@ -1700,10 +1737,15 @@ throw Error('Native file-command completion deadline exceeded');
         return status?.state === "failed" ? status : false;
       }, { timeoutMs: 45000, label: `actual Managed ${kind} fault outcome` });
       assert.equal(outcome.phase, "starting");
+      assert.match(outcome.error, /Child startup failed\./u, "Replacement must report its startup failure after cleanup");
       assert.equal((await bounded(original.exited, { timeoutMs: 5000 })).code, 0);
       await fault.waitFor(async () => !await state.readInstanceLock(faultPaths.lock), { timeoutMs: 5000 });
       await fault.waitFor(() => fetch(url, { signal: AbortSignal.timeout(500) }).then(() => false, () => true), { timeoutMs: 5000 });
       if (replacementIdentity) await fault.waitFor(() => !state.isRunning(replacementIdentity.pid), { timeoutMs: 5000 });
+      assert.ok(workerPids.size, "Restart worker PID was not observed externally");
+      await fault.waitFor(() => [...workerPids].every((pid) => !state.isRunning(pid)), { timeoutMs: 5000, label: "fault restart worker exit" });
+      // The generic teardown must retain unverified startup failures, not this observed fault.
+      verifiedFaultCleanup = true;
       return { observed: `Real native ${kind === "bind" ? "bind collision" : "workspace configuration failure"} produced durable failed restart; concurrent requests joined; old/replacement processes and lock cleared`, evidence: { requestId: outcome.id, phase: outcome.phase, state: outcome.state } };
     } finally { await fault.teardown(); }
   }

@@ -106,6 +106,7 @@ export function createV2Adapter(options) {
       if (entry.accepted) return;
       if (entry.external) throw new Error("OpenCode request is already settled.");
       signal.throwIfAborted();
+      const onResponse = observer.onResponse;
       entry.submitting = true;
       const native = { sessionID: request.sessionID, ...(kind === "form" ? { formID: request.id } : { requestID: request.id }) };
       try {
@@ -134,7 +135,13 @@ export function createV2Adapter(options) {
         if (decision.type === "stop") {
           try { await client.session.interrupt({ sessionID: request.sessionID, resume: false }, { signal }); }
           finally { settleWaiters(observer, ""); }
-        } else if (decision.type === "reject" || decision.reply === "reject") settleWaiters(observer, "Stopped after a request was rejected.");
+        } else if (decision.type === "reject" || decision.reply === "reject") {
+          const text = kind === "permission" ? "Stopped after a permission was rejected." : "Stopped after a request was rejected.";
+          settleWaiters(observer, text);
+          if (onResponse) queueResponse(observer, () => {
+            if (observer.onResponse === onResponse) return onResponse(text, undefined, signal);
+          });
+        }
       } finally { entry.submitting = false; }
     };
     const submit = (decision) => {
