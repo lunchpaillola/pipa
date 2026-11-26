@@ -5,8 +5,9 @@ been published. Normal npm installs must continue to receive stable `0.5.6`
 unless the owner separately approves a stable release.
 
 This candidate increments `0.6.0-beta.4` to `0.6.0-beta.5`.
-Earlier preparation versions `0.6.2` and `0.6.3` were never published and are
-superseded. Publish only to npm's `beta` tag and mark the GitHub release
+Earlier beta preparation versions `0.6.2` and `0.6.3` were never published and are
+superseded. The stable releases `0.6.2` and `0.6.3` now on npm are later,
+separate releases, not these beta candidates. Publish only to npm's `beta` tag and mark the GitHub release
 **Pre-release**. Do not move `latest` or treat the version as stable qualification.
 
 ## Changes from 0.6.0-beta.4
