@@ -43,7 +43,7 @@ Pipa is free and open source. [Pipa for Teams](https://www.usepipa.com/teams?utm
 **Runs on** macOS, Linux, and Windows. **Requires** Node.js 22 or newer, [OpenCode](https://opencode.ai) installed and authenticated, and a Slack workspace where you can create an app.
 
 ```sh
-npm install --global @usepipa/pipa@0.6.4
+npm install --global @usepipa/pipa@latest
 pipa init
 pipa start
 ```
@@ -68,7 +68,7 @@ the steps and ask me before making changes, and back up the profile first.
 
 Pipa automatically detects OpenCode v1 or v2 and selects its native adapter. There is no manual Pipa migration command. OpenCode owns its data/schema upgrades; installing Pipa does not install or upgrade OpenCode.
 
-Unversioned installs use npm's `latest` tag; `@beta` selects the beta channel. Before upgrading, stop/drain Pipa and back up its profile. Keep your current OpenCode version initially. Do not rerun `pipa init` or start a second listener. Read the [release notes](docs/release-0.6.4.md) for limits and rollback steps.
+Unversioned installs use npm's `latest` tag; `@beta` selects the beta channel. Before upgrading, stop/drain Pipa and back up its profile. Keep your current OpenCode version initially. Do not rerun `pipa init` or start a second listener. Read the [release notes](https://github.com/lunchpaillola/pipa/releases) for limits and rollback steps.
 
 ## Security model
 
@@ -89,7 +89,7 @@ Socket Mode connects Pipa to Slack through an outbound connection. You do not ne
 1. Install Pipa:
 
 ```sh
-npm install --global @usepipa/pipa@0.6.4
+npm install --global @usepipa/pipa@latest
 ```
 
 2. From the folder where you want Pipa to work, run:
@@ -248,12 +248,12 @@ The picker shows up to 100 matches; narrow your search for more. A listed model 
 
 **An npm upgrade does not update your Slack app, register commands, or grant scopes.** Mentions and thread replies still work without the model command. Do not rerun `pipa init` or replace credentials to add it.
 
-After verified publication, stop/drain Pipa and privately back up its profile before upgrading to `0.6.4`. Keep the current OpenCode version and use the same `PIPA_HOME` as your existing installation (leave it unset for the default `~/.pipa` profile):
+Before upgrading, stop/drain Pipa and privately back up its profile. Keep the current OpenCode version and use the same `PIPA_HOME` as your existing installation (leave it unset for the default `~/.pipa` profile):
 
 ```sh
-npm install --global @usepipa/pipa@0.6.4
+npm install --global @usepipa/pipa@latest
 pipa --version
-pipa manifest > "$HOME/pipa-slack-manifest-0.6.4.json"
+pipa manifest > "$HOME/pipa-slack-manifest-backup.json"
 ```
 
 `pipa manifest` prints a local template without tokens. It does not change your profile or contact Slack. It is not an export of your app's current Slack settings.
