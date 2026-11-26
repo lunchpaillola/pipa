@@ -5,7 +5,7 @@ import { request } from "node:http";
 import { access, readFile, rm } from "node:fs/promises";
 import { createRuntimeFixture, waitFor, FIXTURE_TEARDOWN_TIMEOUT_MS } from "../../test/helpers/runtime-fixture.mjs";
 import { assertTurnOutcome } from "../../test/helpers/opencode-contract.mjs";
-import { assertPin, compatibilityExit, selectGate, recordCase, finishCell, unobservedPlatforms, CELL_WORKER_TIMEOUT_MS, PINS, MODES, BETA_PINS, BETA_CASE_IDS } from "../test-opencode-matrix.mjs";
+import { assertPin, matchesAttachmentProbePin, compatibilityExit, selectGate, recordCase, finishCell, unobservedPlatforms, CELL_WORKER_TIMEOUT_MS, PINS, MODES, BETA_PINS, BETA_CASE_IDS } from "../test-opencode-matrix.mjs";
 import { observeRuntimeReadiness, observeNativeAdmissions, assertRestartRoutineAdmission, releaseCases, runCell, protectedToolCommand, recordSharedCase } from "./opencode-release-cases.mjs";
 import { checkOpenCodeConnection } from "../../src/opencode.mjs";
 import { createWireFixture, loadWireFixture } from "../../test/helpers/opencode-contract.mjs";
@@ -15,6 +15,15 @@ import { fileURLToPath } from "node:url";
 import { MIGRATION_TARGET_PIN, selectMigrationTarget } from "./opencode-migration.mjs";
 
 const facade = { checkOpenCodeConnection };
+
+test("attachment probe accepts only the exact pin or its observed CLI banner", () => {
+  for (const output of ["2.0.29", "2.0.29\n", "opencode v2.0.29", "opencode v2.0.29\n"]) {
+    assert.equal(matchesAttachmentProbePin(output), true, JSON.stringify(output));
+  }
+  for (const output of ["2.0.30", "opencode v2.0.30\n", "OpenCode v2.0.29\n", "opencode 2.0.29", "tool v2.0.29", "v2.0.29", " 2.0.29", "2.0.29\r\n", "2.0.29\n\n", "2.0.29\nextra", "opencode v2.0.29 extra", "2.0.29\u0000", ""]) {
+    assert.equal(matchesAttachmentProbePin(output), false, JSON.stringify(output));
+  }
+});
 
 test("fixture launches Node without injecting arguments or a spawn supervisor", async (t) => {
   const runtime = await createRuntimeFixture();

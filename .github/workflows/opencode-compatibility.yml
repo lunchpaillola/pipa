@@ -60,10 +60,11 @@ jobs:
           report="$RUNNER_TEMP/attachment-probe.json"
           version_exit=0
           "$engine/opencode" --version > "$root/version.stdout" 2> "$root/version.stderr" || version_exit=$?
-          pin_matches=false
-          if test "$(cat "$root/version.stdout")" = 2.0.29; then
-            pin_matches=true
-          fi
+          pin_matches=$(node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            import { matchesAttachmentProbePin } from "./scripts/test-opencode-matrix.mjs";
+            console.log(matchesAttachmentProbePin(readFileSync(process.argv[1], "utf8")));
+          ' "$root/version.stdout")
           jq --argjson exitCode "$version_exit" --argjson exactPinMatches "$pin_matches" \
             --rawfile stdout "$root/version.stdout" --rawfile stderr "$root/version.stderr" \
             '.setup = {command:"opencode --version",expectedPin:"2.0.29",exitCode:$exitCode,stdout:$stdout,stderr:$stderr,exactPinMatches:$exactPinMatches}' \

@@ -32,6 +32,10 @@ export function assertPin(output, pin) {
   assert.match(output.trim(), new RegExp(`^(?:OpenCode\\s+)?v?${pin.replaceAll(".", "\\.")}$`, "iu"), "Executable version does not match exact pin");
 }
 
+export function matchesAttachmentProbePin(output) {
+  return ["2.0.29", "2.0.29\n", "opencode v2.0.29", "opencode v2.0.29\n"].includes(output);
+}
+
 export function compatibilityExit(rows) {
   for (const row of rows) assert.ok(["PASS", "FAIL", "BLOCKED", "NOT_APPLICABLE"].includes(row.status), "Invalid evidence status");
   return !rows.length || rows.some((row) => row.status === "FAIL" || row.status === "BLOCKED") ? 1 : 0;
