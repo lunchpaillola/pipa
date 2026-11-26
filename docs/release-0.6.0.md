@@ -1,5 +1,7 @@
 # Pipa 0.6.0 release preparation
 
+> Published. `0.6.0` is on npm and `latest` has since moved past it; this preparation record is retained as history. The status lines below describe the preparation moment.
+
 **Publication: PENDING.** This is a stable-channel preparation, not evidence that
 `0.6.0` is available. At preparation, npm `latest` is `0.5.6` and `beta` is
 `0.6.0-beta.5`; the human publisher must recheck immediately before publication.

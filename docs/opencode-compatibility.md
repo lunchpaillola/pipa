@@ -1,7 +1,9 @@
 # OpenCode compatibility and operator transition
 
-This guide describes the dual-adapter candidate on `feat/opencode-v1-v2`.
-It is not a release-qualified upgrade recommendation. See the [native blocker follow-up](research/opencode-native-blockers-verification.md), [U7 evidence](research/opencode-u7-verification.md)
+This guide describes Pipa's dual-adapter support for OpenCode v1 and v2. The
+adapter code ships in the published stable line: `src/opencode-v1.mjs` and
+`src/opencode-v2.mjs` are on `main` and in every npm release since `0.6.0`.
+See the [native blocker follow-up](research/opencode-native-blockers-verification.md), [U7 evidence](research/opencode-u7-verification.md)
 and [testing procedure](pipa-testing.md) before choosing a deployment pin.
 
 The gates below describe harness results and operator cutover evidence, not

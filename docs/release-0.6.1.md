@@ -1,5 +1,7 @@
 # Pipa 0.6.1 stable release preparation
 
+> Published. Stable `0.6.1` is on npm; this preparation record is retained as history. The status lines below describe the preparation moment.
+
 **Draft only; not published.** The owner selected stable `0.6.1`, not beta.
 The GitHub draft must have `draft: true` and `prerelease: false`.
 Neither a draft nor this version-bump PR authorizes tagging, npm publication,
