@@ -4,13 +4,13 @@ Pipa now verifies that the process recorded in its instance lock is the one that
 
 ## Upgrade from 0.6.3
 
-1. Pause automatic launchers and stop the existing instance using its terminal or service manager. Wait for it to exit before changing versions.
+1. Pause automatic launchers and stop the existing instance using its terminal or service manager. Wait for it to exit before changing versions. Note your current `pipa --version` output so you can reinstall that exact version if you need to roll back.
 2. Once 0.6.4 is published on npm, run `npm install -g @usepipa/pipa@0.6.4` and confirm `pipa --version` reports `0.6.4`.
 3. Start Pipa with the same profile and confirm it responds before resuming normal use. Keep each profile on one host and in one PID namespace; never run two versions against the same profile.
 
 If Pipa cannot verify an old lock, it leaves it alone. Move `pipa.lock` or `pipa.lock.recovering` aside only after pausing automatic launchers and confirming that no Pipa instance is running for that profile. Never signal a process just because its PID appears in the lock. On macOS, a PID reused within the same second can still block startup temporarily.
 
-To roll back, stop Pipa and pause automatic launchers again, install `@usepipa/pipa@0.6.3`, confirm the version, and start it with the same profile.
+To roll back, stop Pipa and pause automatic launchers again, install the exact version you noted before upgrading (`@usepipa/pipa@0.6.3` for an upgrade from 0.6.3), confirm the version, and start it with the same profile.
 
 ## Verification
 
