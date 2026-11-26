@@ -132,12 +132,13 @@ export function createV2Adapter(options) {
         }
         entry.accepted = true;
         // Native rejection/cancellation need not produce an idle event.
-        if (decision.type === "stop") {
-          try { await client.session.interrupt({ sessionID: request.sessionID, resume: false }, { signal }); }
-          finally { settleWaiters(observer, ""); }
-        } else if (decision.type === "reject" || decision.reply === "reject") {
-          const text = kind === "permission" ? "Stopped after a permission was rejected." : "Stopped after a request was rejected.";
-          settleWaiters(observer, text);
+        if (decision.type === "stop" || decision.type === "reject" || decision.reply === "reject") {
+          const text = decision.type === "stop" ? ""
+            : kind === "permission" ? "Stopped after a permission was rejected." : "Stopped after a request was rejected.";
+          if (decision.type === "stop") {
+            try { await client.session.interrupt({ sessionID: request.sessionID, resume: false }, { signal }); }
+            finally { settleWaiters(observer, text); }
+          } else settleWaiters(observer, text);
           if (onResponse) queueResponse(observer, () => {
             if (observer.onResponse === onResponse) return onResponse(text, undefined, signal);
           });

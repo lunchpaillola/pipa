@@ -990,6 +990,20 @@ test("explicit permission rejection settles a background turn without a native i
   assert.equal(f.requests.filter((r) => r.path.endsWith("/per_background_reject/reply")).length, 1);
 });
 
+test("question dismissal interrupts and settles a background turn without a reply", async (t) => {
+  const f = await fixture(t);
+  const responses = [];
+  const form = { id: "frm_background_stop", sessionID: "ses_one", title: "Continue?", fields: [{ key: "q0", type: "string" }] };
+  f.forms.push(form);
+  await f.adapter.execute(f.input("ses_one", {
+    onInteraction: async () => ({ type: "stop" }),
+    onResponse: async (text) => { responses.push(text); },
+  }));
+  await until(() => responses.length);
+  assert.deepEqual(responses, [""]);
+  assert.equal(f.requests.filter((r) => r.path.endsWith("/interrupt")).length, 1);
+});
+
 test("question dismissal interrupts natively and settles without idle", async (t) => {
   const f = await fixture(t);
   f.forms.push({ id: "frm_stop", sessionID: "ses_one", title: "Continue?", metadata: { kind: "question" }, fields: [{ key: "q0", type: "string", title: "Answer", required: true }] });
