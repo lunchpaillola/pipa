@@ -7,6 +7,10 @@ on:
         description: Collect the broad deterministic matrix and migration (not release certification)
         type: boolean
         default: false
+      attachment_probe:
+        description: Run only the Linux OpenCode 2.0.29 local attachment diagnostic
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -18,23 +22,63 @@ jobs:
       fail-fast: false
       matrix:
         # Windows native harness is outside the current release scope; unit/package CI remains.
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(inputs.attachment_probe && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Initialize attachment probe receipt
+        if: inputs.attachment_probe
+        run: |
+          jq -n '{collection:"targeted-diagnostic",releaseQualified:false,status:"BLOCKED",observed:"Probe did not return case results; see job log"}' > "$RUNNER_TEMP/attachment-probe.json"
+      - name: Reject conflicting selectors
+        if: inputs.attachment_probe && inputs.full_qualification
+        run: |
+          echo '::error::attachment_probe and full_qualification are mutually exclusive'
+          exit 1
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: node --test scripts/verification/self-check.mjs
+      - if: ${{ !inputs.attachment_probe }}
+        run: node --test scripts/verification/self-check.mjs
       # Two pins x three modes: 24 journey observations per host, no provider secrets.
-      - if: ${{ !inputs.full_qualification }}
+      - if: ${{ !inputs.attachment_probe && !inputs.full_qualification }}
         run: npm run test:beta -- --report=beta-smoke.json
-      - if: ${{ inputs.full_qualification }}
+      - if: ${{ !inputs.attachment_probe && inputs.full_qualification }}
         run: npm run test:engines -- --migration --gate=deterministic --report=opencode-compatibility.json
+      - name: Run Linux attachment probe
+        if: inputs.attachment_probe && !inputs.full_qualification
+        shell: bash
+        run: |
+          root=$(mktemp -d "$RUNNER_TEMP/attachment-probe.XXXXXX")
+          export npm_config_userconfig=/dev/null npm_config_registry=https://registry.npmjs.org
+          archive=$(npm pack --ignore-scripts --pack-destination "$root" --silent)
+          npm install --ignore-scripts --no-audit --no-fund --prefix "$root/candidate" "$root/$archive"
+          npm install --ignore-scripts --no-audit --no-fund --prefix "$root/engine" @opencode/cli-linux-x64@2.0.29
+          engine="$root/engine/node_modules/@opencode/cli-linux-x64/bin"
+          test "$("$engine/opencode" --version)" = 2.0.29
+          PATH="$engine:$PATH" node --input-type=module - "$root/candidate/node_modules/@usepipa/pipa" "$RUNNER_TEMP/attachment-probe.json" <<'JS'
+          import { writeFile } from 'node:fs/promises';
+          import { runCell } from './scripts/verification/opencode-release-cases.mjs';
+          const [, , candidate, report] = process.argv;
+          const pin = '2.0.29';
+          const mode = 'socket-owned';
+          const caseIds = ['startup-readiness', 'attachment-10mib'];
+          const { version: node, platform, arch } = process;
+          const cell = await runCell({ candidate, pin, mode, caseIds });
+          const passed = cell.cleanup.status === 'PASS' && caseIds.every(id => cell.cases.find(row => row.id === id)?.status === 'PASS');
+          await writeFile(report, JSON.stringify({ collection: 'targeted-diagnostic', releaseQualified: false, status: passed ? 'PASS' : 'FAIL', pin, mode, node, platform, arch, cell }, null, 2));
+          process.exitCode = passed ? 0 : 1;
+          JS
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && inputs.attachment_probe
+        with:
+          name: opencode-attachment-probe-linux
+          path: ${{ runner.temp }}/attachment-probe.json
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always() && !inputs.attachment_probe
         with:
           name: opencode-compatibility-${{ matrix.os }}
           path: |
