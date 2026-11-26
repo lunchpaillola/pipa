@@ -386,7 +386,14 @@ export async function recordSharedCase(rows, definition, observe, provider) {
   });
 }
 
-export async function runCell({ candidate, pin, mode, migration = false, caseIds, smoke = false }) {
+export async function runLocalAttachmentComparison(localAttachment) {
+  const control = await localAttachment(32, "boundary-tiny-local");
+  assert.equal(control.outcome, "PASS", `Tiny local attachment: ${control.error}`);
+  const boundary = await localAttachment(10 * 1024 * 1024, "boundary-accepted-local");
+  assert.equal(boundary.outcome, "PASS", `10 MiB local attachment: ${boundary.error}`);
+}
+
+export async function runCell({ candidate, pin, mode, migration = false, caseIds, smoke = false, attachmentDiagnostics = false }) {
   if (caseIds !== undefined) assert.ok(Array.isArray(caseIds) && caseIds.length && new Set(caseIds).size === caseIds.length && caseIds.every((id) => releaseCases.some((row) => row.id === id)), "Invalid targeted case selection");
   const engineBinaries = JSON.parse(process.env.PIPA_MATRIX_ENGINE_BINARIES ?? "{}");
   const runtime = await createRuntimeFixture({ timeoutMs: 7 * 60_000, cleanupTimeoutMs: 10_000 });
@@ -438,6 +445,9 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
   const headers = { authorization: `Basic ${Buffer.from("opencode:synthetic-loopback-only").toString("base64")}` };
   const chat = fakeChat();
   const wires = [];
+  let attachmentTrace;
+  const engineOutput = { stdout: "", stderr: "" };
+  const diagnosticText = (value) => String(value).slice(-8192).replaceAll(runtime.root, "<fixture>").replaceAll("synthetic-loopback-only", "<redacted>").replaceAll("synthetic-local-only", "<redacted>");
   let app;
   let executor;
   let server;
@@ -505,7 +515,20 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
     }
     const eventConnection = disconnectEvents && new URL(address).pathname.endsWith("/event") ? new AbortController() : null;
     const signal = init.signal ?? request?.signal;
-    const response = await fetch(url, eventConnection ? { ...init, signal: AbortSignal.any([eventConnection.signal, ...(signal ? [signal] : [])]) } : init);
+    const trace = attachmentTrace && /\/session\/[^/]+\/prompt$/u.test(new URL(address).pathname) ? attachmentTrace : null;
+    const http = trace && { path: new URL(address).pathname, requestedMs: Date.now() - trace.startedAt };
+    if (http) trace.http.push(http);
+    let response;
+    try {
+      response = await fetch(url, eventConnection ? { ...init, signal: AbortSignal.any([eventConnection.signal, ...(signal ? [signal] : [])]) } : init);
+    } catch (error) {
+      if (http) http.error = { name: error.name, message: diagnosticText(error.message), ms: Date.now() - trace.startedAt };
+      throw error;
+    }
+    if (http) {
+      http.response = { status: response.status, ms: Date.now() - trace.startedAt };
+      if (!response.ok) void response.clone().text().then((text) => { http.response.error = diagnosticText(text); }, () => {});
+    }
     if (eventConnection && response.headers.get("content-type")?.includes("text/event-stream")) {
       eventConnections++;
       eventAbort = eventConnection;
@@ -557,7 +580,12 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
           ...(mode === "attached" ? { attachUrl: baseUrl } : {}),
           spawn: (cmd, args, options) => {
             const spawned = runtime.spawn(cmd, args, options);
-            if (args[0] === "serve") ownedNative = spawned;
+            if (args[0] === "serve") {
+              ownedNative = spawned;
+              if (attachmentDiagnostics) for (const stream of ["stdout", "stderr"]) spawned.child[stream]?.on("data", (chunk) => {
+                engineOutput[stream] = (engineOutput[stream] + chunk).slice(-8192);
+              });
+            }
             return spawned.child;
           },
         });
@@ -1079,8 +1107,50 @@ throw Error('Native file-command completion deadline exceeded');
     },
     "attachment-10mib": async () => {
       if (requireExecutor()) return requireExecutor();
+      if (attachmentDiagnostics) cell.evidence.attachmentDiagnostics = [];
+      const localAttachment = async (size, id) => {
+        const bytes = Buffer.alloc(size, 97);
+        const trace = { size, startedAt: Date.now(), http: [] };
+        attachmentTrace = trace;
+        let pending;
+        const sample = async (phase) => ({ phase, ms: Date.now() - trace.startedAt, ...Object.fromEntries(await Promise.all([
+          ["permissions", "/api/permission/request"], ["questions", "/api/form"],
+        ].map(async ([key, pathname]) => {
+          try {
+            const url = new URL(pathname, baseUrl);
+            url.searchParams.set("location[directory]", runtime.workspace);
+            const response = await fetch(url, { headers, signal: AbortSignal.timeout(750) });
+            const data = response.ok ? (await response.json()).data : null;
+            return [key, { status: response.status, ...(Array.isArray(data) ? { sessions: data.map((item) => item.sessionID) } : {}) }];
+          } catch (error) { return [key, { error: diagnosticText(error.message) }]; }
+        }))) });
+        const timer = setTimeout(() => { pending = sample("before-deadline"); }, 9000);
+        try {
+          const result = await turn(id, { attachments: [{ name: "boundary.txt", size, mimeType: "text/plain", fetchData: async () => bytes }] });
+          assertTurnOutcome(result, { sessionId: result.sessionId, text: textFor(id) });
+          assert.equal(inputReceipt(promptFor(id)).files[0].base64, bytes.toString("base64"));
+          trace.outcome = "PASS";
+        } catch (error) {
+          trace.outcome = "FAIL";
+          trace.error = diagnosticText(error.message);
+        } finally {
+          clearTimeout(timer);
+          attachmentTrace = null;
+          trace.pending = await (pending ?? sample("after-turn"));
+          trace.providerRequests = provider.receipts.filter((item) => item.prompt === promptFor(id)).length;
+          trace.engineOutput = Object.fromEntries(Object.entries(engineOutput).map(([key, value]) => [key, diagnosticText(value)]));
+          const logDir = path.join(runtime.data, "opencode", "log");
+          const logs = await readdir(logDir).catch(() => []);
+          const latest = logs.filter((name) => name.endsWith(".log")).sort().at(-1);
+          trace.engineLog = latest ? await readFile(path.join(logDir, latest), "utf8").then(diagnosticText, () => null) : null;
+          delete trace.startedAt;
+          cell.evidence.attachmentDiagnostics.push(trace);
+        }
+        return trace;
+      };
+      if (attachmentDiagnostics) await runLocalAttachmentComparison(localAttachment);
       const bytes = Buffer.alloc(10 * 1024 * 1024, 97);
-      for (const transport of ["local", "data-uri"]) {
+      for (const transport of attachmentDiagnostics ? ["data-uri"] : ["local", "data-uri"]) {
         const remote = transport === "data-uri" ? facade.createOpenCodeExecutor({ baseUrl: baseUrl.replace("127.0.0.1", "matrix.invalid"), environment: runtime.env, pollIntervalMs: 50,
           fetch: (url, init) => connectedFetch(url instanceof Request ? new Request(url.url.replace("matrix.invalid", "127.0.0.1"), url) : String(url).replace("matrix.invalid", "127.0.0.1"), init) }) : executor;
         try {

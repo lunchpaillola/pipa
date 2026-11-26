@@ -6,7 +6,7 @@ import { access, readFile, rm } from "node:fs/promises";
 import { createRuntimeFixture, waitFor, FIXTURE_TEARDOWN_TIMEOUT_MS } from "../../test/helpers/runtime-fixture.mjs";
 import { assertTurnOutcome } from "../../test/helpers/opencode-contract.mjs";
 import { assertPin, matchesAttachmentProbePin, compatibilityExit, selectGate, recordCase, finishCell, unobservedPlatforms, CELL_WORKER_TIMEOUT_MS, PINS, MODES, BETA_PINS, BETA_CASE_IDS } from "../test-opencode-matrix.mjs";
-import { observeRuntimeReadiness, observeNativeAdmissions, assertRestartRoutineAdmission, releaseCases, runCell, protectedToolCommand, recordSharedCase } from "./opencode-release-cases.mjs";
+import { observeRuntimeReadiness, observeNativeAdmissions, assertRestartRoutineAdmission, releaseCases, runCell, runLocalAttachmentComparison, protectedToolCommand, recordSharedCase } from "./opencode-release-cases.mjs";
 import { checkOpenCodeConnection } from "../../src/opencode.mjs";
 import { createWireFixture, loadWireFixture } from "../../test/helpers/opencode-contract.mjs";
 import { createProvider } from "./opencode-provider.mjs";
@@ -15,6 +15,20 @@ import { fileURLToPath } from "node:url";
 import { MIGRATION_TARGET_PIN, selectMigrationTarget } from "./opencode-migration.mjs";
 
 const facade = { checkOpenCodeConnection };
+
+test("a failed tiny attachment control prevents boundary admission", async () => {
+  const admissions = [];
+  const run = (controlOutcome) => runLocalAttachmentComparison(async (size, id) => {
+    admissions.push({ size, id });
+    return id === "boundary-tiny-local" ? { outcome: controlOutcome, error: "fixture control failed" } : { outcome: "PASS" };
+  });
+  const tiny = { size: 32, id: "boundary-tiny-local" };
+  await assert.rejects(run("FAIL"), /Tiny local attachment: fixture control failed/u);
+  assert.deepEqual(admissions, [tiny]);
+  admissions.length = 0;
+  await run("PASS");
+  assert.deepEqual(admissions, [tiny, { size: 10 * 1024 * 1024, id: "boundary-accepted-local" }]);
+});
 
 test("attachment probe accepts only the exact pin or its observed CLI banner", () => {
   for (const output of ["2.0.29", "2.0.29\n", "opencode v2.0.29", "opencode v2.0.29\n"]) {

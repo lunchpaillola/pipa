@@ -83,7 +83,7 @@ jobs:
           const caseIds = ['startup-readiness', 'attachment-10mib'];
           const { version: node, platform, arch } = process;
           const { setup } = JSON.parse(await readFile(report, 'utf8'));
-          const cell = await runCell({ candidate, pin, mode, caseIds });
+          const cell = await runCell({ candidate, pin, mode, caseIds, attachmentDiagnostics: true });
           const passed = cell.cleanup.status === 'PASS' && caseIds.every(id => cell.cases.find(row => row.id === id)?.status === 'PASS');
           await writeFile(`${report}.tmp`, JSON.stringify({ collection: 'targeted-diagnostic', releaseQualified: false, status: passed ? 'PASS' : 'FAIL', pin, mode, node, platform, arch, setup, cell }, null, 2));
           await rename(`${report}.tmp`, report);
