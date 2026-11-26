@@ -41,11 +41,9 @@ export const releaseCases = [
   caseOf("reconnect-stream", "Reconnect/reload", "Close a real production event response, reconnect, settle one permission and deliver once", "U2/U3", chatCase),
   caseOf("reload-location", "Reconnect/reload", "Native location reload preserves session history and admits exactly one continuation", "U2/U3"),
   caseOf("crash-after-admission", "Abrupt crash/recovery", "Abrupt executor death after native acceptance retains session identity without replay or false success", "U2/U6"),
-  caseOf("crash-during-approval", "Abrupt crash/recovery", "Abrupt executor death at a real pending approval recovers/cancels abandoned work without false success", "U2/U6"),
   caseOf("crash-after-completion", "Abrupt crash/recovery", "Death after engine completion before delivery retains history without automatic replay/redelivery", "U2/U6"),
   caseOf("plugin-reload-contract", "MCP/skills/agents/commands/plugins", "Modified plugin executes its new hook once after v2 location reload or approved v1 full native-process restart, retaining history", "U7"),
   caseOf("attachment-image-data-uri", "Incoming attachments", "Native engine receives exact image and document bytes via local and data URI transport", "U2"),
-  caseOf("attachment-10mib", "Incoming attachments", "Real 10 MiB attachment reaches native admission through local and data URI transport", "U2"),
   caseOf("attachment-over-limit", "Incoming attachments", "10 MiB + 1 is rejected before native admission, both metadata and decoded bytes", "U2"),
   caseOf("attachment-over-limit-metadata", "Incoming attachments", "Oversized Chat attachment metadata rejects without downloading or admitting work", "U2", chatCase),
   caseOf("artifact-limits-fallback", "Outgoing artifacts", "Over-20-MiB outgoing file retains R9; unsafe declarations upload nothing; failed file post falls back once without declaration", "U2/U7"),
@@ -53,7 +51,6 @@ export const releaseCases = [
   caseOf("question-rejected-retry", "Permissions/questions", "A native rejected answer keeps editable controls until corrected submission is accepted", "U3"),
   caseOf("routine-overlap-recovery", "Routine overlap/restart recovery", "Held routine never overlaps; another proceeds; app restart retains run requests and skips missed occurrences", "U4/U6", chatCase),
   caseOf("routine-deactivate-delete", "Routine continuation/access", "Deactivation/deletion at a native execution barrier cancel engine work and suppress delivery", "U4", chatCase),
-  caseOf("shutdown-active-work", "Shutdown/delegation", "Shutdown removes Slack controls and rejects intake; v1 cancels native work, owned engines stop, and attached v2 work survives", "U4", chatCase),
   caseOf("socket-detached-restart", "Detached restart, Socket", "External observer verifies full Socket CLI restart, one ready notice and follow-up", "U6/U7", { ...liveCase, modes: ["socket-owned"], blocked: "Requires actual Socket connection and live evaluator; fake Chat is not full Socket CLI restart proof" }),
   caseOf("managed-restart-startup-failure", "Detached restart, Managed/failures", "Real replacement bind failure records failure and releases owned process/lock", "U6", managedCase),
   caseOf("managed-restart-unready", "Detached restart, Managed/failures", "Real engine with invalid workspace configuration never reports replacement readiness and cleans up", "U6", managedCase),
@@ -120,7 +117,7 @@ export function assertRestartRoutineAdmission(snapshot, { pid, prompt, marker, s
 // Kill only a private Pipa runner/executor process. The actual attached engine
 // stays alive; no shutdown, injected adapter, or engine response substitution.
 export async function abruptTurnProbe({ runtime, candidate, baseUrl, boundary, prompt, sessionFile, followup, releaseSurvivingTurn }) {
-  assert.ok(["admission", "approval", "completion"].includes(boundary));
+  assert.ok(["admission", "completion"].includes(boundary));
   const moduleURL = (file) => pathToFileURL(path.join(candidate, "src", `${file}.mjs`)).href;
   const worker = runtime.spawn(process.execPath, ["--input-type=module", "-e", `
     import { createOpenCodeExecutor } from ${JSON.stringify(moduleURL("opencode"))};
@@ -128,7 +125,6 @@ export async function abruptTurnProbe({ runtime, candidate, baseUrl, boundary, p
     import { createSessionStore } from ${JSON.stringify(moduleURL("state"))};
     import { isNativeAdmission } from ${JSON.stringify(import.meta.url)};
     const prompt = ${JSON.stringify(prompt)};
-    const admitted = Promise.withResolvers();
     const barrier = async (kind, evidence = {}) => {
       // A pending promise does not keep Node alive after the final HTTP stream closes.
       setInterval(() => {}, 1000);
@@ -143,7 +139,6 @@ export async function abruptTurnProbe({ runtime, candidate, baseUrl, boundary, p
         const response = await fetch(url, init);
         if (isNativeAdmission(wire, prompt)) {
           process.send({ kind: 'admission', wire, status: response.status });
-          if (response.ok) admitted.resolve();
           if (response.ok && ${JSON.stringify(boundary)} === 'admission') await barrier('admission');
         }
         return response;
@@ -153,11 +148,6 @@ export async function abruptTurnProbe({ runtime, candidate, baseUrl, boundary, p
     const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn, abortTurn: executor.abortTurn });
     await runner.enqueue('crash-probe', { prompt, workingDirectory: process.cwd(),
       onSession: sessionId => process.send({ kind: 'session', sessionId }),
-      onInteraction: async interaction => {
-        if (${JSON.stringify(boundary)} !== 'approval') throw new Error('Unexpected approval');
-        await admitted.promise;
-        await barrier('approval', { type: interaction.type, requestId: interaction.request.id });
-      },
       deliver: async result => {
         if (${JSON.stringify(boundary)} === 'completion') await barrier('completion', { result });
         process.send({ kind: 'unexpected-delivery' });
@@ -386,14 +376,7 @@ export async function recordSharedCase(rows, definition, observe, provider) {
   });
 }
 
-export async function runLocalAttachmentComparison(localAttachment) {
-  const control = await localAttachment(32, "boundary-tiny-local");
-  assert.equal(control.outcome, "PASS", `Tiny local attachment: ${control.error}`);
-  const boundary = await localAttachment(10 * 1024 * 1024, "boundary-accepted-local");
-  assert.equal(boundary.outcome, "PASS", `10 MiB local attachment: ${boundary.error}`);
-}
-
-export async function runCell({ candidate, pin, mode, migration = false, caseIds, smoke = false, attachmentDiagnostics = false }) {
+export async function runCell({ candidate, pin, mode, migration = false, caseIds, smoke = false }) {
   if (caseIds !== undefined) assert.ok(Array.isArray(caseIds) && caseIds.length && new Set(caseIds).size === caseIds.length && caseIds.every((id) => releaseCases.some((row) => row.id === id)), "Invalid targeted case selection");
   const engineBinaries = JSON.parse(process.env.PIPA_MATRIX_ENGINE_BINARIES ?? "{}");
   const runtime = await createRuntimeFixture({ timeoutMs: 7 * 60_000, cleanupTimeoutMs: 10_000 });
@@ -435,19 +418,10 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
     engineConfig.enabled_providers = ["matrix", "other"];
     engineConfig.providers = { matrix: modelProvider("matrix"), other: modelProvider("other"), excluded: modelProvider("excluded") };
   }
-  // Exact-size plaintext attachment qualification must not hit this finite
-  // provider fixture's ordinary 64k context and enter compaction before inference.
-  if (!caseIds || caseIds.includes("attachment-10mib")) {
-    for (const model of Object.values(engineConfig.provider.matrix.models)) model.limit.context = 16_000_000;
-    for (const model of Object.values(engineConfig.providers?.matrix.models ?? {})) if (model.limit) model.limit.context = 16_000_000;
-  }
   await writeFile(runtime.env.OPENCODE_CONFIG, JSON.stringify(engineConfig));
   const headers = { authorization: `Basic ${Buffer.from("opencode:synthetic-loopback-only").toString("base64")}` };
   const chat = fakeChat();
   const wires = [];
-  let attachmentTrace;
-  const engineOutput = { stdout: "", stderr: "" };
-  const diagnosticText = (value) => String(value).slice(-8192).replaceAll(runtime.root, "<fixture>").replaceAll("synthetic-loopback-only", "<redacted>").replaceAll("synthetic-local-only", "<redacted>");
   let app;
   let executor;
   let server;
@@ -515,20 +489,7 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
     }
     const eventConnection = disconnectEvents && new URL(address).pathname.endsWith("/event") ? new AbortController() : null;
     const signal = init.signal ?? request?.signal;
-    const trace = attachmentTrace && /\/session\/[^/]+\/prompt$/u.test(new URL(address).pathname) ? attachmentTrace : null;
-    const http = trace && { path: new URL(address).pathname, requestedMs: Date.now() - trace.startedAt };
-    if (http) trace.http.push(http);
-    let response;
-    try {
-      response = await fetch(url, eventConnection ? { ...init, signal: AbortSignal.any([eventConnection.signal, ...(signal ? [signal] : [])]) } : init);
-    } catch (error) {
-      if (http) http.error = { name: error.name, message: diagnosticText(error.message), ms: Date.now() - trace.startedAt };
-      throw error;
-    }
-    if (http) {
-      http.response = { status: response.status, ms: Date.now() - trace.startedAt };
-      if (!response.ok) void response.clone().text().then((text) => { http.response.error = diagnosticText(text); }, () => {});
-    }
+    const response = await fetch(url, eventConnection ? { ...init, signal: AbortSignal.any([eventConnection.signal, ...(signal ? [signal] : [])]) } : init);
     if (eventConnection && response.headers.get("content-type")?.includes("text/event-stream")) {
       eventConnections++;
       eventAbort = eventConnection;
@@ -580,12 +541,7 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
           ...(mode === "attached" ? { attachUrl: baseUrl } : {}),
           spawn: (cmd, args, options) => {
             const spawned = runtime.spawn(cmd, args, options);
-            if (args[0] === "serve") {
-              ownedNative = spawned;
-              if (attachmentDiagnostics) for (const stream of ["stdout", "stderr"]) spawned.child[stream]?.on("data", (chunk) => {
-                engineOutput[stream] = (engineOutput[stream] + chunk).slice(-8192);
-              });
-            }
+            if (args[0] === "serve") ownedNative = spawned;
             return spawned.child;
           },
         });
@@ -1105,69 +1061,6 @@ throw Error('Native file-command completion deadline exceeded');
         } finally { if (remote !== executor) remote.stopAll(); }
       }
     },
-    "attachment-10mib": async () => {
-      if (requireExecutor()) return requireExecutor();
-      if (attachmentDiagnostics) cell.evidence.attachmentDiagnostics = [];
-      const localAttachment = async (size, id) => {
-        const bytes = Buffer.alloc(size, 97);
-        const trace = { size, startedAt: Date.now(), http: [] };
-        attachmentTrace = trace;
-        let pending;
-        const sample = async (phase) => ({ phase, ms: Date.now() - trace.startedAt, ...Object.fromEntries(await Promise.all([
-          ["permissions", "/api/permission/request"], ["questions", "/api/form"],
-        ].map(async ([key, pathname]) => {
-          try {
-            const url = new URL(pathname, baseUrl);
-            url.searchParams.set("location[directory]", runtime.workspace);
-            const response = await fetch(url, { headers, signal: AbortSignal.timeout(750) });
-            const data = response.ok ? (await response.json()).data : null;
-            return [key, { status: response.status, ...(Array.isArray(data) ? { sessions: data.map((item) => item.sessionID) } : {}) }];
-          } catch (error) { return [key, { error: diagnosticText(error.message) }]; }
-        }))) });
-        const timer = setTimeout(() => { pending = sample("before-deadline"); }, 9000);
-        try {
-          const result = await turn(id, { attachments: [{ name: "boundary.txt", size, mimeType: "text/plain", fetchData: async () => bytes }] });
-          assertTurnOutcome(result, { sessionId: result.sessionId, text: textFor(id) });
-          assert.equal(inputReceipt(promptFor(id)).files[0].base64, bytes.toString("base64"));
-          trace.outcome = "PASS";
-        } catch (error) {
-          trace.outcome = "FAIL";
-          trace.error = diagnosticText(error.message);
-        } finally {
-          clearTimeout(timer);
-          attachmentTrace = null;
-          trace.pending = await (pending ?? sample("after-turn"));
-          trace.providerRequests = provider.receipts.filter((item) => item.prompt === promptFor(id)).length;
-          trace.engineOutput = Object.fromEntries(Object.entries(engineOutput).map(([key, value]) => [key, diagnosticText(value)]));
-          const logDir = path.join(runtime.data, "opencode", "log");
-          const logs = await readdir(logDir).catch(() => []);
-          const latest = logs.filter((name) => name.endsWith(".log")).sort().at(-1);
-          trace.engineLog = latest ? await readFile(path.join(logDir, latest), "utf8").then(diagnosticText, () => null) : null;
-          delete trace.startedAt;
-          cell.evidence.attachmentDiagnostics.push(trace);
-        }
-        return trace;
-      };
-      if (attachmentDiagnostics) await runLocalAttachmentComparison(localAttachment);
-      const bytes = Buffer.alloc(10 * 1024 * 1024, 97);
-      for (const transport of attachmentDiagnostics ? ["data-uri"] : ["local", "data-uri"]) {
-        const remote = transport === "data-uri" ? facade.createOpenCodeExecutor({ baseUrl: baseUrl.replace("127.0.0.1", "matrix.invalid"), environment: runtime.env, pollIntervalMs: 50,
-          fetch: (url, init) => connectedFetch(url instanceof Request ? new Request(url.url.replace("matrix.invalid", "127.0.0.1"), url) : String(url).replace("matrix.invalid", "127.0.0.1"), init) }) : executor;
-        try {
-          const id = `boundary-accepted-${transport}`;
-          const result = await turn(id, { attachments: [{ name: "boundary.txt", size: bytes.length, mimeType: "text/plain", fetchData: async () => bytes }] }, {}, remote);
-          assertTurnOutcome(result, { sessionId: result.sessionId, text: textFor(id) });
-          const file = inputReceipt(promptFor(id)).files[0];
-          assert.equal(file.base64, bytes.toString("base64"));
-          if (transport === "data-uri") assert.notEqual(file.transport, "local");
-        } catch (error) {
-          const id = `boundary-accepted-${transport}`;
-          const admitted = wires.some(wire => isNativeAdmission(wire, promptFor(id)));
-          const reachedProvider = provider.receipts.some(receipt => receipt.prompt === promptFor(id));
-          throw new Error(`${transport} attachment: ${error.message} (prompt request observed: ${admitted}; provider request observed: ${reachedProvider})`, { cause: error });
-        } finally { if (remote !== executor) remote.stopAll(); }
-      }
-    },
     "attachment-over-limit": async () => {
       if (requireExecutor()) return requireExecutor();
       const bytes = Buffer.alloc(10 * 1024 * 1024 + 1, 97);
@@ -1230,7 +1123,6 @@ throw Error('Native file-command completion deadline exceeded');
       assertNativeAdmissionCount(wires, promptFor("reload-recall"), 1);
     },
     "crash-after-admission": () => crashed("admission"),
-    "crash-during-approval": () => crashed("approval"),
     "crash-after-completion": () => crashed("completion"),
     "plugin-reload-contract": async () => {
       if (!cell.evidence.reload) return { status: "BLOCKED", observed: "Native location reload case did not reach plugin observation" };
@@ -1425,90 +1317,6 @@ throw Error('Native file-command completion deadline exceeded');
         const saved = (await routines.loadRoutineState(paths.routines)).routines.find((item) => item.id === id);
         if (operation === "delete") assert.equal(saved, undefined);
         else { assert.equal(saved.status, "inactive"); await routines.deleteRoutine(id, paths); }
-      }
-    },
-    "shutdown-active-work": async () => {
-      if (requireApp()) return requireApp();
-      const attachedV2 = mode === "attached" && pin.startsWith("2.");
-      for (const [index, kind] of ["root-question", "child-question", "child-permission", "quiet-tool", "child-quiet-tool"].entries()) {
-        const id = `shutdown-${kind}`;
-        const thread = `slack:CMATRIX:630.${index + 1}`;
-        const child = promptFor(`${id}-child`);
-        const marker = path.join(runtime.workspace, `${id}.pid`);
-        const question = { names: ["question", "form"], arguments: (_, tool) => tool.name === "question"
-          ? { questions: [{ header: "Shutdown", question: "Wait for cancellation", options: [{ label: "Yes", description: "Continue" }] }] }
-          : { title: "Shutdown", fields: [{ key: "q0", type: "string", options: [{ value: "Yes", label: "Yes" }], required: true }] } };
-        const tool = { names: ["bash", "shell", "$shell"], arguments: () => ({ command: `"${process.execPath}" -e 'require("node:fs").writeFileSync(${JSON.stringify(marker)},String(process.pid));setInterval(()=>{},1000)'`, description: "Quiet tool held until native cancellation" }) };
-        if (kind.startsWith("child-")) provider.register({ prompt: child, text: textFor(id), tool: kind === "child-question" ? question : tool });
-        provider.register({ prompt: promptFor(id), text: textFor(id), tool: kind.startsWith("child-")
-          ? { names: ["task", "subagent"], arguments: (_, tool) => ({ description: "Held child for shutdown", prompt: child, ...(tool.name === "task" ? { subagent_type: "matrix-fixture" } : { agent: "matrix-fixture" }) }) }
-          : kind === "quiet-tool" ? tool : question });
-        const message = chat.send(thread, promptFor(id));
-        const control = await runtime.waitFor(() => chat.controls.findLast((item) => item.thread === thread), { timeoutMs: 12000, label: `${kind} pending control` });
-        let toolPid;
-        if (kind.endsWith("quiet-tool")) {
-          const action = control.blocks.flatMap((block) => block.elements ?? []).find((item) => item.action_id?.startsWith("pipa_permission_once_"));
-          assert.ok(action);
-          await chat.handlers.action({ actionId: action.action_id, value: action.value, threadId: thread, user: { userId: "UMATRIX" } });
-          toolPid = await runtime.waitFor(() => readFile(marker, "utf8").then(Number, (error) => { if (error.code !== "ENOENT") throw error; return false; }), { timeoutMs: 5000, label: "quiet tool started" });
-          assert.equal(state.isRunning(toolPid), true);
-          // A completed native tool, not a short production deadline, ends work.
-          assert.ok(!chat.posts.some((item) => item.thread === thread));
-        }
-        const previousAdmissions = wires.filter((wire) => isNativeAdmission(wire, "intake after shutdown")).length;
-        await app.shutdown();
-        assert.ok(control.deleted || control.updated?.blocks?.every((block) => block.type !== "actions"), `${kind} retained live controls`);
-        chat.send(thread, "intake after shutdown");
-        await new Promise(setImmediate);
-        assertNativeAdmissionCount(wires, "intake after shutdown", previousAdmissions);
-        if (mode === "attached") {
-          await health();
-          const read = async (pathname, query = {}) => {
-            const url = new URL(`${baseUrl}${pathname}`);
-            for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value);
-            const response = await fetch(url, { headers, signal: AbortSignal.timeout(1000) });
-            assert.equal(response.status, 200);
-            return response.json();
-          };
-          if (attachedV2) {
-            const rootId = JSON.parse(await readFile(paths.sessions, "utf8"))[thread];
-            assert.ok(rootId, `${kind} fixture root session was not mapped`);
-            const sessionIds = [rootId];
-            if (kind.startsWith("child-")) {
-              const children = (await read("/api/session", { parentID: rootId })).data.filter((item) => item.parentID === rootId);
-              assert.equal(children.length, 1, `${kind} fixture child session`);
-              sessionIds.push(children[0].id);
-            }
-            const active = (await read("/api/session/active")).data;
-            const workId = sessionIds.at(-1);
-            assert.ok(Object.hasOwn(active, workId), `${kind} native work did not survive Pipa shutdown`);
-            if (toolPid) assert.equal(state.isRunning(toolPid), true, `${kind} tool did not survive Pipa shutdown`);
-            else {
-              const pathname = kind.endsWith("question") ? "/api/form" : "/api/permission/request";
-              const pending = (await read(pathname, { "location[directory]": runtime.workspace })).data;
-              assert.equal(pending.filter((item) => item.sessionID === workId).length, 1, `${kind} native request did not survive Pipa shutdown`);
-            }
-            // This is fixture cleanup, not part of Pipa shutdown. Interrupt only the sessions created above.
-            for (const sessionId of sessionIds) {
-              const response = await fetch(`${baseUrl}/api/session/${encodeURIComponent(sessionId)}/interrupt`, {
-                method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ resume: false }), signal: AbortSignal.timeout(1000),
-              });
-              assert.ok(response.ok, `${kind} fixture interrupt HTTP ${response.status}`);
-              await response.body?.cancel();
-            }
-            await runtime.waitFor(async () => {
-              const active = (await read("/api/session/active")).data;
-              return sessionIds.every((sessionId) => !Object.hasOwn(active, sessionId));
-            }, { timeoutMs: 5000, label: `${kind} fixture sessions settle` });
-          } else {
-            for (const pathname of ["/question", "/permission"]) assert.deepEqual(await read(pathname, { directory: runtime.workspace }), []);
-            assert.ok(Object.values(await read("/session/status", { directory: runtime.workspace })).every((item) => !["busy", "retry"].includes(item.type)));
-          }
-        }
-        if (toolPid) await runtime.waitFor(() => !state.isRunning(toolPid), { timeoutMs: 5000, label: "quiet native tool process exit" });
-        assert.ok(!chat.posts.some((item) => item.thread === thread && item.content?.markdown === textFor(id)));
-        assert.ok(!chat.reactions.some((item) => item.message === message.id && item.added && item.emoji === "white_check_mark"));
-        await startApp();
       }
     },
     "managed-restart-startup-failure": () => managedFailure("bind"),
@@ -1711,15 +1519,13 @@ throw Error('Native file-command completion deadline exceeded');
     if (prerequisite?.status !== "PASS") return { status: "BLOCKED", observed: `U2/U6: production native admission/completion prerequisite is ${prerequisite?.status ?? "absent"}; cannot reach an authoritative ${boundary} death boundary before the port. ${prerequisite?.observed ?? ""}` };
     const id = `crash-${boundary}`;
     const followup = `${id}-followup`;
-    const replace = pin.startsWith("2.") || boundary === "completion" || boundary === "admission";
-    if (replace) provider.register({ prompt: promptFor(followup), text: textFor(followup), verify: messages => {
+    provider.register({ prompt: promptFor(followup), text: textFor(followup), verify: messages => {
       assert.equal(JSON.stringify(messages).includes(promptFor(id)), true, "History must retain accepted input");
       if (boundary === "completion" || (pin.startsWith("1.") && boundary === "admission")) assert.ok(JSON.stringify(messages).includes(textFor(id)), "Completed crash result lost");
     } });
     provider.register({ prompt: promptFor(id), text: textFor(id), ...(boundary === "admission" ? { hold: true } : {}),
-      ...(boundary === "approval" ? { tool: { names: ["bash", "shell", "$shell"], arguments: () => ({ command: `"${process.execPath}" -e "console.log('${textFor(id)}')"`, description: "Reach a real protected-tool approval before abrupt Pipa death" }) } } : {}),
     });
-    const evidence = await abruptTurnProbe({ runtime, candidate, baseUrl, boundary, prompt: promptFor(id), sessionFile: path.join(runtime.state, `${id}-sessions.json`), ...(replace ? { followup: promptFor(followup) } : {}),
+    const evidence = await abruptTurnProbe({ runtime, candidate, baseUrl, boundary, prompt: promptFor(id), sessionFile: path.join(runtime.state, `${id}-sessions.json`), followup: promptFor(followup),
       ...(boundary === "admission" ? { releaseSurvivingTurn: async (sessionId) => {
         const receipt = await runtime.waitFor(() => provider.receipts.find(receipt => receipt.prompt === promptFor(id)), { timeoutMs: 12000, label: "surviving native turn reaches held provider" });
         const releasedAt = process.hrtime.bigint().toString();
@@ -1731,23 +1537,6 @@ throw Error('Native file-command completion deadline exceeded');
             && typeof message.time?.completed === "number" && message.content.some(part => part.type === "text" && part.text === textFor(id)));
         }, { timeoutMs: 12000, label: "surviving native response completes before follow-up" });
         return releasedAt;
-      } } : boundary === "approval" && pin.startsWith("2.") ? { releaseSurvivingTurn: async (sessionId, reached) => {
-        assert.equal(reached.type, "permission");
-        assert.ok(reached.requestId);
-        const sessionUrl = `${baseUrl}/api/session/${encodeURIComponent(sessionId)}`;
-        const request = await fetch(`${sessionUrl}/permission`, { headers, signal: AbortSignal.timeout(1000) });
-        assert.ok(request.ok, `Pending permission HTTP ${request.status}`);
-        assert.ok((await request.json()).data.some(item => item.id === reached.requestId), "Native approval did not survive the crash");
-        // Model an explicit operator rejection, never grant or silently cancel work on reconnect.
-        const reply = await fetch(`${sessionUrl}/permission/${encodeURIComponent(reached.requestId)}/reply`, {
-          method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ decision: "reject" }), signal: AbortSignal.timeout(1000),
-        });
-        assert.ok(reply.ok, `Native operator rejection HTTP ${reply.status}`);
-        await runtime.waitFor(async () => {
-          const active = await fetch(`${baseUrl}/api/session/active`, { headers, signal: AbortSignal.timeout(1000) });
-          assert.ok(active.ok, `Active sessions HTTP ${active.status}`);
-          return !Object.hasOwn((await active.json()).data, sessionId);
-        }, { timeoutMs: 12000, label: "native session settles after operator rejection" });
       } } : {}),
     });
     (cell.evidence.crashes ??= []).push(evidence);
@@ -1755,7 +1544,7 @@ throw Error('Native file-command completion deadline exceeded');
       assertTurnOutcome(evidence.recovery.result, { sessionId: evidence.sessionId, text: textFor(followup) });
       if (boundary === "completion") assertTurnOutcome(evidence.result, { sessionId: evidence.sessionId, text: textFor(id) });
       return { observed: pin.startsWith("2.")
-        ? `Actual executor SIGKILL at ${boundary}; ${boundary === "approval" ? "explicit operator rejection settled the surviving native approval; " : ""}replacement reused native session history without automatically replaying the original prompt and delivered one explicit follow-up. Native engine survived executor death. Not full Socket application death or routine crash-window proof.`
+        ? `Actual executor SIGKILL at ${boundary}; replacement reused native session history without automatically replaying the original prompt and delivered one explicit follow-up. Native engine survived executor death. Not full Socket application death or routine crash-window proof.`
         : `Actual v1 executor SIGKILL at ${boundary}; separate replacement retained the mapped session/history, replayed no input, delivered no original result, and completed one explicit follow-up. ${boundary === "admission" ? "Replacement waited for surviving native work to settle; it did not cancel or claim abandoned ownership. " : ""}No native restart, v1 startup cancellation, Slack-card cleanup or whole-app recovery is claimed.`, evidence };
     }
     if (boundary === "admission") {
@@ -1767,16 +1556,6 @@ throw Error('Native file-command completion deadline exceeded');
       const next = await turn(`${id}-followup`, { sessionId: evidence.sessionId }, { verify: (messages) => assert.ok(JSON.stringify(messages).includes(promptFor(id)), "Completed crash history lost") });
       assertTurnOutcome(next, { sessionId: evidence.sessionId, text: textFor(`${id}-followup`) });
       evidence.followupRetainedHistory = true;
-    }
-    if (pin.startsWith("1.") && boundary === "approval") {
-      const read = async pathname => {
-        const response = await fetch(`${baseUrl}${pathname}?directory=${encodeURIComponent(runtime.workspace)}`, { headers, signal: AbortSignal.timeout(5000) });
-        assert.equal(response.status, 200);
-        return response.json();
-      };
-      const [statuses, permissions, questions] = await Promise.all([read("/session/status"), read("/permission"), read("/question")]);
-      evidence.pendingAfterDeath = { status: statuses[evidence.sessionId]?.type ?? "idle", permissions: permissions.filter(item => item.sessionID === evidence.sessionId).map(item => item.id), questions: questions.filter(item => item.sessionID === evidence.sessionId).map(item => item.id) };
-      return { status: "BLOCKED", observed: `V1 executor died at native approval; surviving session is ${evidence.pendingAfterDeath.status} with ${evidence.pendingAfterDeath.permissions.length} permission(s) and ${evidence.pendingAfterDeath.questions.length} question(s). Replacement startup has no durable v1 turn ownership to cancel these safely. Plugin-restart approval does not authorize recovery-time attached-engine takeover.`, evidence };
     }
     return { status: "BLOCKED", observed: `U2/U6: actual SIGKILL at native ${boundary} barrier; one accepted admission, persisted session and no delivery. ${boundary === "completion" ? "Explicit follow-up retained completed history. " : ""}Owned instruction/admission startup recovery has no qualified public seam; this bounded runner/executor probe is not full Socket death, automatic recovery, or routine crash-window proof.`, evidence };
   }

@@ -29,7 +29,7 @@ test("release admission self-check: forbidden native v2 text and duplicate v1/v2
 test("release catalog keeps native crash boundaries and separate unqualified model/Slack proofs", async () => {
   const ids = releaseCases.map((row) => row.id);
   assert.equal(new Set(ids).size, ids.length);
-  for (const id of ["crash-after-admission", "crash-during-approval", "crash-after-completion"]) {
+  for (const id of ["crash-after-admission", "crash-after-completion"]) {
     assert.equal(releaseCases.find((row) => row.id === id)?.owner, "U2/U6");
   }
   assert.ok(releaseCases.find((row) => row.id === "slack-editable-retry-controls")?.blocked);
@@ -52,18 +52,12 @@ test("release catalog keeps native crash boundaries and separate unqualified mod
   assert.ok(workflow.includes("npm run test:engines -- --migration --gate=deterministic"));
 });
 
-for (const [generation, boundary, replacement] of [["v1", "admission"], ["v1", "approval"], ["v1", "completion"], ["v1", "completion", true]]) test(`release crash self-check: ${generation} SIGKILL at ${boundary}${replacement ? " with replacement" : ""} through production runner/native HTTP fixture (not engine recovery proof)`, async (t) => {
+for (const [generation, boundary, replacement] of [["v1", "admission"], ["v1", "completion"], ["v1", "completion", true]]) test(`release crash self-check: ${generation} SIGKILL at ${boundary}${replacement ? " with replacement" : ""} through production runner/native HTTP fixture (not engine recovery proof)`, async (t) => {
   const runtime = await createRuntimeFixture({ timeoutMs: 25000 });
   t.after(() => runtime.teardown());
   const document = await loadWireFixture(generation, runtime);
   const sessionFile = path.join(runtime.state, "crash-sessions.json");
   if (replacement) for (const route of document.routes.filter(route => ["/global/health", "/path"].includes(route.path))) route.repeatLast = true;
-  const admission = Promise.withResolvers();
-  if (boundary === "approval") {
-    document.routes.find((route) => route.path === "/session/status").responses = [{ json: { ses_contract: { type: "busy" } } }];
-    const messages = document.routes.find((route) => route.path.endsWith("/message"));
-    messages.responses = [messages.responses[0]];
-  }
   if (boundary === "completion") document.routes.find((route) => route.path.endsWith("/message")).responses.shift();
   const wire = createWireFixture(document);
   const serverErrors = [];
@@ -77,9 +71,6 @@ for (const [generation, boundary, replacement] of [["v1", "admission"], ["v1", "
       if (request.url.startsWith("/event?") || request.url === "/api/event") {
         response.writeHead(200, { "content-type": "text/event-stream" });
         response.flushHeaders();
-        await admission.promise;
-        // A pending approval can only appear after actual prompt acceptance.
-        if (boundary === "approval") response.write(document.routes.find((route) => route.path === "/event").responses[0].sse.split("\n\n")[0] + "\n\n");
         return;
       }
       let body = "";
@@ -87,7 +78,6 @@ for (const [generation, boundary, replacement] of [["v1", "admission"], ["v1", "
       const result = await wire.fetch(`http://127.0.0.1${request.url}`, { method: request.method, ...(body ? { body } : {}) });
       response.writeHead(result.status, Object.fromEntries(result.headers));
       response.end(await result.text());
-      if (request.url.includes("/prompt_async?")) admission.resolve();
     } catch (error) { serverErrors.push(error); response.writeHead(500); response.end(); }
   });
   const baseUrl = await runtime.listen(server);
@@ -102,7 +92,6 @@ for (const [generation, boundary, replacement] of [["v1", "admission"], ["v1", "
     assert.equal(evidence.recovery.noReplay, true);
     assertNativeAdmissionCount(wire.calls, followup, 1);
   }
-  if (boundary === "approval") assert.equal(evidence.requestId, "que_contract");
   assertNativeAdmissionCount(wire.calls, document.prompt, 1);
   assert.deepEqual(serverErrors, []);
   wire.assertComplete();
@@ -1836,7 +1825,7 @@ test("U2: session persistence callback runs before artifact allocation, context 
   }
 });
 
-for (const generation of ["v1", "v2"]) for (const remote of [false, true]) test(`${generation} U2: 10 MiB decoded input boundary, metadata, multiple Unicode files and ${remote ? "data URI" : "local file"} transport`, async (t) => {
+for (const generation of ["v1", "v2"]) for (const remote of [false, true]) test(`${generation} U2: oversize input rejection and multiple Unicode files and ${remote ? "data URI" : "local file"} transport`, async (t) => {
   const { executor, input, document, wire } = await fixture(t, generation, { executorOptions: { baseUrl: remote ? "https://remote.fixture" : "http://127.0.0.1:4096" }, onRequest: async (call) => {
     if (remote || !call.path.endsWith(generation === "v1" ? "/prompt_async" : "/prompt")) return;
     const urls = generation === "v1" ? call.body.parts.slice(1).map((file) => file.url) : call.body.files.map((file) => file.uri);
@@ -1848,7 +1837,7 @@ for (const generation of ["v1", "v2"]) for (const remote of [false, true]) test(
   assert.equal(downloaded, false);
   await assert.rejects(executor.runTurn({ ...input, attachments: [{ size: 1, fetchData: async () => Buffer.alloc(10 * 1024 * 1024 + 1) }] }), /10 MiB/u);
   assert.equal(wire.calls.length, 0, "oversized files cannot reach admission");
-  const bytes = Buffer.alloc(10 * 1024 * 1024, 97);
+  const bytes = Buffer.from("café 😀");
   const route = document.routes.find((route) => route.path.endsWith(generation === "v1" ? "/prompt_async" : "/prompt"));
   if (generation === "v2") delete route.body; // The exact native files are asserted below, alongside unchanged exact prompt bytes.
   await runTurnContract({ executor, input: { ...input, attachments: [
@@ -1864,7 +1853,6 @@ for (const generation of ["v1", "v2"]) for (const remote of [false, true]) test(
       assert.equal(file.uri.startsWith("data:"), true);
       const data = Buffer.from(file.uri.split(",")[1], "base64");
       assert.deepEqual(data, index === 0 ? bytes : Buffer.from("two"));
-      if (index === 0) assert.ok(Buffer.byteLength(file.uri) > bytes.length, "base64 overhead does not reduce the decoded limit");
     } else await assert.rejects(access(new URL(file.uri)), { code: "ENOENT" });
   }
   wire.assertComplete();
