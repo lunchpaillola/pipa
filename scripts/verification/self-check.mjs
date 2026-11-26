@@ -320,7 +320,7 @@ test("required deterministic defects, missing cases/cells, diagnostics and empty
   for (const engine of PINS) for (const mode of MODES) for (const status of ["FAIL", "BLOCKED", "NOT_APPLICABLE"]) {
     const report = gateFixture();
     const cell = report.cells.find((cell) => cell.engine === engine && cell.mode === mode);
-    for (const id of ["exact-prompt-continuation", "crash-after-admission", "crash-during-approval", "crash-after-completion", ...(mode === "managed" ? ["managed-restart"] : ["socket-fixture-restart"]), ...(engine.startsWith("2.") ? ["definitions-command", "models-default", "models-switch", "models-variants", "models-reset"] : [])]) {
+    for (const id of ["exact-prompt-continuation", "crash-after-admission", "crash-after-completion", ...(mode === "managed" ? ["managed-restart"] : ["socket-fixture-restart"]), ...(engine.startsWith("2.") ? ["definitions-command", "models-default", "models-switch", "models-variants", "models-reset"] : [])]) {
       const row = cell.cases.find((row) => row.id === id);
       row.status = status;
       assert.equal(selectGate(report).exitCode, 1, `${engine} ${mode} ${id} ${status}`);

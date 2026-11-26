@@ -5,6 +5,8 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+export const CONTROLLED_PROVIDER_FAILURE = "Controlled matrix provider failure";
+
 // Finite model scripts. Sessions, tools, permissions, forms and scheduling remain real.
 export async function createProvider(runtime) {
   const scripts = new Map();
@@ -47,7 +49,7 @@ export async function createProvider(runtime) {
       }
       if (script.fail) {
         res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { message: "Controlled matrix provider failure", type: "invalid_request_error" } }));
+        res.end(JSON.stringify({ error: { message: CONTROLLED_PROVIDER_FAILURE, type: "invalid_request_error" } }));
         return;
       }
       let call;
