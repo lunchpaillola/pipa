@@ -53,7 +53,7 @@ export const releaseCases = [
   caseOf("question-rejected-retry", "Permissions/questions", "A native rejected answer keeps editable controls until corrected submission is accepted", "U3"),
   caseOf("routine-overlap-recovery", "Routine overlap/restart recovery", "Held routine never overlaps; another proceeds; app restart retains run requests and skips missed occurrences", "U4/U6", chatCase),
   caseOf("routine-deactivate-delete", "Routine continuation/access", "Deactivation/deletion at a native execution barrier cancel engine work and suppress delivery", "U4", chatCase),
-  caseOf("shutdown-active-work", "Shutdown/delegation", "Shutdown drains root/child questions, permissions and a quiet active tool; rejects intake and preserves attached ownership", "U4", chatCase),
+  caseOf("shutdown-active-work", "Shutdown/delegation", "Shutdown removes Slack controls and rejects intake; v1 cancels native work, owned engines stop, and attached v2 work survives", "U4", chatCase),
   caseOf("socket-detached-restart", "Detached restart, Socket", "External observer verifies full Socket CLI restart, one ready notice and follow-up", "U6/U7", { ...liveCase, modes: ["socket-owned"], blocked: "Requires actual Socket connection and live evaluator; fake Chat is not full Socket CLI restart proof" }),
   caseOf("managed-restart-startup-failure", "Detached restart, Managed/failures", "Real replacement bind failure records failure and releases owned process/lock", "U6", managedCase),
   caseOf("managed-restart-unready", "Detached restart, Managed/failures", "Real engine with invalid workspace configuration never reports replacement readiness and cleans up", "U6", managedCase),
@@ -1090,6 +1090,11 @@ throw Error('Native file-command completion deadline exceeded');
           const file = inputReceipt(promptFor(id)).files[0];
           assert.equal(file.base64, bytes.toString("base64"));
           if (transport === "data-uri") assert.notEqual(file.transport, "local");
+        } catch (error) {
+          const id = `boundary-accepted-${transport}`;
+          const admitted = wires.some(wire => isNativeAdmission(wire, promptFor(id)));
+          const reachedProvider = provider.receipts.some(receipt => receipt.prompt === promptFor(id));
+          throw new Error(`${transport} attachment: ${error.message} (prompt request observed: ${admitted}; provider request observed: ${reachedProvider})`, { cause: error });
         } finally { if (remote !== executor) remote.stopAll(); }
       }
     },
@@ -1310,7 +1315,11 @@ throw Error('Native file-command completion deadline exceeded');
       const pending = (await routines.loadRoutineState(paths.routines)).routines.find((item) => item.id === id).runRequestedAt;
       assert.ok(pending);
       await app.shutdown();
-      await runtime.waitFor(() => held.closed, { timeoutMs: 5000, label: "shutdown engine-side routine cancellation" });
+      if (mode === "attached") {
+        // The independently owned engine can finish after Pipa disconnects.
+        if (!held.closed) provider.release(promptFor(id));
+        await health();
+      } else await runtime.waitFor(() => held.closed, { timeoutMs: 5000, label: "shutdown engine-side routine cancellation" });
       assert.equal((await routines.loadRoutineState(paths.routines)).routines.find((item) => item.id === id).runRequestedAt, pending);
       assert.ok(!chat.posts.some((item) => item.thread === "slack:CMATRIX:610.001"));
       const missedAt = Date.now() + 400;
@@ -1325,6 +1334,7 @@ throw Error('Native file-command completion deadline exceeded');
       assert.equal(saved.routines.find((item) => item.id === id).runRequestedAt, null);
       assert.equal(saved.routines.find((item) => item.id === "missed-once").status, "inactive");
       assert.ok(Date.parse(saved.routines.find((item) => item.id === "missed-recurring").nextRunAt) > Date.now());
+      assert.equal(provider.receipts.filter((item) => item.prompt === promptFor(id)).length, 2, "Pending routine did not recover exactly once");
       assert.ok(!provider.receipts.some((item) => item.prompt.includes("missed-once") || item.prompt.includes("missed-recurring")));
       assert.equal(chat.posts.filter((item) => item.thread === "slack:CMATRIX:610.001").length, 1);
       for (const name of [id, "overlap-independent", "missed-once", "missed-recurring"]) await routines.deleteRoutine(name, paths);
@@ -1349,6 +1359,7 @@ throw Error('Native file-command completion deadline exceeded');
     },
     "shutdown-active-work": async () => {
       if (requireApp()) return requireApp();
+      const attachedV2 = mode === "attached" && pin.startsWith("2.");
       for (const [index, kind] of ["root-question", "child-question", "child-permission", "quiet-tool", "child-quiet-tool"].entries()) {
         const id = `shutdown-${kind}`;
         const thread = `slack:CMATRIX:630.${index + 1}`;
@@ -1377,12 +1388,9 @@ throw Error('Native file-command completion deadline exceeded');
         const previousAdmissions = wires.filter((wire) => isNativeAdmission(wire, "intake after shutdown")).length;
         await app.shutdown();
         assert.ok(control.deleted || control.updated?.blocks?.every((block) => block.type !== "actions"), `${kind} retained live controls`);
-        assert.ok(!chat.posts.some((item) => item.thread === thread && item.content?.markdown === textFor(id)));
-        assert.ok(!chat.reactions.some((item) => item.message === message.id && item.added && item.emoji === "white_check_mark"));
         chat.send(thread, "intake after shutdown");
         await new Promise(setImmediate);
         assertNativeAdmissionCount(wires, "intake after shutdown", previousAdmissions);
-        if (toolPid) await runtime.waitFor(() => !state.isRunning(toolPid), { timeoutMs: 5000, label: "quiet native tool process exit" });
         if (mode === "attached") {
           await health();
           const read = async (pathname, query = {}) => {
@@ -1392,14 +1400,44 @@ throw Error('Native file-command completion deadline exceeded');
             assert.equal(response.status, 200);
             return response.json();
           };
-          if (pin.startsWith("2.")) {
-            for (const pathname of ["/api/form", "/api/permission/request"]) assert.deepEqual((await read(pathname, { "location[directory]": runtime.workspace })).data, []);
-            assert.deepEqual((await read("/api/session/active")).data, {});
+          if (attachedV2) {
+            const rootId = JSON.parse(await readFile(paths.sessions, "utf8"))[thread];
+            assert.ok(rootId, `${kind} fixture root session was not mapped`);
+            const sessionIds = [rootId];
+            if (kind.startsWith("child-")) {
+              const children = (await read("/api/session", { parentID: rootId })).data.filter((item) => item.parentID === rootId);
+              assert.equal(children.length, 1, `${kind} fixture child session`);
+              sessionIds.push(children[0].id);
+            }
+            const active = (await read("/api/session/active")).data;
+            const workId = sessionIds.at(-1);
+            assert.ok(Object.hasOwn(active, workId), `${kind} native work did not survive Pipa shutdown`);
+            if (toolPid) assert.equal(state.isRunning(toolPid), true, `${kind} tool did not survive Pipa shutdown`);
+            else {
+              const pathname = kind.endsWith("question") ? "/api/form" : "/api/permission/request";
+              const pending = (await read(pathname, { "location[directory]": runtime.workspace })).data;
+              assert.equal(pending.filter((item) => item.sessionID === workId).length, 1, `${kind} native request did not survive Pipa shutdown`);
+            }
+            // This is fixture cleanup, not part of Pipa shutdown. Interrupt only the sessions created above.
+            for (const sessionId of sessionIds) {
+              const response = await fetch(`${baseUrl}/api/session/${encodeURIComponent(sessionId)}/interrupt`, {
+                method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ resume: false }), signal: AbortSignal.timeout(1000),
+              });
+              assert.ok(response.ok, `${kind} fixture interrupt HTTP ${response.status}`);
+              await response.body?.cancel();
+            }
+            await runtime.waitFor(async () => {
+              const active = (await read("/api/session/active")).data;
+              return sessionIds.every((sessionId) => !Object.hasOwn(active, sessionId));
+            }, { timeoutMs: 5000, label: `${kind} fixture sessions settle` });
           } else {
             for (const pathname of ["/question", "/permission"]) assert.deepEqual(await read(pathname, { directory: runtime.workspace }), []);
             assert.ok(Object.values(await read("/session/status", { directory: runtime.workspace })).every((item) => !["busy", "retry"].includes(item.type)));
           }
         }
+        if (toolPid) await runtime.waitFor(() => !state.isRunning(toolPid), { timeoutMs: 5000, label: "quiet native tool process exit" });
+        assert.ok(!chat.posts.some((item) => item.thread === thread && item.content?.markdown === textFor(id)));
+        assert.ok(!chat.reactions.some((item) => item.message === message.id && item.added && item.emoji === "white_check_mark"));
         await startApp();
       }
     },
