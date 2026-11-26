@@ -20,7 +20,7 @@ original commits, dates, failures, unobserved cases, and coverage limits; daily-
 acceptance is not an exhaustive test receipt. This decision does not assert that
 the full matrix passed, certify every provider/client, or set `releaseQualified`
 to true. Windows native is `—` (not run), not a pass. Generic future qualification
-policy remains in [CONTRIBUTING](../CONTRIBUTING.md#stable-release).
+policy at the time is preserved in [CONTRIBUTING](https://github.com/lunchpaillola/pipa/blob/db0b55f/CONTRIBUTING.md#stable-release).
 
 Required exact-version verification:
 
