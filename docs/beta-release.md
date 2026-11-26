@@ -218,7 +218,10 @@ Reinstalling Pipa does not reverse an OpenCode data upgrade. An engine upgrade
 needs a separate matched-snapshot backup/rollback plan; see
 [OpenCode compatibility](opencode-compatibility.md).
 
-## Publisher checklist
+## Historical beta.5 publisher checklist
+
+This records the process used for this candidate. For new releases, follow
+[Releases](../CONTRIBUTING.md#releases).
 
 This candidate adds thread context and missing-folder recovery on top of PR #66's
 restart fix. Routine model selection is unchanged: a saved routine model is
@@ -227,9 +230,9 @@ The agent may merge after owner approval and passing CI; the owner tags and publ
 prerelease creation must target the actual merged commit, never the unmerged
 feature head. Installation remains a separate cutover.
 
-1. Recheck PR feedback and required CI for the exact beta commit. Run the [controlled-beta checks](../CONTRIBUTING.md#controlled-beta), including the installed-package smoke and publish dry-run. Record limitations separately from passing checks.
+1. Recheck PR feedback and required CI for the exact beta commit. Run the [then-current controlled-beta checks](https://github.com/lunchpaillola/pipa/blob/db0b55f/CONTRIBUTING.md#controlled-beta), including the installed-package smoke and publish dry-run. Record limitations separately from passing checks.
 2. Immediately before publication, run `npm view @usepipa/pipa dist-tags versions --json`. Confirm `0.6.0-beta.5` is still unused and record the current `beta` and `latest` tags. Stop if the registry changed unexpectedly.
-3. After this candidate PR is merged and required CI passes, check out the actual merged commit in a clean release checkout, verify both package files say `0.6.0-beta.5`, and follow the [merged-artifact checks](../CONTRIBUTING.md#releases) without rerunning the PR suite. Tag that merged commit `v0.6.0-beta.5`; never tag the unmerged feature head. Create its GitHub release as **Pre-release**, not latest, using these changes and limits as the notes. Tagging and GitHub release creation do not publish to npm.
+3. After this candidate PR is merged and required CI passes, check out the actual merged commit in a clean release checkout, verify both package files say `0.6.0-beta.5`, and follow the [then-current merged-artifact checks](https://github.com/lunchpaillola/pipa/blob/db0b55f/CONTRIBUTING.md#releases) without rerunning the PR suite. Tag that merged commit `v0.6.0-beta.5`; never tag the unmerged feature head. Create its GitHub release as **Pre-release**, not latest, using these changes and limits as the notes. Tagging and GitHub release creation do not publish to npm.
 4. The owner publishes the exact checked archive:
 
 ```sh

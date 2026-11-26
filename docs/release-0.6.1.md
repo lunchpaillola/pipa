@@ -92,7 +92,7 @@ remain unresolved; see [the prior release notes](release-0.6.0.md).
    authorized squash-merging the fix and preparing publication. The main-branch package
    remains `0.6.0` until this version bump is merged.
 2. Resolve the stable qualification requirements in
-   [CONTRIBUTING](../CONTRIBUTING.md#stable-release); retain every missing or failed
+   [then-current CONTRIBUTING guide](https://github.com/lunchpaillola/pipa/blob/db0b55f/CONTRIBUTING.md#stable-release); retain every missing or failed
    observation. Preparation is not whole-release qualification.
 3. After the version-bump PR is merged, retarget the GitHub draft to that actual
    merged release commit. Recheck all three package/lock version fields, package

@@ -19,7 +19,7 @@ the OpenCode v2 adapter. There is no repeat run on `main` or before npm publish.
 `npm test` and `npm run test:pack` remain available for local verification. Add
 focused regression tests for behavior changes.
 
-For maintainer runtime compatibility checks or pre-release verification, run `node --test scripts/verification/self-check.mjs`
+For optional runtime compatibility checks, run `node --test scripts/verification/self-check.mjs`
 and `npm run test:beta -- --report=beta-smoke.json`: real 1.19.0 / 2.2.5 engines,
 three modes, six cells and 24 applicable case observations per host, with scripted
 local provider/Chat fixtures and no credentials or paid-provider quota.
@@ -78,59 +78,25 @@ For an existing profile, test `pipa manifest` as a read-only local-template expo
 
 ## Releases
 
-Reuse the PR results if the merged tree matches the tested tree. If it differs,
-verify the affected change. Verify the Git release tag points to the merge
-commit. From that clean checkout, check the version and npm dist-tag, inspect
-and clean-install the packed tarball, and confirm `pipa --version`. Keep the
-exact checked archive as `$TARBALL`; publish it with the explicit tag and
-verify its integrity and dist-tag on npm. Do not rerun the PR suite for publication.
-
 Pipa follows Semantic Versioning:
 
 - New backward-compatible capability: minor release (`0.1.0` to `0.2.0`)
 - Backward-compatible fix: patch release (`0.2.0` to `0.2.1`)
 - Breaking change: discuss the version before release
 
-### Controlled beta
+Prepare the release PR with matching versions in `package.json` and
+`package-lock.json` and the release notes. Merging does not publish the package.
 
-An opt-in beta is a limited trial, not full stable/platform qualification. For
-`0.6.0-beta.5`, use the [beta notes and publisher checklist](docs/beta-release.md).
+1. With owner approval, confirm the npm version is unused and record the current
+   `latest` and `beta` tags. Tag the actual merge commit as `v<version>`.
+2. From a clean checkout of that commit, run `npm pack --json` into a private
+   directory. Inspect the package contents for private files and record the
+   integrity of the exact archive. There is no second test run for publication.
+3. The authorized publisher runs `npm publish "$TARBALL" --tag "$NPM_TAG" --access public`
+   with `latest` for stable or `beta` for a prerelease. Keep the other tag unchanged.
+4. Verify the public npm version, integrity and tags, then create the matching
+   GitHub release (marked pre-release for `beta`). Installing or restarting a
+   running instance is a separate owner-approved operation.
 
-1. Confirm the version is unused on npm and record the current `latest` tag.
-2. Update both package files, beta notes and installation instructions in the PR.
-3. Run `npm test`, `npm run test:pack`, and `node --test scripts/verification/self-check.mjs` on that exact version. Inspect `npm publish --dry-run --tag beta --access public` for package contents and accidental private data. Confirm Linux PR CI passes.
-4. Record the scoped native smoke evidence and its platform/head limits. Retain known failures and gaps; do not label a beta `releaseQualified` or require the abandoned migration-status gate.
-5. Obtain explicit owner approval for merge, release tag and GitHub prerelease. Merge only after required CI passes, then tag the actual merged commit as `v0.6.0-beta.5`.
-6. The authorized publisher runs `npm publish "$TARBALL" --tag beta --access public` from that clean, versioned release checkout. Never omit `--tag beta`, move `latest`, or permanently set `publishConfig.tag` to beta.
-7. Verify npm's `beta` tag points to the new version and `latest` is unchanged. Create the matching GitHub release marked **Pre-release**. Installation into an existing daily profile is a separate owner-approved cutover.
-
-### Stable release
-
-Except for the explicit 0.6.0 decision below, the stronger qualification requirements apply to future stable dual-engine releases:
-
-1. Update `package.json` and `package-lock.json` in the feature pull request.
-2. Run `npm test` and `npm run test:pack`. For this dual-engine candidate, also collect the full required Linux/macOS native OS/mode matrix, migration/rollback and private operator/live-client evidence. Windows native runs are outside the current scope; their absence alone does not block it. Missing required evidence still blocks release; the automated Slack collector alone cannot certify it.
-3. Merge after CI passes.
-4. Tag the merge as `v<version>` and push the tag.
-5. The authorized human publisher runs `npm publish "$TARBALL" --tag latest --access public` from the clean, merged, tagged release commit.
-6. Verify the published npm version, then create the matching GitHub release.
-
-### 0.6.0 metadata/docs-only release decision
-
-For this `0.6.0` promotion only, the owner explicitly accepted reusing
-`0.6.0-beta.5` native/live evidence and daily use because runtime code and the
-dependency graph are unchanged, with no fresh native/live or full-matrix runs.
-This is a release-specific evidence exception, not a claim of full
-qualification or a weaker policy for future runtime changes. Windows native is
-`—` (not run); historical failures and unobserved receipts remain unchanged, and
-`releaseQualified` remains false.
-
-Full tests in exact-`0.6.0` release PR CI, `npm run test:pack` with
-packed CLI verification, and
-`npm publish --dry-run --tag latest --access public` remain required. Record
-their actual results before publication; prior beta package checks do not replace
-them. No new tests are required for this pure version/docs change. See the
-[release notes and human publisher gate](docs/release-0.6.0.md), including the
-unfixed stale-lock/PID-reuse and dependency follow-ups. Publication is pending;
-preparation does not authorize npm login/publish, production cutover, or a public
-announcement before verified npm publication.
+Historical release procedures are in the [0.6.0 notes](docs/release-0.6.0.md)
+and the [beta.5 notes](docs/beta-release.md).
